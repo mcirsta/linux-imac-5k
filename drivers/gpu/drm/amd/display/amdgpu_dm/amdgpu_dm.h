@@ -668,6 +668,39 @@ struct amdgpu_display_manager {
 	bool edp0_on_dp1_quirk;
 
 	/**
+	 * @imac5k_tiled_display_quirk:
+	 *
+	 * Temporary bring-up quirk for Apple iMac19,1-class internal 5K tiled
+	 * panels. Stage 1 preserves the secondary half after probe-style boot.
+	 */
+	bool imac5k_tiled_display_quirk;
+
+	/**
+	 * @imac5k_plain_boot_synth_quirk:
+	 *
+	 * Stage 2 scaffolding flag. The current patch does not synthesize the
+	 * split state yet, but it records when the machine is a candidate.
+	 */
+	bool imac5k_plain_boot_synth_quirk;
+
+	/**
+	 * @imac5k_secondary_head_detected:
+	 *
+	 * True once the secondary 2560x2880 half has been identified on this
+	 * boot path.
+	 */
+	bool imac5k_secondary_head_detected;
+
+	/**
+	 * @imac5k_plain_boot_candidate_seen:
+	 *
+	 * Set when the primary internal tile is present but the secondary half
+	 * has not been preserved/discovered, which is the Stage 2 synthesis
+	 * starting point.
+	 */
+	bool imac5k_plain_boot_candidate_seen;
+
+	/**
 	 * @dpia_aux_lock:
 	 *
 	 * Guards access to DPIA AUX
@@ -837,6 +870,14 @@ struct amdgpu_dm_connector {
 	/* Automated testing */
 	bool timing_changed;
 	struct dc_crtc_timing *timing_requested;
+
+	/*
+	 * Temporary iMac 5K bring-up markers. The secondary DP half is backed
+	 * by an emulated sink so the first real userspace modeset does not
+	 * immediately collapse the tiled boot configuration.
+	 */
+	bool imac5k_secondary_head;
+	bool imac5k_em_sink_seeded;
 
 	/* Adaptive Sync */
 	bool pack_sdp_v1_3;
