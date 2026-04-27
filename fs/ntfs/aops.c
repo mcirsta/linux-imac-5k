@@ -37,16 +37,24 @@ static void ntfs_iomap_read_end_io(struct bio *bio)
 	bio_put(bio);
 }
 
-static void ntfs_iomap_bio_submit_read(const struct iomap_iter *iter,
-	struct iomap_read_folio_ctx *ctx)
+static int ntfs_iomap_bio_read_folio_range(const struct iomap_iter *iter,
+	struct iomap_read_folio_ctx *ctx, size_t len)
+{
+	return iomap_bio_read_ops.read_folio_range(iter, ctx, len);
+}
+
+static void ntfs_iomap_bio_submit_read(struct iomap_read_folio_ctx *ctx)
 {
 	struct bio *bio = ctx->read_ctx;
-	bio->bi_end_io = ntfs_iomap_read_end_io;
-	submit_bio(bio);
+
+	if (bio)
+		bio->bi_end_io = ntfs_iomap_read_end_io;
+
+	iomap_bio_read_ops.submit_read(ctx);
 }
 
 static const struct iomap_read_ops ntfs_iomap_bio_read_ops = {
-	.read_folio_range	= iomap_bio_read_folio_range,
+	.read_folio_range	= ntfs_iomap_bio_read_folio_range,
 	.submit_read		= ntfs_iomap_bio_submit_read,
 };
 
