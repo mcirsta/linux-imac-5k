@@ -3477,8 +3477,15 @@ static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
 #define IMAC5K_TILE_HEIGHT_MM_MAX  345
 #define IMAC5K_TILE_HDISPLAY       2560
 #define IMAC5K_TILE_VDISPLAY       2880
-#define IMAC5K_PRIMARY_TILE_X      0
-#define IMAC5K_SECONDARY_TILE_X    1
+#define IMAC5K_PREBOOT_PRIMARY_TILE_X 0
+/*
+ * Experiment: probe boot exposes the physical eDP head as tile 0,0, but GNOME
+ * builds one logical 5K monitor while the visible image appears routed to the
+ * wrong half.  Hard-swap the userspace-facing TILE locations for one build so
+ * we can test whether the panel's physical stream order is reversed.
+ */
+#define IMAC5K_PRIMARY_TILE_X      1
+#define IMAC5K_SECONDARY_TILE_X    0
 #define IMAC5K_TILE_Y              0
 #define IMAC5K_TILE_COLUMNS        2
 #define IMAC5K_TILE_ROWS           1
@@ -3516,7 +3523,8 @@ static bool amdgpu_dm_imac5k_has_primary_tile(const struct amdgpu_dm_connector *
 	return connector->has_tile &&
 	       connector->num_h_tile == IMAC5K_TILE_COLUMNS &&
 	       connector->num_v_tile == IMAC5K_TILE_ROWS &&
-	       connector->tile_h_loc == IMAC5K_PRIMARY_TILE_X &&
+	       (connector->tile_h_loc == IMAC5K_PREBOOT_PRIMARY_TILE_X ||
+		connector->tile_h_loc == IMAC5K_PRIMARY_TILE_X) &&
 	       connector->tile_v_loc == IMAC5K_TILE_Y &&
 	       connector->tile_h_size == IMAC5K_TILE_HDISPLAY &&
 	       connector->tile_v_size == IMAC5K_TILE_VDISPLAY;
@@ -3579,51 +3587,100 @@ amdgpu_dm_imac5k_find_primary_tiled_head(struct drm_device *dev)
 	return primary;
 }
 
-static void amdgpu_dm_imac5k_apply_secondary_tile_property(
-		struct amdgpu_dm_connector *secondary,
-		struct amdgpu_dm_connector *primary)
+static void amdgpu_dm_imac5k_apply_tile_property(
+		struct amdgpu_dm_connector *aconnector,
+		struct drm_tile_group *reference_tile_group,
+		bool single_monitor,
+		unsigned int tile_x,
+		const char *role)
 {
-	struct drm_connector *secondary_connector;
-	struct drm_connector *primary_connector;
+	struct drm_connector *connector;
 	struct drm_tile_group *tile_group;
 	int ret;
 
-	if (!secondary || !primary)
+	if (!aconnector || !reference_tile_group)
 		return;
 
-	secondary_connector = &secondary->base;
-	primary_connector = &primary->base;
+	connector = &aconnector->base;
 
-	if (!primary_connector->has_tile || !primary_connector->tile_group)
-		return;
-
-	if (secondary_connector->tile_group != primary_connector->tile_group) {
-		tile_group = drm_mode_get_tile_group(secondary_connector->dev,
-				(const char *)primary_connector->tile_group->group_data);
+	if (connector->tile_group != reference_tile_group) {
+		tile_group = drm_mode_get_tile_group(connector->dev,
+				(const char *)reference_tile_group->group_data);
 		if (!tile_group)
 			return;
 
-		if (secondary_connector->tile_group)
-			drm_mode_put_tile_group(secondary_connector->dev,
-					secondary_connector->tile_group);
-		secondary_connector->tile_group = tile_group;
+		if (connector->tile_group)
+			drm_mode_put_tile_group(connector->dev,
+					connector->tile_group);
+		connector->tile_group = tile_group;
 	}
 
-	secondary_connector->has_tile = true;
-	secondary_connector->tile_is_single_monitor =
-		primary_connector->tile_is_single_monitor;
-	secondary_connector->num_h_tile = IMAC5K_TILE_COLUMNS;
-	secondary_connector->num_v_tile = IMAC5K_TILE_ROWS;
-	secondary_connector->tile_h_loc = IMAC5K_SECONDARY_TILE_X;
-	secondary_connector->tile_v_loc = IMAC5K_TILE_Y;
-	secondary_connector->tile_h_size = IMAC5K_TILE_HDISPLAY;
-	secondary_connector->tile_v_size = IMAC5K_TILE_VDISPLAY;
+	connector->has_tile = true;
+	connector->tile_is_single_monitor = single_monitor;
+	connector->num_h_tile = IMAC5K_TILE_COLUMNS;
+	connector->num_v_tile = IMAC5K_TILE_ROWS;
+	connector->tile_h_loc = tile_x;
+	connector->tile_v_loc = IMAC5K_TILE_Y;
+	connector->tile_h_size = IMAC5K_TILE_HDISPLAY;
+	connector->tile_v_size = IMAC5K_TILE_VDISPLAY;
 
-	ret = drm_connector_set_tile_property(secondary_connector);
+	ret = drm_connector_set_tile_property(connector);
 	if (ret)
-		drm_info(secondary_connector->dev,
-			 "IMAC5K: failed to set secondary TILE property on %s (%d)\n",
-			 secondary_connector->name, ret);
+		drm_info(connector->dev,
+			 "IMAC5K: failed to set %s TILE property on %s (%d)\n",
+			 role, connector->name, ret);
+}
+
+static void amdgpu_dm_imac5k_apply_primary_tile_property(
+		struct amdgpu_dm_connector *primary)
+{
+	struct amdgpu_display_manager *dm;
+	struct drm_connector *connector;
+
+	if (!primary || !primary->base.dev)
+		return;
+
+	dm = &drm_to_adev(primary->base.dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm) ||
+	    !amdgpu_dm_imac5k_is_primary_head(primary) ||
+	    !amdgpu_dm_imac5k_has_primary_tile(primary))
+		return;
+
+	connector = &primary->base;
+	if (!connector->has_tile || !connector->tile_group)
+		return;
+
+	amdgpu_dm_imac5k_apply_tile_property(primary, connector->tile_group,
+					     connector->tile_is_single_monitor,
+					     IMAC5K_PRIMARY_TILE_X, "primary");
+}
+
+static void amdgpu_dm_imac5k_apply_pair_tile_properties(
+		struct amdgpu_dm_connector *primary,
+		struct amdgpu_dm_connector *secondary)
+{
+	struct drm_connector *primary_connector;
+	struct drm_tile_group *tile_group;
+	bool single_monitor;
+
+	if (!primary)
+		return;
+
+	primary_connector = &primary->base;
+	if (!primary_connector->has_tile || !primary_connector->tile_group)
+		return;
+
+	tile_group = primary_connector->tile_group;
+	single_monitor = primary_connector->tile_is_single_monitor;
+
+	amdgpu_dm_imac5k_apply_tile_property(primary, tile_group, single_monitor,
+					     IMAC5K_PRIMARY_TILE_X, "primary");
+
+	if (secondary)
+		amdgpu_dm_imac5k_apply_tile_property(secondary, tile_group,
+						     single_monitor,
+						     IMAC5K_SECONDARY_TILE_X,
+						     "secondary");
 }
 
 static void amdgpu_dm_imac5k_update_edid_block_checksum(u8 *block)
@@ -3812,14 +3869,15 @@ static void amdgpu_dm_imac5k_seed_emulated_sink(struct amdgpu_dm_connector *acon
 	}
 
 	if (primary)
-		amdgpu_dm_imac5k_apply_secondary_tile_property(aconnector, primary);
+		amdgpu_dm_imac5k_apply_pair_tile_properties(primary, aconnector);
 
 	aconnector->imac5k_em_sink_seeded = true;
 	dev = aconnector->base.dev;
 	drm_info(dev,
-		 "IMAC5K: seeded emulated sink for %s from %s to preserve secondary tile %u,%u through userspace takeover edid_tile_patched=%u\n",
+		 "IMAC5K: seeded emulated sink for %s from %s to preserve swapped tiled pair primary=%u,%u secondary=%u,%u through userspace takeover edid_tile_patched=%u\n",
 		 aconnector->base.name,
 		 primary ? primary->base.name : aconnector->base.name,
+		 IMAC5K_PRIMARY_TILE_X, IMAC5K_TILE_Y,
 		 IMAC5K_SECONDARY_TILE_X, IMAC5K_TILE_Y,
 		 tile_patched);
 
@@ -4379,6 +4437,7 @@ void amdgpu_dm_update_connector_after_detect(
 	amdgpu_dm_imac5k_mark_secondary_head(aconnector);
 	amdgpu_dm_imac5k_seed_emulated_sink(aconnector);
 	amdgpu_dm_imac5k_note_plain_boot_candidate(aconnector);
+	amdgpu_dm_imac5k_apply_primary_tile_property(aconnector);
 
 	if (aconnector->dc_sink == sink &&
 	    !amdgpu_dm_imac5k_should_preserve_secondary_sink(aconnector)) {
@@ -4448,6 +4507,7 @@ void amdgpu_dm_update_connector_after_detect(
 		amdgpu_dm_imac5k_mark_secondary_head(aconnector);
 		amdgpu_dm_imac5k_seed_emulated_sink(aconnector);
 		amdgpu_dm_imac5k_note_plain_boot_candidate(aconnector);
+		amdgpu_dm_imac5k_apply_primary_tile_property(aconnector);
 	} else {
 		if (amdgpu_dm_imac5k_should_preserve_secondary_sink(aconnector)) {
 			drm_info(dev,
@@ -6232,6 +6292,7 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 		amdgpu_dm_imac5k_mark_secondary_head(aconnector);
 		amdgpu_dm_imac5k_seed_emulated_sink(aconnector);
 		amdgpu_dm_imac5k_note_plain_boot_candidate(aconnector);
+		amdgpu_dm_imac5k_apply_primary_tile_property(aconnector);
 		amdgpu_dm_imac5k_log_connector(aconnector, "boot_detect");
 	}
 
