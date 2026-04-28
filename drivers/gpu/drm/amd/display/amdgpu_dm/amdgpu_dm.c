@@ -73,6 +73,8 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/types.h>
+#include <linux/string.h>
+#include <linux/slab.h>
 #include <linux/pm_runtime.h>
 #include <linux/pci.h>
 #include <linux/power_supply.h>
@@ -3469,10 +3471,18 @@ static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
 	}
 }
 
-#define IMAC5K_TILE_WIDTH_MM   299
-#define IMAC5K_TILE_HEIGHT_MM  336
-#define IMAC5K_TILE_HDISPLAY   2560
-#define IMAC5K_TILE_VDISPLAY   2880
+#define IMAC5K_TILE_WIDTH_MM_MIN   295
+#define IMAC5K_TILE_WIDTH_MM_MAX   305
+#define IMAC5K_TILE_HEIGHT_MM_MIN  330
+#define IMAC5K_TILE_HEIGHT_MM_MAX  345
+#define IMAC5K_TILE_HDISPLAY       2560
+#define IMAC5K_TILE_VDISPLAY       2880
+#define IMAC5K_PRIMARY_TILE_X      0
+#define IMAC5K_SECONDARY_TILE_X    1
+#define IMAC5K_TILE_Y              0
+#define IMAC5K_TILE_COLUMNS        2
+#define IMAC5K_TILE_ROWS           1
+#define IMAC5K_SECONDARY_LINK_ID   1
 
 static bool amdgpu_dm_imac5k_quirk_enabled(const struct amdgpu_display_manager *dm)
 {
@@ -3488,8 +3498,28 @@ static bool amdgpu_dm_imac5k_panel_geometry_match(const struct amdgpu_dm_connect
 
 	connector = &aconnector->base;
 
-	return connector->display_info.width_mm == IMAC5K_TILE_WIDTH_MM &&
-	       connector->display_info.height_mm == IMAC5K_TILE_HEIGHT_MM;
+	return connector->display_info.width_mm >= IMAC5K_TILE_WIDTH_MM_MIN &&
+	       connector->display_info.width_mm <= IMAC5K_TILE_WIDTH_MM_MAX &&
+	       connector->display_info.height_mm >= IMAC5K_TILE_HEIGHT_MM_MIN &&
+	       connector->display_info.height_mm <= IMAC5K_TILE_HEIGHT_MM_MAX;
+}
+
+static bool amdgpu_dm_imac5k_has_primary_tile(const struct amdgpu_dm_connector *aconnector)
+{
+	const struct drm_connector *connector;
+
+	if (!aconnector)
+		return false;
+
+	connector = &aconnector->base;
+
+	return connector->has_tile &&
+	       connector->num_h_tile == IMAC5K_TILE_COLUMNS &&
+	       connector->num_v_tile == IMAC5K_TILE_ROWS &&
+	       connector->tile_h_loc == IMAC5K_PRIMARY_TILE_X &&
+	       connector->tile_v_loc == IMAC5K_TILE_Y &&
+	       connector->tile_h_size == IMAC5K_TILE_HDISPLAY &&
+	       connector->tile_v_size == IMAC5K_TILE_VDISPLAY;
 }
 
 static bool amdgpu_dm_imac5k_is_primary_head(const struct amdgpu_dm_connector *aconnector)
@@ -3497,7 +3527,8 @@ static bool amdgpu_dm_imac5k_is_primary_head(const struct amdgpu_dm_connector *a
 	if (!aconnector || !aconnector->dc_link)
 		return false;
 
-	return amdgpu_dm_imac5k_panel_geometry_match(aconnector) &&
+	return (amdgpu_dm_imac5k_has_primary_tile(aconnector) ||
+		amdgpu_dm_imac5k_panel_geometry_match(aconnector)) &&
 	       aconnector->base.connector_type == DRM_MODE_CONNECTOR_eDP &&
 	       aconnector->dc_link->connector_signal == SIGNAL_TYPE_EDP;
 }
@@ -3507,9 +3538,161 @@ static bool amdgpu_dm_imac5k_is_secondary_head(const struct amdgpu_dm_connector 
 	if (!aconnector || !aconnector->dc_link || aconnector->mst_root)
 		return false;
 
-	return amdgpu_dm_imac5k_panel_geometry_match(aconnector) &&
-	       aconnector->base.connector_type == DRM_MODE_CONNECTOR_DisplayPort &&
+	/*
+	 * Probe-boot evidence shows the right half survives as DP-1/crtc-1 even
+	 * while the public connector status says disconnected. Do not require
+	 * EDID geometry here; that is exactly the state we are trying to keep.
+	 */
+	return aconnector->base.connector_type == DRM_MODE_CONNECTOR_DisplayPort &&
+	       (aconnector->connector_id == IMAC5K_SECONDARY_LINK_ID ||
+		!strcmp(aconnector->base.name, "DP-1")) &&
 	       aconnector->dc_link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT;
+}
+
+static struct amdgpu_dm_connector *
+amdgpu_dm_imac5k_find_primary_tiled_head(struct drm_device *dev)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	struct amdgpu_dm_connector *primary = NULL;
+
+	if (!dev)
+		return NULL;
+
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		struct amdgpu_dm_connector *candidate;
+
+		if (connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK)
+			continue;
+
+		candidate = to_amdgpu_dm_connector(connector);
+		if (amdgpu_dm_imac5k_is_primary_head(candidate) &&
+		    amdgpu_dm_imac5k_has_primary_tile(candidate) &&
+		    candidate->drm_edid) {
+			primary = candidate;
+			break;
+		}
+	}
+	drm_connector_list_iter_end(&iter);
+
+	return primary;
+}
+
+static void amdgpu_dm_imac5k_apply_secondary_tile_property(
+		struct amdgpu_dm_connector *secondary,
+		struct amdgpu_dm_connector *primary)
+{
+	struct drm_connector *secondary_connector;
+	struct drm_connector *primary_connector;
+	struct drm_tile_group *tile_group;
+	int ret;
+
+	if (!secondary || !primary)
+		return;
+
+	secondary_connector = &secondary->base;
+	primary_connector = &primary->base;
+
+	if (!primary_connector->has_tile || !primary_connector->tile_group)
+		return;
+
+	if (secondary_connector->tile_group != primary_connector->tile_group) {
+		tile_group = drm_mode_get_tile_group(secondary_connector->dev,
+				(const char *)primary_connector->tile_group->group_data);
+		if (!tile_group)
+			return;
+
+		if (secondary_connector->tile_group)
+			drm_mode_put_tile_group(secondary_connector->dev,
+					secondary_connector->tile_group);
+		secondary_connector->tile_group = tile_group;
+	}
+
+	secondary_connector->has_tile = true;
+	secondary_connector->tile_is_single_monitor =
+		primary_connector->tile_is_single_monitor;
+	secondary_connector->num_h_tile = IMAC5K_TILE_COLUMNS;
+	secondary_connector->num_v_tile = IMAC5K_TILE_ROWS;
+	secondary_connector->tile_h_loc = IMAC5K_SECONDARY_TILE_X;
+	secondary_connector->tile_v_loc = IMAC5K_TILE_Y;
+	secondary_connector->tile_h_size = IMAC5K_TILE_HDISPLAY;
+	secondary_connector->tile_v_size = IMAC5K_TILE_VDISPLAY;
+
+	ret = drm_connector_set_tile_property(secondary_connector);
+	if (ret)
+		drm_info(secondary_connector->dev,
+			 "IMAC5K: failed to set secondary TILE property on %s (%d)\n",
+			 secondary_connector->name, ret);
+}
+
+static void amdgpu_dm_imac5k_update_edid_block_checksum(u8 *block)
+{
+	u8 sum = 0;
+	int i;
+
+	block[EDID_LENGTH - 1] = 0;
+	for (i = 0; i < EDID_LENGTH - 1; i++)
+		sum += block[i];
+	block[EDID_LENGTH - 1] = 0 - sum;
+}
+
+static u8 *amdgpu_dm_imac5k_clone_secondary_tile_edid(const struct edid *edid,
+						      size_t edid_len,
+						      bool *tile_patched)
+{
+	u8 *edid_copy;
+	unsigned int block_count;
+	unsigned int block_idx;
+
+	if (tile_patched)
+		*tile_patched = false;
+
+	if (!edid || edid_len < EDID_LENGTH)
+		return NULL;
+
+	edid_copy = kmemdup(edid, edid_len, GFP_KERNEL);
+	if (!edid_copy)
+		return NULL;
+
+	block_count = edid_len / EDID_LENGTH;
+	for (block_idx = 1; block_idx < block_count; block_idx++) {
+		u8 *extension = edid_copy + block_idx * EDID_LENGTH;
+		unsigned int displayid_end;
+		unsigned int offset;
+
+		if (extension[0] != 0x70)
+			continue;
+
+		displayid_end = min_t(unsigned int, 5 + extension[2],
+				      EDID_LENGTH - 1);
+
+		for (offset = 5; offset + 3 <= displayid_end;) {
+			u8 tag = extension[offset];
+			u8 block_len = extension[offset + 2];
+			unsigned int payload = offset + 3;
+			unsigned int next = payload + block_len;
+
+			if (next > displayid_end)
+				break;
+
+			if ((tag == 0x12 || tag == 0x28) && block_len >= 4) {
+				u8 *topo = extension + payload + 1;
+
+				topo[1] = (IMAC5K_SECONDARY_TILE_X << 4) |
+					  IMAC5K_TILE_Y;
+				topo[2] &= ~0x0f;
+				amdgpu_dm_imac5k_update_edid_block_checksum(extension);
+				if (tile_patched)
+					*tile_patched = true;
+				return edid_copy;
+			}
+
+			offset = next;
+		}
+	}
+
+	return edid_copy;
 }
 
 static void amdgpu_dm_imac5k_mark_secondary_head(struct amdgpu_dm_connector *aconnector)
@@ -3572,38 +3755,76 @@ static void amdgpu_dm_imac5k_seed_emulated_sink(struct amdgpu_dm_connector *acon
 	struct dc_sink_init_data init_params = { 0 };
 	const struct drm_edid *drm_edid;
 	const struct edid *edid;
+	struct amdgpu_dm_connector *primary = NULL;
+	u8 *edid_copy;
+	size_t edid_len;
+	bool tile_patched;
 
 	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
 		return;
 
-	if (!aconnector->imac5k_secondary_head || aconnector->imac5k_em_sink_seeded ||
-	    aconnector->dc_em_sink)
+	if (!aconnector->imac5k_secondary_head || aconnector->imac5k_em_sink_seeded)
 		return;
 
 	drm_edid = aconnector->drm_edid;
+	if (!drm_edid) {
+		primary = amdgpu_dm_imac5k_find_primary_tiled_head(aconnector->base.dev);
+		if (!primary)
+			return;
+		drm_edid = primary->drm_edid;
+	}
+
 	if (!drm_edid)
 		return;
 
 	edid = drm_edid_raw(drm_edid);
 	if (!edid)
 		return;
+	edid_len = (edid->extensions + 1) * EDID_LENGTH;
+	edid_copy = amdgpu_dm_imac5k_clone_secondary_tile_edid(edid, edid_len,
+							       &tile_patched);
+	if (!edid_copy)
+		return;
 
 	init_params.link = aconnector->dc_link;
 	init_params.sink_signal = aconnector->dc_sink ?
 		aconnector->dc_sink->sink_signal : SIGNAL_TYPE_DISPLAY_PORT;
 
-	aconnector->dc_em_sink = dc_link_add_remote_sink(aconnector->dc_link,
-							 (uint8_t *)edid,
-							 (edid->extensions + 1) * EDID_LENGTH,
-							 &init_params);
-	if (!aconnector->dc_em_sink)
-		return;
+	if (!aconnector->dc_em_sink) {
+		aconnector->dc_em_sink = dc_link_add_remote_sink(aconnector->dc_link,
+								 edid_copy,
+								 edid_len,
+								 &init_params);
+		if (!aconnector->dc_em_sink)
+			goto out_free_edid;
+	}
+
+	if (!aconnector->drm_edid) {
+		aconnector->drm_edid = drm_edid_alloc(edid_copy, edid_len);
+		if (!aconnector->drm_edid)
+			goto out_free_edid;
+		drm_edid_connector_update(&aconnector->base, aconnector->drm_edid);
+	}
+
+	if (!aconnector->dc_sink) {
+		aconnector->dc_sink = aconnector->dc_em_sink;
+		dc_sink_retain(aconnector->dc_sink);
+	}
+
+	if (primary)
+		amdgpu_dm_imac5k_apply_secondary_tile_property(aconnector, primary);
 
 	aconnector->imac5k_em_sink_seeded = true;
 	dev = aconnector->base.dev;
 	drm_info(dev,
-		 "IMAC5K: seeded emulated sink for %s to preserve the secondary 2560x2880 tile through userspace takeover\n",
-		 aconnector->base.name);
+		 "IMAC5K: seeded emulated sink for %s from %s to preserve secondary tile %u,%u through userspace takeover edid_tile_patched=%u\n",
+		 aconnector->base.name,
+		 primary ? primary->base.name : aconnector->base.name,
+		 IMAC5K_SECONDARY_TILE_X, IMAC5K_TILE_Y,
+		 tile_patched);
+
+out_free_edid:
+	kfree(edid_copy);
 }
 
 static bool amdgpu_dm_imac5k_should_preserve_secondary_sink(const struct amdgpu_dm_connector *aconnector)
@@ -3639,19 +3860,28 @@ static void amdgpu_dm_imac5k_log_connector(struct amdgpu_dm_connector *aconnecto
 	connector = &aconnector->base;
 
 	drm_info(dev,
-		 "IMAC5K: %s connector=%s type=%d signal=%d internal=%u dc_sink=%p em_sink=%p secondary=%u size=%ux%u modes=%d status=%d\n",
+		 "IMAC5K: %s connector=%s id=%u type=%d signal=%d internal=%u dc_sink=%p em_sink=%p secondary=%u seeded=%u size=%ux%u modes=%d status=%d tile=%u %ux%u loc=%u,%u size=%ux%u\n",
 		 tag,
 		 connector->name,
+		 aconnector->connector_id,
 		 connector->connector_type,
 		 aconnector->dc_link ? aconnector->dc_link->connector_signal : SIGNAL_TYPE_NONE,
 		 aconnector->dc_link ? aconnector->dc_link->is_internal_display : 0,
 		 aconnector->dc_sink,
 		 aconnector->dc_em_sink,
 		 aconnector->imac5k_secondary_head,
+		 aconnector->imac5k_em_sink_seeded,
 		 connector->display_info.width_mm,
 		 connector->display_info.height_mm,
 		 aconnector->num_modes,
-		 connector->status);
+		 connector->status,
+		 connector->has_tile,
+		 connector->num_h_tile,
+		 connector->num_v_tile,
+		 connector->tile_h_loc,
+		 connector->tile_v_loc,
+		 connector->tile_h_size,
+		 connector->tile_v_size);
 }
 
 static void amdgpu_dm_imac5k_log_streams(struct drm_device *dev,
@@ -3706,6 +3936,13 @@ static void amdgpu_dm_imac5k_log_crtc_update(struct amdgpu_display_manager *dm,
 	const char *connector_name = connector ? connector->name : "<none>";
 
 	if (!dm || !amdgpu_dm_imac5k_quirk_enabled(dm) || !crtc)
+		return;
+
+	if (!connector && old_crtc_state && new_crtc_state &&
+	    old_crtc_state->active == new_crtc_state->active &&
+	    old_crtc_state->mode.hdisplay == new_crtc_state->mode.hdisplay &&
+	    old_crtc_state->mode.vdisplay == new_crtc_state->mode.vdisplay &&
+	    !drm_atomic_crtc_needs_modeset(new_crtc_state))
 		return;
 
 	dev = dm->ddev;
@@ -4139,10 +4376,12 @@ void amdgpu_dm_update_connector_after_detect(
 	if (sink && sink->sink_signal == SIGNAL_TYPE_DISPLAY_PORT_MST)
 		return;
 
-	if (aconnector->dc_sink == sink) {
-		amdgpu_dm_imac5k_mark_secondary_head(aconnector);
-		amdgpu_dm_imac5k_seed_emulated_sink(aconnector);
-		amdgpu_dm_imac5k_note_plain_boot_candidate(aconnector);
+	amdgpu_dm_imac5k_mark_secondary_head(aconnector);
+	amdgpu_dm_imac5k_seed_emulated_sink(aconnector);
+	amdgpu_dm_imac5k_note_plain_boot_candidate(aconnector);
+
+	if (aconnector->dc_sink == sink &&
+	    !amdgpu_dm_imac5k_should_preserve_secondary_sink(aconnector)) {
 		amdgpu_dm_imac5k_log_connector(aconnector, "detect_unchanged");
 
 		/*
@@ -5990,6 +6229,9 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 			}
 		}
 		amdgpu_set_panel_orientation(&aconnector->base);
+		amdgpu_dm_imac5k_mark_secondary_head(aconnector);
+		amdgpu_dm_imac5k_seed_emulated_sink(aconnector);
+		amdgpu_dm_imac5k_note_plain_boot_candidate(aconnector);
 		amdgpu_dm_imac5k_log_connector(aconnector, "boot_detect");
 	}
 
