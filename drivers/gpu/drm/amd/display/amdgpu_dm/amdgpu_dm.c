@@ -3942,12 +3942,102 @@ static void amdgpu_dm_imac5k_log_connector(struct amdgpu_dm_connector *aconnecto
 		 connector->tile_v_size);
 }
 
+static u32 amdgpu_dm_imac5k_count_tile_streams(const struct dc_state *dc_state)
+{
+	u32 count = 0;
+	u32 i;
+
+	if (!dc_state)
+		return 0;
+
+	for (i = 0; i < dc_state->stream_count; i++) {
+		const struct dc_stream_state *stream = dc_state->streams[i];
+
+		if (!stream)
+			continue;
+
+		if (stream->timing.h_addressable == IMAC5K_TILE_HDISPLAY &&
+		    stream->timing.v_addressable == IMAC5K_TILE_VDISPLAY)
+			count++;
+	}
+
+	return count;
+}
+
+static void amdgpu_dm_imac5k_note_two_stream_state(struct drm_device *dev,
+						   struct dc_state *dc_state,
+						   const char *tag)
+{
+	struct amdgpu_display_manager *dm;
+	u32 tile_streams;
+
+	if (!dev || !dc_state)
+		return;
+
+	dm = &drm_to_adev(dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm) ||
+	    !dm->imac5k_secondary_head_detected)
+		return;
+
+	tile_streams = amdgpu_dm_imac5k_count_tile_streams(dc_state);
+	if (tile_streams < 2 || dm->imac5k_two_tile_streams_seen)
+		return;
+
+	dm->imac5k_two_tile_streams_seen = true;
+	drm_info(dev,
+		 "IMAC5K: two-stream guard armed at %s stream_count=%u tile_streams=%u\n",
+		 tag, dc_state->stream_count, tile_streams);
+}
+
+static bool amdgpu_dm_imac5k_should_suppress_stream_drop(struct drm_device *dev,
+							 struct dc_state *dc_state)
+{
+	struct amdgpu_display_manager *dm;
+	struct dc_state *current_state;
+	u32 new_tile_streams;
+	u32 current_stream_count = 0;
+	u32 current_tile_streams = 0;
+
+	if (!dev || !dc_state)
+		return false;
+
+	dm = &drm_to_adev(dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm) ||
+	    !dm->imac5k_secondary_head_detected ||
+	    !dm->imac5k_two_tile_streams_seen)
+		return false;
+
+	new_tile_streams = amdgpu_dm_imac5k_count_tile_streams(dc_state);
+	if (dc_state->stream_count >= 2 && new_tile_streams >= 2)
+		return false;
+
+	current_state = dm->dc ? dm->dc->current_state : NULL;
+	if (current_state) {
+		current_stream_count = current_state->stream_count;
+		current_tile_streams =
+			amdgpu_dm_imac5k_count_tile_streams(current_state);
+	}
+
+	if (current_tile_streams < 2)
+		return false;
+
+	dm->imac5k_stream_drop_suppressions++;
+	drm_info(dev,
+		 "IMAC5K: suppressing transient stream drop #%u proposed_streams=%u proposed_tile_streams=%u current_streams=%u current_tile_streams=%u\n",
+		 dm->imac5k_stream_drop_suppressions,
+		 dc_state->stream_count, new_tile_streams,
+		 current_stream_count, current_tile_streams);
+
+	return true;
+}
+
 static void amdgpu_dm_imac5k_log_streams(struct drm_device *dev,
 					 struct dc_state *dc_state,
 					 const char *tag)
 {
 	struct amdgpu_display_manager *dm;
 	u32 i;
+	u32 tile_streams;
 
 	if (!dev)
 		return;
@@ -3956,10 +4046,15 @@ static void amdgpu_dm_imac5k_log_streams(struct drm_device *dev,
 	if (!amdgpu_dm_imac5k_quirk_enabled(dm) || !dc_state)
 		return;
 
-	drm_info(dev, "IMAC5K: %s stream_count=%u plain_boot_candidate=%u secondary_detected=%u\n",
+	tile_streams = amdgpu_dm_imac5k_count_tile_streams(dc_state);
+	drm_info(dev,
+		 "IMAC5K: %s stream_count=%u tile_streams=%u plain_boot_candidate=%u secondary_detected=%u guard_armed=%u suppressions=%u\n",
 		 tag, dc_state->stream_count,
+		 tile_streams,
 		 dm->imac5k_plain_boot_candidate_seen,
-		 dm->imac5k_secondary_head_detected);
+		 dm->imac5k_secondary_head_detected,
+		 dm->imac5k_two_tile_streams_seen,
+		 dm->imac5k_stream_drop_suppressions);
 
 	for (i = 0; i < dc_state->stream_count; i++) {
 		const struct dc_stream_state *stream = dc_state->streams[i];
@@ -11057,7 +11152,7 @@ static void dm_clear_writeback(struct amdgpu_display_manager *dm,
 	dc_stream_remove_writeback(dm->dc, crtc_state->stream, 0);
 }
 
-static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
+static bool amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 					struct dc_state *dc_state)
 {
 	struct drm_device *dev = state->dev;
@@ -11074,6 +11169,11 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 	bool set_backlight_level = false;
 
 	amdgpu_dm_imac5k_log_streams(dev, dc_state, "commit_streams_begin");
+	if (amdgpu_dm_imac5k_should_suppress_stream_drop(dev, dc_state)) {
+		amdgpu_dm_imac5k_log_streams(dev, dc_state,
+					      "commit_streams_suppressed");
+		return false;
+	}
 
 	/* Disable writeback */
 	for_each_old_connector_in_state(state, connector, old_con_state, i) {
@@ -11224,6 +11324,8 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 	if ((dm->active_vblank_irq_count == 0) && amdgpu_dm_is_headless(dm->adev))
 		dc_allow_idle_optimizations(dm->dc, true);
 	mutex_unlock(&dm->dc_lock);
+	amdgpu_dm_imac5k_note_two_stream_state(dev, dc_state,
+						"commit_streams_end");
 
 	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
 		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
@@ -11260,6 +11362,7 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 	}
 
 	amdgpu_dm_imac5k_log_streams(dev, dc_state, "commit_streams_end");
+	return true;
 }
 
 static void dm_set_writeback(struct amdgpu_display_manager *dm,
@@ -11558,6 +11661,7 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 	struct drm_connector_state *old_con_state = NULL, *new_con_state = NULL;
 	struct dm_crtc_state *dm_old_crtc_state, *dm_new_crtc_state;
 	int crtc_disable_count = 0;
+	bool imac5k_stream_commit_suppressed = false;
 
 	trace_amdgpu_dm_atomic_commit_tail_begin(state);
 
@@ -11568,7 +11672,8 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 	if (dm_state && dm_state->context) {
 		dc_state = dm_state->context;
 		amdgpu_dm_imac5k_log_streams(dev, dc_state, "atomic_commit_tail_pre");
-		amdgpu_dm_commit_streams(state, dc_state);
+		imac5k_stream_commit_suppressed =
+			!amdgpu_dm_commit_streams(state, dc_state);
 		amdgpu_dm_imac5k_log_streams(dev, dc_state, "atomic_commit_tail_post");
 	}
 
@@ -11708,7 +11813,8 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 		enum amdgpu_dm_pipe_crc_source cur_crc_src;
 #endif
 		/* Count number of newly disabled CRTCs for dropping PM refs later. */
-		if (old_crtc_state->active && !new_crtc_state->active)
+		if (!imac5k_stream_commit_suppressed &&
+		    old_crtc_state->active && !new_crtc_state->active)
 			crtc_disable_count++;
 
 		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);

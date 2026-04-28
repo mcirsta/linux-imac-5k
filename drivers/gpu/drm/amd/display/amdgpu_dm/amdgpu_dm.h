@@ -692,6 +692,24 @@ struct amdgpu_display_manager {
 	bool imac5k_secondary_head_detected;
 
 	/**
+	 * @imac5k_two_tile_streams_seen:
+	 *
+	 * Armed after DC has accepted a two-stream 2560x2880 tiled iMac5K
+	 * state. Later transient userspace modesets may briefly propose fewer
+	 * streams; the bring-up quirk can then avoid tearing down the trained
+	 * firmware display pair while userspace rebuilds the same topology.
+	 */
+	bool imac5k_two_tile_streams_seen;
+
+	/**
+	 * @imac5k_stream_drop_suppressions:
+	 *
+	 * Diagnostic counter for suppressed transient drops below the armed
+	 * two-stream iMac5K state.
+	 */
+	unsigned int imac5k_stream_drop_suppressions;
+
+	/**
 	 * @imac5k_plain_boot_candidate_seen:
 	 *
 	 * Set when the primary internal tile is present but the secondary half
