@@ -3490,6 +3490,8 @@ static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
 #define IMAC5K_TILE_COLUMNS        2
 #define IMAC5K_TILE_ROWS           1
 #define IMAC5K_SECONDARY_LINK_ID   1
+#define IMAC5K_DPCD_PANEL_LATCH    0x4F1
+#define IMAC5K_DPCD_WRITE_RETRY_MS 10
 
 static bool amdgpu_dm_imac5k_quirk_enabled(const struct amdgpu_display_manager *dm)
 {
@@ -3942,6 +3944,13 @@ static void amdgpu_dm_imac5k_log_connector(struct amdgpu_dm_connector *aconnecto
 		 connector->tile_v_size);
 }
 
+static bool amdgpu_dm_imac5k_is_tile_stream(const struct dc_stream_state *stream)
+{
+	return stream &&
+	       stream->timing.h_addressable == IMAC5K_TILE_HDISPLAY &&
+	       stream->timing.v_addressable == IMAC5K_TILE_VDISPLAY;
+}
+
 static u32 amdgpu_dm_imac5k_count_tile_streams(const struct dc_state *dc_state)
 {
 	u32 count = 0;
@@ -3956,12 +3965,134 @@ static u32 amdgpu_dm_imac5k_count_tile_streams(const struct dc_state *dc_state)
 		if (!stream)
 			continue;
 
-		if (stream->timing.h_addressable == IMAC5K_TILE_HDISPLAY &&
-		    stream->timing.v_addressable == IMAC5K_TILE_VDISPLAY)
+		if (amdgpu_dm_imac5k_is_tile_stream(stream))
 			count++;
 	}
 
 	return count;
+}
+
+static void
+amdgpu_dm_imac5k_finalize_secondary_dpcd(struct amdgpu_dm_connector *aconnector,
+					 const char *tag)
+{
+	struct drm_device *dev;
+	struct dc_link *link;
+	enum dc_status status;
+	u8 table_revision[3];
+	u8 payload = 1;
+
+	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
+		return;
+
+	if (!aconnector->imac5k_secondary_head)
+		return;
+
+	dev = aconnector->base.dev;
+	link = aconnector->dc_link;
+
+	if (!link->ctx) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary DPCD finalize skipped on %s link=%u: missing dc ctx\n",
+			 tag, aconnector->base.name, link->link_index);
+		return;
+	}
+
+	if (!aconnector->imac5k_source_dpcd_programmed) {
+		dpcd_set_source_specific_data(link);
+
+		table_revision[0] = link->ctx->dce_version >= DCE_VERSION_12_0 ?
+				    0x05 : 0x04;
+		table_revision[1] = 0x1d;
+		table_revision[2] = 0x03;
+
+		status = core_link_write_dpcd(link, DP_SOURCE_TABLE_REVISION,
+					      table_revision,
+					      sizeof(table_revision));
+		if (status == DC_OK)
+			aconnector->imac5k_source_dpcd_programmed = true;
+
+		drm_info(dev,
+			 "IMAC5K: %s secondary source-DPCD %s link=%u dce=%d 0x310=%02x %02x %02x status=%d\n",
+			 tag, aconnector->base.name, link->link_index,
+			 link->ctx->dce_version,
+			 table_revision[0], table_revision[1], table_revision[2],
+			 status);
+	}
+
+	if (!aconnector->imac5k_source_dpcd_programmed) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary 0x4F1 latch deferred on %s link=%u: source-DPCD not programmed\n",
+			 tag, aconnector->base.name, link->link_index);
+		return;
+	}
+
+	if (aconnector->imac5k_dpcd_4f1_asserted)
+		return;
+
+	status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+				      &payload, sizeof(payload));
+	if (status != DC_OK) {
+		msleep(IMAC5K_DPCD_WRITE_RETRY_MS);
+		status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+					      &payload, sizeof(payload));
+	}
+
+	if (status == DC_OK)
+		aconnector->imac5k_dpcd_4f1_asserted = true;
+
+	drm_info(dev,
+		 "IMAC5K: %s secondary 0x4F1 latch %s link=%u payload=%u status=%d asserted=%u\n",
+		 tag, aconnector->base.name, link->link_index, payload,
+		 status, aconnector->imac5k_dpcd_4f1_asserted);
+}
+
+static void amdgpu_dm_imac5k_finalize_secondary_links(struct drm_device *dev,
+						      struct dc_state *dc_state,
+						      const char *tag)
+{
+	struct amdgpu_display_manager *dm;
+	u32 tile_streams;
+	bool found_secondary = false;
+	u32 i;
+
+	if (!dev || !dc_state)
+		return;
+
+	dm = &drm_to_adev(dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm))
+		return;
+
+	tile_streams = amdgpu_dm_imac5k_count_tile_streams(dc_state);
+	if (!dm->imac5k_secondary_head_detected ||
+	    !dm->imac5k_two_tile_streams_seen) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary DPCD finalize gated off stream_count=%u tile_streams=%u secondary_detected=%u guard_armed=%u\n",
+			 tag, dc_state->stream_count, tile_streams,
+			 dm->imac5k_secondary_head_detected,
+			 dm->imac5k_two_tile_streams_seen);
+		return;
+	}
+
+	for (i = 0; i < dc_state->stream_count; i++) {
+		struct dc_stream_state *stream = dc_state->streams[i];
+		struct amdgpu_dm_connector *aconnector;
+
+		if (!amdgpu_dm_imac5k_is_tile_stream(stream))
+			continue;
+
+		aconnector = (struct amdgpu_dm_connector *)stream->dm_stream_context;
+		if (!aconnector || !aconnector->imac5k_secondary_head)
+			continue;
+
+		found_secondary = true;
+		amdgpu_dm_imac5k_finalize_secondary_dpcd(aconnector, tag);
+	}
+
+	if (!found_secondary)
+		drm_info(dev,
+			 "IMAC5K: %s secondary DPCD finalize found no secondary tile stream target stream_count=%u tile_streams=%u\n",
+			 tag, dc_state->stream_count, tile_streams);
 }
 
 static void amdgpu_dm_imac5k_note_two_stream_state(struct drm_device *dev,
@@ -11326,6 +11457,8 @@ static bool amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 	mutex_unlock(&dm->dc_lock);
 	amdgpu_dm_imac5k_note_two_stream_state(dev, dc_state,
 						"commit_streams_end");
+	amdgpu_dm_imac5k_finalize_secondary_links(dev, dc_state,
+						   "commit_streams_end");
 
 	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
 		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
