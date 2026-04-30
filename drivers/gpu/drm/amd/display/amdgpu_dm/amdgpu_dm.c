@@ -3418,10 +3418,106 @@ static void apply_delay_after_dpcd_poweroff(struct amdgpu_device *adev,
  * (MST) sinks. Should be called after connector detection is complete to see
  * the final state of all links.
  */
+static void amdgpu_dm_log_link_route(struct drm_device *dev,
+				     struct dc_link *link,
+				     const char *tag,
+				     const char *connector_name,
+				     int link_slot,
+				     bool force_info)
+{
+	struct ddc *ddc_pin = NULL;
+	const char *sink_name = "n/a";
+	int ddc_line = -1;
+	int ddc_channel = -1;
+	int ddc_hw_supported = -1;
+	int ddc_transaction = -1;
+	int ddc_internal = -1;
+	int enc_connector_id = -1;
+	int enc_connector_enum = -1;
+	int enc_id = -1;
+	int enc_enum = -1;
+	int enc_transmitter = -1;
+	int enc_engine = -1;
+	int enc_hpd_source = -1;
+	int enc_output_signals = 0;
+	bool tx_is_uniphy_d = false;
+
+	if (!dev || !link)
+		return;
+
+	if (!connector_name)
+		connector_name = "<none>";
+
+	if (link->ddc) {
+		ddc_pin = get_ddc_pin(link->ddc);
+		ddc_transaction = link->ddc->transaction_type;
+		ddc_internal = link->ddc->flags.IS_INTERNAL_DISPLAY;
+	}
+
+	if (ddc_pin) {
+		ddc_line = dal_ddc_get_line(ddc_pin);
+		ddc_channel = ddc_pin->hw_info.ddc_channel;
+		ddc_hw_supported = ddc_pin->hw_info.hw_supported;
+	}
+
+	if (link->link_enc) {
+		enc_connector_id = link->link_enc->connector.id;
+		enc_connector_enum = link->link_enc->connector.enum_id;
+		enc_id = link->link_enc->id.id;
+		enc_enum = link->link_enc->id.enum_id;
+		enc_transmitter = link->link_enc->transmitter;
+		enc_engine = link->link_enc->preferred_engine;
+		enc_hpd_source = link->link_enc->hpd_source;
+		enc_output_signals = link->link_enc->output_signals;
+		tx_is_uniphy_d = link->link_enc->transmitter == TRANSMITTER_UNIPHY_D;
+	}
+
+	if (link->local_sink && link->local_sink->edid_caps.display_name[0])
+		sink_name = link->local_sink->edid_caps.display_name;
+
+	if (force_info) {
+		drm_info(dev,
+			 "IMAC5K: %s route connector=%s slot=%d link_index=%u link_id=%u/%u/%u signal=%d type=%d ep=%d internal=%u local_sink=%p sink_signal=%d sink_name=%s sink_edid_len=%u\n",
+			 tag, connector_name, link_slot, link->link_index,
+			 link->link_id.type, link->link_id.enum_id, link->link_id.id,
+			 link->connector_signal, link->type, link->ep_type,
+			 link->is_internal_display, link->local_sink,
+			 link->local_sink ? link->local_sink->sink_signal : SIGNAL_TYPE_NONE,
+			 sink_name,
+			 link->local_sink ? link->local_sink->dc_edid.length : 0);
+		drm_info(dev,
+			 "IMAC5K: %s route connector=%s ddc=%p ddc_pin=%p ddc_hw_inst=%u ddc_line=%d ddc_channel=%d ddc_hw_supported=%d ddc_transaction=%d ddc_internal=%d aux_mode=%u hpd_status=%u hpd_hw=%u hpd_src=%u irq_hpd=%d irq_hpd_rx=%d irq_rr=%d\n",
+			 tag, connector_name, link->ddc, ddc_pin, link->ddc_hw_inst,
+			 ddc_line, ddc_channel, ddc_hw_supported, ddc_transaction,
+			 ddc_internal, link->aux_mode, link->hpd_status,
+			 dc_link_get_hpd_state(link), link->hpd_src,
+			 link->irq_source_hpd, link->irq_source_hpd_rx,
+			 link->irq_source_read_request);
+		drm_info(dev,
+			 "IMAC5K: %s route connector=%s link_enc=%p enc_connector=%d/%d enc_id=%d/%d transmitter=%d tx_is_uniphy_d=%u preferred_engine=%d eng_id=%d link_enc_hw_inst=%u enc_hpd_source=%d enc_output_signals=0x%x link_active=%u link_state_valid=%u rate=%d lanes=%d expected_win_aux_pin_for_0x3113=2\n",
+			 tag, connector_name, link->link_enc,
+			 enc_connector_id, enc_connector_enum, enc_id, enc_enum,
+			 enc_transmitter, tx_is_uniphy_d, enc_engine, link->eng_id,
+			 link->link_enc_hw_inst, enc_hpd_source, enc_output_signals,
+			 link->link_status.link_active, link->link_state_valid,
+			 link->cur_link_settings.link_rate,
+			 link->cur_link_settings.lane_count);
+	} else {
+		drm_dbg_kms(dev,
+			    "LINK_DUMP[%d]: local_sink=%p type=%d sink_signal=%d sink_count=%u edid_name=%s mst_capable=%d mst_alloc_streams=%d\n",
+			    link_slot, link->local_sink, link->type,
+			    link->local_sink ? link->local_sink->sink_signal : SIGNAL_TYPE_NONE,
+			    link->sink_count, sink_name,
+			    link->dpcd_caps.is_mst_capable,
+			    link->mst_stream_alloc_table.stream_count);
+	}
+}
+
 static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
 {
 	struct dc *dc = adev->dm.dc;
 	struct drm_device *dev = adev_to_drm(adev);
+	bool imac5k = adev->dm.imac5k_tiled_display_quirk;
 	int li;
 
 	if (!dc)
@@ -3429,26 +3525,13 @@ static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
 
 	for (li = 0; li < dc->link_count; li++) {
 		struct dc_link *l = dc->links[li];
-		const char *name = NULL;
 		int rs;
 
 		if (!l)
 			continue;
-		if (l->local_sink && l->local_sink->edid_caps.display_name[0])
-			name = l->local_sink->edid_caps.display_name;
-		else
-			name = "n/a";
 
-		drm_dbg_kms(dev,
-			"LINK_DUMP[%d]: local_sink=%p type=%d sink_signal=%d sink_count=%u edid_name=%s mst_capable=%d mst_alloc_streams=%d\n",
-			li,
-			l->local_sink,
-			l->type,
-			l->local_sink ? l->local_sink->sink_signal : SIGNAL_TYPE_NONE,
-			l->sink_count,
-			name,
-			l->dpcd_caps.is_mst_capable,
-			l->mst_stream_alloc_table.stream_count);
+		amdgpu_dm_log_link_route(dev, l, "dc_link_dump",
+					 "<dc-link>", li, imac5k);
 
 		/* Dump remote (MST) sinks if any */
 		for (rs = 0; rs < l->sink_count; rs++) {
@@ -3461,12 +3544,14 @@ static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
 				rname = rsink->edid_caps.display_name;
 			else
 				rname = "n/a";
-			drm_dbg_kms(dev,
-				"  REMOTE_SINK[%d:%d]: sink=%p signal=%d edid_name=%s\n",
-				li, rs,
-				rsink,
-				rsink->sink_signal,
-				rname);
+			if (imac5k)
+				drm_info(dev,
+					 "IMAC5K: dc_link_dump remote_sink[%d:%d] sink=%p signal=%d edid_name=%s\n",
+					 li, rs, rsink, rsink->sink_signal, rname);
+			else
+				drm_dbg_kms(dev,
+					    "  REMOTE_SINK[%d:%d]: sink=%p signal=%d edid_name=%s\n",
+					    li, rs, rsink, rsink->sink_signal, rname);
 		}
 	}
 }
@@ -3492,10 +3577,183 @@ static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
 #define IMAC5K_SECONDARY_LINK_ID   1
 #define IMAC5K_DPCD_PANEL_LATCH    0x4F1
 #define IMAC5K_DPCD_WRITE_RETRY_MS 10
+#define IMAC5K_HPD_CHECK_INTERVAL_MS 10
+#define IMAC5K_HPD_READY_TIMEOUT_MS 300
+#define IMAC5K_POST_HPD_READY_DELAY_MS 30
+#define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
+#define IMAC5K_WIN_PRIMARY_OBJECT_ID   0x3114
+#define IMAC5K_WIN_SECONDARY_SELECTOR  0x4871
+#define IMAC5K_WIN_PRIMARY_SELECTOR    0x4875
+#define IMAC5K_WIN_SECONDARY_AUX_PIN   2
+#define IMAC5K_WIN_PRIMARY_AUX_PIN     3
+#define IMAC5K_SECONDARY_DDC_LINE      GPIO_DDC_LINE_DDC3
+#define IMAC5K_PRIMARY_DDC_LINE        GPIO_DDC_LINE_DDC4
+#define IMAC5K_SECONDARY_DDC_CHANNEL   CHANNEL_ID_DDC3
+#define IMAC5K_PRIMARY_DDC_CHANNEL     CHANNEL_ID_DDC4
+#define IMAC5K_SECONDARY_TRANSMITTER   TRANSMITTER_UNIPHY_D
+#define IMAC5K_PRIMARY_TRANSMITTER     TRANSMITTER_UNIPHY_C
 
 static bool amdgpu_dm_imac5k_quirk_enabled(const struct amdgpu_display_manager *dm)
 {
 	return dm && dm->imac5k_tiled_display_quirk;
+}
+
+static const char *amdgpu_dm_imac5k_ddc_line_name(int line)
+{
+	switch (line) {
+	case GPIO_DDC_LINE_DDC1:
+		return "GPIO_DDC_LINE_DDC1";
+	case GPIO_DDC_LINE_DDC2:
+		return "GPIO_DDC_LINE_DDC2";
+	case GPIO_DDC_LINE_DDC3:
+		return "GPIO_DDC_LINE_DDC3";
+	case GPIO_DDC_LINE_DDC4:
+		return "GPIO_DDC_LINE_DDC4";
+	case GPIO_DDC_LINE_DDC5:
+		return "GPIO_DDC_LINE_DDC5";
+	case GPIO_DDC_LINE_DDC6:
+		return "GPIO_DDC_LINE_DDC6";
+	case GPIO_DDC_LINE_DDC_VGA:
+		return "GPIO_DDC_LINE_DDC_VGA";
+	case GPIO_DDC_LINE_I2C_PAD:
+		return "GPIO_DDC_LINE_I2C_PAD";
+	case GPIO_DDC_LINE_UNKNOWN:
+	default:
+		return "GPIO_DDC_LINE_UNKNOWN";
+	}
+}
+
+static const char *amdgpu_dm_imac5k_channel_name(int channel)
+{
+	switch (channel) {
+	case CHANNEL_ID_DDC1:
+		return "CHANNEL_ID_DDC1";
+	case CHANNEL_ID_DDC2:
+		return "CHANNEL_ID_DDC2";
+	case CHANNEL_ID_DDC3:
+		return "CHANNEL_ID_DDC3";
+	case CHANNEL_ID_DDC4:
+		return "CHANNEL_ID_DDC4";
+	case CHANNEL_ID_DDC5:
+		return "CHANNEL_ID_DDC5";
+	case CHANNEL_ID_DDC6:
+		return "CHANNEL_ID_DDC6";
+	case CHANNEL_ID_DDC_VGA:
+		return "CHANNEL_ID_DDC_VGA";
+	case CHANNEL_ID_I2C_PAD:
+		return "CHANNEL_ID_I2C_PAD";
+	case CHANNEL_ID_UNKNOWN:
+	default:
+		return "CHANNEL_ID_UNKNOWN";
+	}
+}
+
+static const char *amdgpu_dm_imac5k_transmitter_name(int transmitter)
+{
+	switch (transmitter) {
+	case TRANSMITTER_UNIPHY_A:
+		return "TRANSMITTER_UNIPHY_A";
+	case TRANSMITTER_UNIPHY_B:
+		return "TRANSMITTER_UNIPHY_B";
+	case TRANSMITTER_UNIPHY_C:
+		return "TRANSMITTER_UNIPHY_C";
+	case TRANSMITTER_UNIPHY_D:
+		return "TRANSMITTER_UNIPHY_D";
+	case TRANSMITTER_UNIPHY_E:
+		return "TRANSMITTER_UNIPHY_E";
+	case TRANSMITTER_UNIPHY_F:
+		return "TRANSMITTER_UNIPHY_F";
+	case TRANSMITTER_UNIPHY_G:
+		return "TRANSMITTER_UNIPHY_G";
+	case TRANSMITTER_UNKNOWN:
+	default:
+		return "TRANSMITTER_UNKNOWN";
+	}
+}
+
+static bool amdgpu_dm_imac5k_verify_windows_route(
+		struct drm_device *dev,
+		struct dc_link *link,
+		const char *tag,
+		const char *connector_name,
+		bool secondary,
+		const char *operation)
+{
+	struct ddc *ddc_pin = NULL;
+	const char *role = secondary ? "secondary" : "primary";
+	const int expected_ddc_line = secondary ? IMAC5K_SECONDARY_DDC_LINE :
+						 IMAC5K_PRIMARY_DDC_LINE;
+	const int expected_channel = secondary ? IMAC5K_SECONDARY_DDC_CHANNEL :
+						 IMAC5K_PRIMARY_DDC_CHANNEL;
+	const int expected_transmitter = secondary ? IMAC5K_SECONDARY_TRANSMITTER :
+						      IMAC5K_PRIMARY_TRANSMITTER;
+	const unsigned int expected_object_id = secondary ?
+					       IMAC5K_WIN_SECONDARY_OBJECT_ID :
+					       IMAC5K_WIN_PRIMARY_OBJECT_ID;
+	const unsigned int expected_selector = secondary ?
+					      IMAC5K_WIN_SECONDARY_SELECTOR :
+					      IMAC5K_WIN_PRIMARY_SELECTOR;
+	const unsigned int expected_aux_pin = secondary ?
+					     IMAC5K_WIN_SECONDARY_AUX_PIN :
+					     IMAC5K_WIN_PRIMARY_AUX_PIN;
+	int ddc_line = GPIO_DDC_LINE_UNKNOWN;
+	int ddc_channel = CHANNEL_ID_UNKNOWN;
+	int transmitter = TRANSMITTER_UNKNOWN;
+	bool ddc_line_ok;
+	bool ddc_channel_ok;
+	bool transmitter_ok;
+	bool aux_mode_ok;
+	bool ok;
+
+	if (!dev || !link)
+		return false;
+
+	if (!tag)
+		tag = "<none>";
+
+	if (!connector_name)
+		connector_name = "<none>";
+
+	if (!operation)
+		operation = "route";
+
+	if (link->ddc)
+		ddc_pin = get_ddc_pin(link->ddc);
+
+	if (ddc_pin) {
+		ddc_line = dal_ddc_get_line(ddc_pin);
+		ddc_channel = ddc_pin->hw_info.ddc_channel;
+	}
+
+	if (link->link_enc)
+		transmitter = link->link_enc->transmitter;
+
+	ddc_line_ok = ddc_line == expected_ddc_line;
+	ddc_channel_ok = ddc_channel == expected_channel;
+	transmitter_ok = transmitter == expected_transmitter;
+	aux_mode_ok = link->aux_mode;
+	ok = ddc_line_ok && ddc_channel_ok && transmitter_ok && aux_mode_ok;
+
+	drm_info(dev,
+		 "IMAC5K: %s %s Windows-route %s for %s connector=%s link=%u expected_obj=0x%x selector=0x%x win_aux_pin=%u expected_ddc=%s/%d expected_channel=%s/%d expected_tx=%s/%d actual_ddc=%s/%d actual_channel=%s/%d actual_tx=%s/%d ddc_line_ok=%u channel_ok=%u tx_ok=%u aux_mode=%u aux_ok=%u ddc=%p ddc_pin=%p link_enc=%p hpd=%u/%u link_active=%u link_state_valid=%u\n",
+		 tag, role, ok ? "ok" : "mismatch", operation, connector_name,
+		 link->link_index, expected_object_id, expected_selector,
+		 expected_aux_pin,
+		 amdgpu_dm_imac5k_ddc_line_name(expected_ddc_line),
+		 expected_ddc_line,
+		 amdgpu_dm_imac5k_channel_name(expected_channel),
+		 expected_channel,
+		 amdgpu_dm_imac5k_transmitter_name(expected_transmitter),
+		 expected_transmitter,
+		 amdgpu_dm_imac5k_ddc_line_name(ddc_line), ddc_line,
+		 amdgpu_dm_imac5k_channel_name(ddc_channel), ddc_channel,
+		 amdgpu_dm_imac5k_transmitter_name(transmitter), transmitter,
+		 ddc_line_ok, ddc_channel_ok, transmitter_ok, link->aux_mode,
+		 aux_mode_ok, link->ddc, ddc_pin, link->link_enc,
+		 link->hpd_status, dc_link_get_hpd_state(link),
+		 link->link_status.link_active, link->link_state_valid);
+
+	return ok;
 }
 
 static bool amdgpu_dm_imac5k_panel_geometry_match(const struct amdgpu_dm_connector *aconnector)
@@ -3942,6 +4200,21 @@ static void amdgpu_dm_imac5k_log_connector(struct amdgpu_dm_connector *aconnecto
 		 connector->tile_v_loc,
 		 connector->tile_h_size,
 		 connector->tile_v_size);
+
+	amdgpu_dm_log_link_route(dev, aconnector->dc_link, tag,
+				 connector->name,
+				 aconnector->dc_link ? aconnector->dc_link->link_index : -1,
+				 true);
+
+	if (amdgpu_dm_imac5k_is_primary_head(aconnector))
+		amdgpu_dm_imac5k_verify_windows_route(dev, aconnector->dc_link,
+						      tag, connector->name,
+						      false, "connector-log");
+	else if (aconnector->imac5k_secondary_head ||
+		 amdgpu_dm_imac5k_is_secondary_head(aconnector))
+		amdgpu_dm_imac5k_verify_windows_route(dev, aconnector->dc_link,
+						      tag, connector->name,
+						      true, "connector-log");
 }
 
 static bool amdgpu_dm_imac5k_is_tile_stream(const struct dc_stream_state *stream)
@@ -3972,6 +4245,173 @@ static u32 amdgpu_dm_imac5k_count_tile_streams(const struct dc_state *dc_state)
 	return count;
 }
 
+static bool
+amdgpu_dm_imac5k_wait_secondary_aux_ready(
+		struct amdgpu_dm_connector *aconnector,
+		const char *tag)
+{
+	struct drm_device *dev;
+	struct dc_link *link;
+	bool hpd_cached_final;
+	bool hpd_cached_initial;
+	bool hpd_hw_final;
+	bool hpd_hw_initial;
+	bool hpd_initial;
+	bool hpd_ready;
+	bool waited_before;
+	u32 elapsed_ms = 0;
+	u32 post_delay_ms = 0;
+	int link_connector_id = CONNECTOR_ID_UNKNOWN;
+	int enc_connector_id = CONNECTOR_ID_UNKNOWN;
+
+	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
+		return false;
+
+	if (!aconnector->imac5k_secondary_head)
+		return true;
+
+	dev = aconnector->base.dev;
+	link = aconnector->dc_link;
+
+	if (!link->dc || !link->dc->link_srv) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary AUX-ready wait skipped on %s link=%u: missing dc\n",
+			 tag, aconnector->base.name, link->link_index);
+		return false;
+	}
+
+	link_connector_id = link->link_id.id;
+	if (link->link_enc)
+		enc_connector_id = link->link_enc->connector.id;
+
+	waited_before = aconnector->imac5k_aux_ready_wait_done;
+	hpd_hw_initial = dc_link_get_hpd_state(link);
+	hpd_cached_initial = link->hpd_status;
+	hpd_initial = hpd_hw_initial || hpd_cached_initial;
+	hpd_ready = hpd_initial;
+	while (!hpd_ready && elapsed_ms < IMAC5K_HPD_READY_TIMEOUT_MS) {
+		msleep(IMAC5K_HPD_CHECK_INTERVAL_MS);
+		elapsed_ms += IMAC5K_HPD_CHECK_INTERVAL_MS;
+		hpd_ready = dc_link_get_hpd_state(link) || link->hpd_status;
+	}
+	hpd_hw_final = dc_link_get_hpd_state(link);
+	hpd_cached_final = link->hpd_status;
+
+	if (hpd_ready && !aconnector->imac5k_aux_ready_wait_done) {
+		post_delay_ms = IMAC5K_POST_HPD_READY_DELAY_MS;
+		msleep(post_delay_ms);
+		aconnector->imac5k_aux_ready_wait_done = true;
+	}
+
+	drm_info(dev,
+		 "IMAC5K: %s secondary AUX-ready wait %s link=%u signal=%d link_conn=%d enc_conn=%d live_sink=%u hpd_initial=%u hw_hpd=%u/%u cached_hpd=%u/%u hpd_ready=%u elapsed_ms=%u post_delay_ms=%u waited_before=%u\n",
+		 tag, aconnector->base.name, link->link_index,
+		 link->connector_signal, link_connector_id, enc_connector_id,
+		 !!link->local_sink, hpd_initial, hpd_hw_initial, hpd_hw_final,
+		 hpd_cached_initial, hpd_cached_final, hpd_ready, elapsed_ms,
+		 post_delay_ms, waited_before);
+
+	return hpd_ready;
+}
+
+static bool
+amdgpu_dm_imac5k_program_secondary_source_dpcd(
+		struct amdgpu_dm_connector *aconnector,
+		const char *tag,
+		bool require_live_sink,
+		bool force)
+{
+	struct drm_device *dev;
+	struct dc_link *link;
+	enum dc_status mst_status;
+	enum dc_status status;
+	u8 table_revision[3];
+	u8 mst_ctrl = 0;
+
+	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
+		return false;
+
+	if (!aconnector->imac5k_secondary_head)
+		return false;
+
+	if (aconnector->imac5k_source_dpcd_programmed && !force)
+		return true;
+
+	dev = aconnector->base.dev;
+	link = aconnector->dc_link;
+
+	if (force)
+		aconnector->imac5k_source_dpcd_programmed = false;
+
+	amdgpu_dm_log_link_route(dev, link, tag, aconnector->base.name,
+				 link->link_index, true);
+
+	if (!amdgpu_dm_imac5k_wait_secondary_aux_ready(aconnector, tag)) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary source-DPCD skipped on %s link=%u: AUX/HPD not ready\n",
+			 tag, aconnector->base.name, link->link_index);
+		return false;
+	}
+
+	if (require_live_sink && !link->local_sink) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary source-DPCD skipped on %s link=%u: no live local sink\n",
+			 tag, aconnector->base.name, link->link_index);
+		return false;
+	}
+
+	if (!link->ctx) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary source-DPCD skipped on %s link=%u: missing dc ctx\n",
+			 tag, aconnector->base.name, link->link_index);
+		return false;
+	}
+
+	if (!amdgpu_dm_imac5k_verify_windows_route(dev, link, tag,
+						   aconnector->base.name,
+						   true, "source-DPCD")) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary source-DPCD skipped on %s link=%u: Windows-equivalent route mismatch\n",
+			 tag, aconnector->base.name, link->link_index);
+		return false;
+	}
+
+	/*
+	 * Windows publishes source-DPCD before link training. Log 0x111 here
+	 * read-only because Windows conditionally touches it on the signal-32
+	 * class-2 path, but we are not ready to mutate that register yet.
+	 */
+	mst_status = core_link_read_dpcd(link, DP_MSTM_CTRL,
+					&mst_ctrl, sizeof(mst_ctrl));
+
+	dpcd_set_source_specific_data(link);
+
+	table_revision[0] = link->ctx->dce_version >= DCE_VERSION_12_0 ?
+			    0x05 : 0x04;
+	table_revision[1] = 0x1d;
+	table_revision[2] = 0x03;
+
+	status = core_link_write_dpcd(link, DP_SOURCE_TABLE_REVISION,
+				      table_revision, sizeof(table_revision));
+	if (status == DC_OK)
+		aconnector->imac5k_source_dpcd_programmed = true;
+	else
+		drm_info(dev,
+			 "IMAC5K: %s secondary source-DPCD write failed after Windows-route ok on %s link=%u status=%d 0x310=%02x %02x %02x\n",
+			 tag, aconnector->base.name, link->link_index, status,
+			 table_revision[0], table_revision[1], table_revision[2]);
+
+	drm_info(dev,
+		 "IMAC5K: %s secondary source-DPCD %s link=%u dce=%d live_sink=%u force=%u 0x111=%02x status_111=%d 0x310=%02x %02x %02x status=%d programmed=%u\n",
+		 tag, aconnector->base.name, link->link_index,
+		 link->ctx->dce_version, !!link->local_sink, force,
+		 mst_ctrl, mst_status,
+		 table_revision[0], table_revision[1], table_revision[2],
+		 status, aconnector->imac5k_source_dpcd_programmed);
+
+	return aconnector->imac5k_source_dpcd_programmed;
+}
+
 static void
 amdgpu_dm_imac5k_finalize_secondary_dpcd(struct amdgpu_dm_connector *aconnector,
 					 const char *tag)
@@ -3979,7 +4419,6 @@ amdgpu_dm_imac5k_finalize_secondary_dpcd(struct amdgpu_dm_connector *aconnector,
 	struct drm_device *dev;
 	struct dc_link *link;
 	enum dc_status status;
-	u8 table_revision[3];
 	u8 payload = 1;
 
 	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
@@ -3999,31 +4438,33 @@ amdgpu_dm_imac5k_finalize_secondary_dpcd(struct amdgpu_dm_connector *aconnector,
 	}
 
 	if (!aconnector->imac5k_source_dpcd_programmed) {
-		dpcd_set_source_specific_data(link);
-
-		table_revision[0] = link->ctx->dce_version >= DCE_VERSION_12_0 ?
-				    0x05 : 0x04;
-		table_revision[1] = 0x1d;
-		table_revision[2] = 0x03;
-
-		status = core_link_write_dpcd(link, DP_SOURCE_TABLE_REVISION,
-					      table_revision,
-					      sizeof(table_revision));
-		if (status == DC_OK)
-			aconnector->imac5k_source_dpcd_programmed = true;
-
-		drm_info(dev,
-			 "IMAC5K: %s secondary source-DPCD %s link=%u dce=%d 0x310=%02x %02x %02x status=%d\n",
-			 tag, aconnector->base.name, link->link_index,
-			 link->ctx->dce_version,
-			 table_revision[0], table_revision[1], table_revision[2],
-			 status);
+		amdgpu_dm_imac5k_program_secondary_source_dpcd(aconnector,
+							       tag, false, false);
 	}
 
 	if (!aconnector->imac5k_source_dpcd_programmed) {
 		drm_info(dev,
 			 "IMAC5K: %s secondary 0x4F1 latch deferred on %s link=%u: source-DPCD not programmed\n",
 			 tag, aconnector->base.name, link->link_index);
+		return;
+	}
+
+	if (!amdgpu_dm_imac5k_verify_windows_route(dev, link, tag,
+						   aconnector->base.name,
+						   true, "0x4F1-latch")) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary 0x4F1 latch deferred on %s link=%u: Windows-equivalent route mismatch\n",
+			 tag, aconnector->base.name, link->link_index);
+		return;
+	}
+
+	if (!link->link_status.link_active || !link->link_state_valid) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary 0x4F1 latch deferred on %s link=%u: link_active=%u link_state_valid=%u live_sink=%u rate=%d lanes=%d\n",
+			 tag, aconnector->base.name, link->link_index,
+			 link->link_status.link_active, link->link_state_valid,
+			 !!link->local_sink, link->cur_link_settings.link_rate,
+			 link->cur_link_settings.lane_count);
 		return;
 	}
 
@@ -4040,6 +4481,11 @@ amdgpu_dm_imac5k_finalize_secondary_dpcd(struct amdgpu_dm_connector *aconnector,
 
 	if (status == DC_OK)
 		aconnector->imac5k_dpcd_4f1_asserted = true;
+	else
+		drm_info(dev,
+			 "IMAC5K: %s secondary 0x4F1 latch write failed after Windows-route ok on %s link=%u payload=%u status=%d\n",
+			 tag, aconnector->base.name, link->link_index, payload,
+			 status);
 
 	drm_info(dev,
 		 "IMAC5K: %s secondary 0x4F1 latch %s link=%u payload=%u status=%d asserted=%u\n",
@@ -4093,6 +4539,44 @@ static void amdgpu_dm_imac5k_finalize_secondary_links(struct drm_device *dev,
 		drm_info(dev,
 			 "IMAC5K: %s secondary DPCD finalize found no secondary tile stream target stream_count=%u tile_streams=%u\n",
 			 tag, dc_state->stream_count, tile_streams);
+}
+
+static void
+amdgpu_dm_imac5k_program_secondary_source_dpcd_for_streams(
+		struct drm_device *dev,
+		struct dc_state *dc_state,
+		const char *tag)
+{
+	struct amdgpu_display_manager *dm;
+	u32 i;
+
+	if (!dev || !dc_state)
+		return;
+
+	dm = &drm_to_adev(dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm))
+		return;
+
+	for (i = 0; i < dc_state->stream_count; i++) {
+		struct dc_stream_state *stream = dc_state->streams[i];
+		struct amdgpu_dm_connector *aconnector;
+
+		if (!amdgpu_dm_imac5k_is_tile_stream(stream))
+			continue;
+
+		aconnector = (struct amdgpu_dm_connector *)stream->dm_stream_context;
+		if (!aconnector || !aconnector->imac5k_secondary_head)
+			continue;
+
+		/*
+		 * Re-publish immediately before DC enables/trains the link.
+		 * DP power transitions can discard source-DPCD state, and this
+		 * mirrors the Windows ordering more closely than detect-time.
+		 */
+		amdgpu_dm_imac5k_program_secondary_source_dpcd(aconnector,
+							       tag, false,
+							       true);
+	}
 }
 
 static void amdgpu_dm_imac5k_note_two_stream_state(struct drm_device *dev,
@@ -4661,6 +5145,10 @@ void amdgpu_dm_update_connector_after_detect(
 		return;
 
 	amdgpu_dm_imac5k_mark_secondary_head(aconnector);
+	if (sink)
+		amdgpu_dm_imac5k_program_secondary_source_dpcd(aconnector,
+							       "detect_live_pretrain",
+							       true, false);
 	amdgpu_dm_imac5k_seed_emulated_sink(aconnector);
 	amdgpu_dm_imac5k_note_plain_boot_candidate(aconnector);
 	amdgpu_dm_imac5k_apply_primary_tile_property(aconnector);
@@ -4731,6 +5219,9 @@ void amdgpu_dm_update_connector_after_detect(
 		amdgpu_dm_update_freesync_caps(connector, aconnector->drm_edid);
 		update_connector_ext_caps(aconnector);
 		amdgpu_dm_imac5k_mark_secondary_head(aconnector);
+		amdgpu_dm_imac5k_program_secondary_source_dpcd(aconnector,
+							       "detect_connected_pretrain",
+							       true, false);
 		amdgpu_dm_imac5k_seed_emulated_sink(aconnector);
 		amdgpu_dm_imac5k_note_plain_boot_candidate(aconnector);
 		amdgpu_dm_imac5k_apply_primary_tile_property(aconnector);
@@ -6516,6 +7007,9 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 		}
 		amdgpu_set_panel_orientation(&aconnector->base);
 		amdgpu_dm_imac5k_mark_secondary_head(aconnector);
+		amdgpu_dm_imac5k_program_secondary_source_dpcd(aconnector,
+							       "boot_detect_pretrain",
+							       true, false);
 		amdgpu_dm_imac5k_seed_emulated_sink(aconnector);
 		amdgpu_dm_imac5k_note_plain_boot_candidate(aconnector);
 		amdgpu_dm_imac5k_apply_primary_tile_property(aconnector);
@@ -11449,6 +11943,8 @@ static bool amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 	dm_enable_per_frame_crtc_master_sync(dc_state);
 	mutex_lock(&dm->dc_lock);
 	dc_exit_ips_for_hw_access(dm->dc);
+	amdgpu_dm_imac5k_program_secondary_source_dpcd_for_streams(
+			dev, dc_state, "commit_streams_pretrain");
 	WARN_ON(!dc_commit_streams(dm->dc, &params));
 
 	/* Allow idle optimization when vblank count is 0 for display off */

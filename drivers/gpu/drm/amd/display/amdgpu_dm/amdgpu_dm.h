@@ -896,6 +896,7 @@ struct amdgpu_dm_connector {
 	 */
 	bool imac5k_secondary_head;
 	bool imac5k_em_sink_seeded;
+	bool imac5k_aux_ready_wait_done;
 	bool imac5k_source_dpcd_programmed;
 	bool imac5k_dpcd_4f1_asserted;
 
