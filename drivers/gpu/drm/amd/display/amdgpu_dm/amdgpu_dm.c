@@ -3589,8 +3589,8 @@ static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
 #define IMAC5K_WIN_PRIMARY_AUX_PIN     3
 #define IMAC5K_SECONDARY_DDC_LINE      GPIO_DDC_LINE_DDC3
 #define IMAC5K_PRIMARY_DDC_LINE        GPIO_DDC_LINE_DDC4
-#define IMAC5K_SECONDARY_DDC_CHANNEL   CHANNEL_ID_DDC3
-#define IMAC5K_PRIMARY_DDC_CHANNEL     CHANNEL_ID_DDC4
+#define IMAC5K_SECONDARY_DDC_HW_CHANNEL IMAC5K_SECONDARY_DDC_LINE
+#define IMAC5K_PRIMARY_DDC_HW_CHANNEL   IMAC5K_PRIMARY_DDC_LINE
 #define IMAC5K_SECONDARY_TRANSMITTER   TRANSMITTER_UNIPHY_D
 #define IMAC5K_PRIMARY_TRANSMITTER     TRANSMITTER_UNIPHY_C
 
@@ -3621,31 +3621,6 @@ static const char *amdgpu_dm_imac5k_ddc_line_name(int line)
 	case GPIO_DDC_LINE_UNKNOWN:
 	default:
 		return "GPIO_DDC_LINE_UNKNOWN";
-	}
-}
-
-static const char *amdgpu_dm_imac5k_channel_name(int channel)
-{
-	switch (channel) {
-	case CHANNEL_ID_DDC1:
-		return "CHANNEL_ID_DDC1";
-	case CHANNEL_ID_DDC2:
-		return "CHANNEL_ID_DDC2";
-	case CHANNEL_ID_DDC3:
-		return "CHANNEL_ID_DDC3";
-	case CHANNEL_ID_DDC4:
-		return "CHANNEL_ID_DDC4";
-	case CHANNEL_ID_DDC5:
-		return "CHANNEL_ID_DDC5";
-	case CHANNEL_ID_DDC6:
-		return "CHANNEL_ID_DDC6";
-	case CHANNEL_ID_DDC_VGA:
-		return "CHANNEL_ID_DDC_VGA";
-	case CHANNEL_ID_I2C_PAD:
-		return "CHANNEL_ID_I2C_PAD";
-	case CHANNEL_ID_UNKNOWN:
-	default:
-		return "CHANNEL_ID_UNKNOWN";
 	}
 }
 
@@ -3684,8 +3659,9 @@ static bool amdgpu_dm_imac5k_verify_windows_route(
 	const char *role = secondary ? "secondary" : "primary";
 	const int expected_ddc_line = secondary ? IMAC5K_SECONDARY_DDC_LINE :
 						 IMAC5K_PRIMARY_DDC_LINE;
-	const int expected_channel = secondary ? IMAC5K_SECONDARY_DDC_CHANNEL :
-						 IMAC5K_PRIMARY_DDC_CHANNEL;
+	const int expected_ddc_hw_channel = secondary ?
+					    IMAC5K_SECONDARY_DDC_HW_CHANNEL :
+					    IMAC5K_PRIMARY_DDC_HW_CHANNEL;
 	const int expected_transmitter = secondary ? IMAC5K_SECONDARY_TRANSMITTER :
 						      IMAC5K_PRIMARY_TRANSMITTER;
 	const unsigned int expected_object_id = secondary ?
@@ -3698,10 +3674,10 @@ static bool amdgpu_dm_imac5k_verify_windows_route(
 					     IMAC5K_WIN_SECONDARY_AUX_PIN :
 					     IMAC5K_WIN_PRIMARY_AUX_PIN;
 	int ddc_line = GPIO_DDC_LINE_UNKNOWN;
-	int ddc_channel = CHANNEL_ID_UNKNOWN;
+	int ddc_hw_channel = GPIO_DDC_LINE_UNKNOWN;
 	int transmitter = TRANSMITTER_UNKNOWN;
 	bool ddc_line_ok;
-	bool ddc_channel_ok;
+	bool ddc_hw_channel_ok;
 	bool transmitter_ok;
 	bool aux_mode_ok;
 	bool ok;
@@ -3723,33 +3699,38 @@ static bool amdgpu_dm_imac5k_verify_windows_route(
 
 	if (ddc_pin) {
 		ddc_line = dal_ddc_get_line(ddc_pin);
-		ddc_channel = ddc_pin->hw_info.ddc_channel;
+		/*
+		 * hw_info.ddc_channel mirrors the ATOM BIOS i2c_line value,
+		 * not enum channel_id. It is zero-based like enum gpio_ddc_line.
+		 */
+		ddc_hw_channel = ddc_pin->hw_info.ddc_channel;
 	}
 
 	if (link->link_enc)
 		transmitter = link->link_enc->transmitter;
 
 	ddc_line_ok = ddc_line == expected_ddc_line;
-	ddc_channel_ok = ddc_channel == expected_channel;
+	ddc_hw_channel_ok = ddc_hw_channel == expected_ddc_hw_channel;
 	transmitter_ok = transmitter == expected_transmitter;
 	aux_mode_ok = link->aux_mode;
-	ok = ddc_line_ok && ddc_channel_ok && transmitter_ok && aux_mode_ok;
+	ok = ddc_line_ok && ddc_hw_channel_ok && transmitter_ok && aux_mode_ok;
 
 	drm_info(dev,
-		 "IMAC5K: %s %s Windows-route %s for %s connector=%s link=%u expected_obj=0x%x selector=0x%x win_aux_pin=%u expected_ddc=%s/%d expected_channel=%s/%d expected_tx=%s/%d actual_ddc=%s/%d actual_channel=%s/%d actual_tx=%s/%d ddc_line_ok=%u channel_ok=%u tx_ok=%u aux_mode=%u aux_ok=%u ddc=%p ddc_pin=%p link_enc=%p hpd=%u/%u link_active=%u link_state_valid=%u\n",
+		 "IMAC5K: %s %s Windows-route %s for %s connector=%s link=%u expected_obj=0x%x selector=0x%x win_aux_pin=%u expected_ddc=%s/%d expected_hw_channel=%s/%d expected_tx=%s/%d actual_ddc=%s/%d actual_hw_channel=%s/%d actual_tx=%s/%d ddc_line_ok=%u hw_channel_ok=%u tx_ok=%u aux_mode=%u aux_ok=%u ddc=%p ddc_pin=%p link_enc=%p hpd=%u/%u link_active=%u link_state_valid=%u\n",
 		 tag, role, ok ? "ok" : "mismatch", operation, connector_name,
 		 link->link_index, expected_object_id, expected_selector,
 		 expected_aux_pin,
 		 amdgpu_dm_imac5k_ddc_line_name(expected_ddc_line),
 		 expected_ddc_line,
-		 amdgpu_dm_imac5k_channel_name(expected_channel),
-		 expected_channel,
+		 amdgpu_dm_imac5k_ddc_line_name(expected_ddc_hw_channel),
+		 expected_ddc_hw_channel,
 		 amdgpu_dm_imac5k_transmitter_name(expected_transmitter),
 		 expected_transmitter,
 		 amdgpu_dm_imac5k_ddc_line_name(ddc_line), ddc_line,
-		 amdgpu_dm_imac5k_channel_name(ddc_channel), ddc_channel,
+		 amdgpu_dm_imac5k_ddc_line_name(ddc_hw_channel),
+		 ddc_hw_channel,
 		 amdgpu_dm_imac5k_transmitter_name(transmitter), transmitter,
-		 ddc_line_ok, ddc_channel_ok, transmitter_ok, link->aux_mode,
+		 ddc_line_ok, ddc_hw_channel_ok, transmitter_ok, link->aux_mode,
 		 aux_mode_ok, link->ddc, ddc_pin, link->link_enc,
 		 link->hpd_status, dc_link_get_hpd_state(link),
 		 link->link_status.link_active, link->link_state_valid);
