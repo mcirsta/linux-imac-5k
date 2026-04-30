@@ -42,6 +42,7 @@
 #include "amdgpu_dm_trace.h"
 #include "link/protocols/link_dpcd.h"
 #include "link_service_types.h"
+#include "gpio_service_interface.h"
 #include "link/protocols/link_dp_capability.h"
 #include "link/protocols/link_ddc.h"
 
