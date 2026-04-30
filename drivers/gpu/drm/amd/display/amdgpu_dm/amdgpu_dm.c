@@ -3578,6 +3578,7 @@ static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
 #define IMAC5K_SECONDARY_LINK_ID   1
 #define IMAC5K_DPCD_PANEL_LATCH    0x4F1
 #define IMAC5K_DPCD_WRITE_RETRY_MS 10
+#define IMAC5K_DPCD_PANEL_LATCH_SETTLE_MS 100
 #define IMAC5K_HPD_CHECK_INTERVAL_MS 10
 #define IMAC5K_HPD_READY_TIMEOUT_MS 300
 #define IMAC5K_POST_HPD_READY_DELAY_MS 30
@@ -4297,6 +4298,127 @@ amdgpu_dm_imac5k_wait_secondary_aux_ready(
 }
 
 static bool
+amdgpu_dm_imac5k_write_secondary_4f1_latch(
+		struct amdgpu_dm_connector *aconnector,
+		const char *tag,
+		bool require_live_sink,
+		bool require_link_active,
+		bool settle_after_attempt)
+{
+	struct drm_device *dev;
+	struct dc_link *link;
+	enum dc_status dpcd_rev_status = DC_ERROR_UNEXPECTED;
+	enum dc_status sink_status_status = DC_ERROR_UNEXPECTED;
+	enum dc_status status;
+	u8 dpcd_rev = 0;
+	u8 payload = 1;
+	u8 sink_status = 0;
+	bool hpd_cached_after;
+	bool hpd_cached_before;
+	bool hpd_hw_after = false;
+	bool hpd_hw_before = false;
+
+	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
+		return false;
+
+	if (!aconnector->imac5k_secondary_head)
+		return false;
+
+	dev = aconnector->base.dev;
+	link = aconnector->dc_link;
+
+	if (!link->ctx) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary 0x4F1 latch skipped on %s link=%u: missing dc ctx\n",
+			 tag, aconnector->base.name, link->link_index);
+		return false;
+	}
+
+	if (!amdgpu_dm_imac5k_verify_windows_route(dev, link, tag,
+						   aconnector->base.name,
+						   true, "0x4F1-latch")) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary 0x4F1 latch deferred on %s link=%u: Windows-equivalent route mismatch\n",
+			 tag, aconnector->base.name, link->link_index);
+		return false;
+	}
+
+	hpd_cached_before = link->hpd_status;
+	if (link->dc && link->dc->link_srv)
+		hpd_hw_before = dc_link_get_hpd_state(link);
+
+	if (require_live_sink && !link->local_sink) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary 0x4F1 latch deferred on %s link=%u: no live local sink hpd=%u/%u\n",
+			 tag, aconnector->base.name, link->link_index,
+			 hpd_hw_before, hpd_cached_before);
+		return false;
+	}
+
+	if (require_link_active &&
+	    (!link->link_status.link_active || !link->link_state_valid)) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary 0x4F1 latch deferred on %s link=%u: link_active=%u link_state_valid=%u live_sink=%u rate=%d lanes=%d hpd=%u/%u\n",
+			 tag, aconnector->base.name, link->link_index,
+			 link->link_status.link_active, link->link_state_valid,
+			 !!link->local_sink, link->cur_link_settings.link_rate,
+			 link->cur_link_settings.lane_count,
+			 hpd_hw_before, hpd_cached_before);
+		return false;
+	}
+
+	if (aconnector->imac5k_dpcd_4f1_asserted) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary 0x4F1 latch already asserted on %s link=%u live_sink=%u link_active=%u link_state_valid=%u hpd=%u/%u\n",
+			 tag, aconnector->base.name, link->link_index,
+			 !!link->local_sink, link->link_status.link_active,
+			 link->link_state_valid, hpd_hw_before, hpd_cached_before);
+		return true;
+	}
+
+	status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+				      &payload, sizeof(payload));
+	if (status != DC_OK) {
+		msleep(IMAC5K_DPCD_WRITE_RETRY_MS);
+		status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+					      &payload, sizeof(payload));
+	}
+
+	if (status == DC_OK)
+		aconnector->imac5k_dpcd_4f1_asserted = true;
+	else
+		drm_info(dev,
+			 "IMAC5K: %s secondary 0x4F1 latch write failed after Windows-route ok on %s link=%u payload=%u status=%d\n",
+			 tag, aconnector->base.name, link->link_index, payload,
+			 status);
+
+	if (settle_after_attempt)
+		msleep(IMAC5K_DPCD_PANEL_LATCH_SETTLE_MS);
+
+	dpcd_rev_status = core_link_read_dpcd(link, DP_DPCD_REV,
+					      &dpcd_rev, sizeof(dpcd_rev));
+	sink_status_status = core_link_read_dpcd(link, DP_SINK_STATUS,
+						 &sink_status,
+						 sizeof(sink_status));
+
+	hpd_cached_after = link->hpd_status;
+	if (link->dc && link->dc->link_srv)
+		hpd_hw_after = dc_link_get_hpd_state(link);
+
+	drm_info(dev,
+		 "IMAC5K: %s secondary 0x4F1 latch %s link=%u payload=%u status=%d asserted=%u settle_ms=%u live_sink=%u link_active=%u link_state_valid=%u hpd_hw=%u/%u hpd_cached=%u/%u dpcd000=%02x status000=%d dpcd205=%02x status205=%d\n",
+		 tag, aconnector->base.name, link->link_index, payload,
+		 status, aconnector->imac5k_dpcd_4f1_asserted,
+		 settle_after_attempt ? IMAC5K_DPCD_PANEL_LATCH_SETTLE_MS : 0,
+		 !!link->local_sink, link->link_status.link_active,
+		 link->link_state_valid, hpd_hw_before, hpd_hw_after,
+		 hpd_cached_before, hpd_cached_after, dpcd_rev,
+		 dpcd_rev_status, sink_status, sink_status_status);
+
+	return aconnector->imac5k_dpcd_4f1_asserted;
+}
+
+static bool
 amdgpu_dm_imac5k_program_secondary_source_dpcd(
 		struct amdgpu_dm_connector *aconnector,
 		const char *tag,
@@ -4309,6 +4431,7 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd(
 	enum dc_status status;
 	u8 table_revision[3];
 	u8 mst_ctrl = 0;
+	bool was_programmed;
 
 	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
 		return false;
@@ -4316,46 +4439,54 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd(
 	if (!aconnector->imac5k_secondary_head)
 		return false;
 
-	if (aconnector->imac5k_source_dpcd_programmed && !force)
+	if (aconnector->imac5k_source_dpcd_programmed && !force) {
+		if (require_live_sink && !aconnector->imac5k_dpcd_4f1_asserted)
+			amdgpu_dm_imac5k_write_secondary_4f1_latch(aconnector,
+								   tag,
+								   true, false,
+								   true);
 		return true;
+	}
 
+	was_programmed = aconnector->imac5k_source_dpcd_programmed;
 	dev = aconnector->base.dev;
 	link = aconnector->dc_link;
-
-	if (force)
-		aconnector->imac5k_source_dpcd_programmed = false;
 
 	amdgpu_dm_log_link_route(dev, link, tag, aconnector->base.name,
 				 link->link_index, true);
 
 	if (!amdgpu_dm_imac5k_wait_secondary_aux_ready(aconnector, tag)) {
 		drm_info(dev,
-			 "IMAC5K: %s secondary source-DPCD skipped on %s link=%u: AUX/HPD not ready\n",
-			 tag, aconnector->base.name, link->link_index);
-		return false;
+			 "IMAC5K: %s secondary source-DPCD skipped on %s link=%u: AUX/HPD not ready previously_programmed=%u\n",
+			 tag, aconnector->base.name, link->link_index,
+			 was_programmed);
+		return was_programmed;
 	}
 
 	if (require_live_sink && !link->local_sink) {
 		drm_info(dev,
-			 "IMAC5K: %s secondary source-DPCD skipped on %s link=%u: no live local sink\n",
-			 tag, aconnector->base.name, link->link_index);
-		return false;
+			 "IMAC5K: %s secondary source-DPCD skipped on %s link=%u: no live local sink previously_programmed=%u\n",
+			 tag, aconnector->base.name, link->link_index,
+			 was_programmed);
+		return was_programmed;
 	}
 
 	if (!link->ctx) {
 		drm_info(dev,
-			 "IMAC5K: %s secondary source-DPCD skipped on %s link=%u: missing dc ctx\n",
-			 tag, aconnector->base.name, link->link_index);
-		return false;
+			 "IMAC5K: %s secondary source-DPCD skipped on %s link=%u: missing dc ctx previously_programmed=%u\n",
+			 tag, aconnector->base.name, link->link_index,
+			 was_programmed);
+		return was_programmed;
 	}
 
 	if (!amdgpu_dm_imac5k_verify_windows_route(dev, link, tag,
 						   aconnector->base.name,
 						   true, "source-DPCD")) {
 		drm_info(dev,
-			 "IMAC5K: %s secondary source-DPCD skipped on %s link=%u: Windows-equivalent route mismatch\n",
-			 tag, aconnector->base.name, link->link_index);
-		return false;
+			 "IMAC5K: %s secondary source-DPCD skipped on %s link=%u: Windows-equivalent route mismatch previously_programmed=%u\n",
+			 tag, aconnector->base.name, link->link_index,
+			 was_programmed);
+		return was_programmed;
 	}
 
 	/*
@@ -4384,12 +4515,17 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd(
 			 table_revision[0], table_revision[1], table_revision[2]);
 
 	drm_info(dev,
-		 "IMAC5K: %s secondary source-DPCD %s link=%u dce=%d live_sink=%u force=%u 0x111=%02x status_111=%d 0x310=%02x %02x %02x status=%d programmed=%u\n",
+		 "IMAC5K: %s secondary source-DPCD %s link=%u dce=%d live_sink=%u force=%u previously_programmed=%u 0x111=%02x status_111=%d 0x310=%02x %02x %02x status=%d programmed=%u\n",
 		 tag, aconnector->base.name, link->link_index,
 		 link->ctx->dce_version, !!link->local_sink, force,
-		 mst_ctrl, mst_status,
+		 was_programmed, mst_ctrl, mst_status,
 		 table_revision[0], table_revision[1], table_revision[2],
 		 status, aconnector->imac5k_source_dpcd_programmed);
+
+	if (status == DC_OK && require_live_sink && !force)
+		amdgpu_dm_imac5k_write_secondary_4f1_latch(aconnector, tag,
+							   true, false,
+							   true);
 
 	return aconnector->imac5k_source_dpcd_programmed;
 }
@@ -4400,8 +4536,6 @@ amdgpu_dm_imac5k_finalize_secondary_dpcd(struct amdgpu_dm_connector *aconnector,
 {
 	struct drm_device *dev;
 	struct dc_link *link;
-	enum dc_status status;
-	u8 payload = 1;
 
 	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
 		return;
@@ -4431,48 +4565,8 @@ amdgpu_dm_imac5k_finalize_secondary_dpcd(struct amdgpu_dm_connector *aconnector,
 		return;
 	}
 
-	if (!amdgpu_dm_imac5k_verify_windows_route(dev, link, tag,
-						   aconnector->base.name,
-						   true, "0x4F1-latch")) {
-		drm_info(dev,
-			 "IMAC5K: %s secondary 0x4F1 latch deferred on %s link=%u: Windows-equivalent route mismatch\n",
-			 tag, aconnector->base.name, link->link_index);
-		return;
-	}
-
-	if (!link->link_status.link_active || !link->link_state_valid) {
-		drm_info(dev,
-			 "IMAC5K: %s secondary 0x4F1 latch deferred on %s link=%u: link_active=%u link_state_valid=%u live_sink=%u rate=%d lanes=%d\n",
-			 tag, aconnector->base.name, link->link_index,
-			 link->link_status.link_active, link->link_state_valid,
-			 !!link->local_sink, link->cur_link_settings.link_rate,
-			 link->cur_link_settings.lane_count);
-		return;
-	}
-
-	if (aconnector->imac5k_dpcd_4f1_asserted)
-		return;
-
-	status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
-				      &payload, sizeof(payload));
-	if (status != DC_OK) {
-		msleep(IMAC5K_DPCD_WRITE_RETRY_MS);
-		status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
-					      &payload, sizeof(payload));
-	}
-
-	if (status == DC_OK)
-		aconnector->imac5k_dpcd_4f1_asserted = true;
-	else
-		drm_info(dev,
-			 "IMAC5K: %s secondary 0x4F1 latch write failed after Windows-route ok on %s link=%u payload=%u status=%d\n",
-			 tag, aconnector->base.name, link->link_index, payload,
-			 status);
-
-	drm_info(dev,
-		 "IMAC5K: %s secondary 0x4F1 latch %s link=%u payload=%u status=%d asserted=%u\n",
-		 tag, aconnector->base.name, link->link_index, payload,
-		 status, aconnector->imac5k_dpcd_4f1_asserted);
+	amdgpu_dm_imac5k_write_secondary_4f1_latch(aconnector, tag,
+						   false, true, false);
 }
 
 static void amdgpu_dm_imac5k_finalize_secondary_links(struct drm_device *dev,
