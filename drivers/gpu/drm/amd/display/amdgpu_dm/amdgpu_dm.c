@@ -81,6 +81,7 @@
 #include <linux/power_supply.h>
 #include <linux/firmware.h>
 #include <linux/component.h>
+#include <linux/sched.h>
 #include <linux/sort.h>
 
 #include <drm/drm_privacy_screen_consumer.h>
@@ -3411,6 +3412,43 @@ static void apply_delay_after_dpcd_poweroff(struct amdgpu_device *adev,
 	}
 }
 
+#define IMAC5K_TILE_WIDTH_MM_MIN   295
+#define IMAC5K_TILE_WIDTH_MM_MAX   305
+#define IMAC5K_TILE_HEIGHT_MM_MIN  330
+#define IMAC5K_TILE_HEIGHT_MM_MAX  345
+#define IMAC5K_TILE_HDISPLAY       2560
+#define IMAC5K_TILE_VDISPLAY       2880
+#define IMAC5K_PRIMARY_TILE_X      0
+#define IMAC5K_SECONDARY_TILE_X    1
+#define IMAC5K_TILE_Y              0
+#define IMAC5K_TILE_COLUMNS        2
+#define IMAC5K_TILE_ROWS           1
+#define IMAC5K_TILE_SINGLE_MONITOR true
+#define IMAC5K_SECONDARY_LINK_ID   1
+#define IMAC5K_DPCD_PANEL_LATCH    0x4F1
+#define IMAC5K_DPCD_WRITE_RETRY_MS 10
+#define IMAC5K_DPCD_PANEL_LATCH_SETTLE_MS 100
+#define IMAC5K_HPD_CHECK_INTERVAL_MS 10
+#define IMAC5K_HPD_READY_TIMEOUT_MS 300
+#define IMAC5K_POST_HPD_READY_DELAY_MS 30
+#define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
+#define IMAC5K_WIN_PRIMARY_OBJECT_ID   0x3114
+#define IMAC5K_WIN_SECONDARY_SELECTOR  0x4871
+#define IMAC5K_WIN_PRIMARY_SELECTOR    0x4875
+#define IMAC5K_WIN_SECONDARY_AUX_PIN   2
+#define IMAC5K_WIN_PRIMARY_AUX_PIN     3
+#define IMAC5K_SECONDARY_DDC_LINE      GPIO_DDC_LINE_DDC3
+#define IMAC5K_PRIMARY_DDC_LINE        GPIO_DDC_LINE_DDC4
+#define IMAC5K_SECONDARY_DDC_HW_CHANNEL IMAC5K_SECONDARY_DDC_LINE
+#define IMAC5K_PRIMARY_DDC_HW_CHANNEL   IMAC5K_PRIMARY_DDC_LINE
+#define IMAC5K_SECONDARY_TRANSMITTER   TRANSMITTER_UNIPHY_D
+#define IMAC5K_PRIMARY_TRANSMITTER     TRANSMITTER_UNIPHY_C
+
+static unsigned int amdgpu_dm_imac5k_raw_object_id(struct graphics_object_id id)
+{
+	return dal_graphics_object_id_to_uint(id);
+}
+
 /**
  * amdgpu_dm_dump_links_and_sinks - Debug dump of all DC links and their sinks
  * @adev: amdgpu device pointer
@@ -3428,6 +3466,7 @@ static void amdgpu_dm_log_link_route(struct drm_device *dev,
 {
 	struct ddc *ddc_pin = NULL;
 	const char *sink_name = "n/a";
+	const char *win_role = "none";
 	int ddc_line = -1;
 	int ddc_channel = -1;
 	int ddc_hw_supported = -1;
@@ -3441,13 +3480,23 @@ static void amdgpu_dm_log_link_route(struct drm_device *dev,
 	int enc_engine = -1;
 	int enc_hpd_source = -1;
 	int enc_output_signals = 0;
+	unsigned int raw_link_id;
+	unsigned int expected_selector = 0;
+	unsigned int expected_aux_pin = 0;
 	bool tx_is_uniphy_d = false;
+	bool object_id_ok = false;
+	bool ddc_line_ok = false;
+	bool ddc_channel_ok = false;
+	bool transmitter_ok = false;
+	bool win_route_ok = false;
 
 	if (!dev || !link)
 		return;
 
 	if (!connector_name)
 		connector_name = "<none>";
+
+	raw_link_id = amdgpu_dm_imac5k_raw_object_id(link->link_id);
 
 	if (link->ddc) {
 		ddc_pin = get_ddc_pin(link->ddc);
@@ -3473,15 +3522,41 @@ static void amdgpu_dm_log_link_route(struct drm_device *dev,
 		tx_is_uniphy_d = link->link_enc->transmitter == TRANSMITTER_UNIPHY_D;
 	}
 
+	if (raw_link_id == IMAC5K_WIN_SECONDARY_OBJECT_ID ||
+	    (ddc_line == IMAC5K_SECONDARY_DDC_LINE &&
+	     ddc_channel == IMAC5K_SECONDARY_DDC_HW_CHANNEL &&
+	     enc_transmitter == IMAC5K_SECONDARY_TRANSMITTER)) {
+		win_role = "secondary";
+		expected_selector = IMAC5K_WIN_SECONDARY_SELECTOR;
+		expected_aux_pin = IMAC5K_WIN_SECONDARY_AUX_PIN;
+		object_id_ok = raw_link_id == IMAC5K_WIN_SECONDARY_OBJECT_ID;
+		ddc_line_ok = ddc_line == IMAC5K_SECONDARY_DDC_LINE;
+		ddc_channel_ok = ddc_channel == IMAC5K_SECONDARY_DDC_HW_CHANNEL;
+		transmitter_ok = enc_transmitter == IMAC5K_SECONDARY_TRANSMITTER;
+	} else if (raw_link_id == IMAC5K_WIN_PRIMARY_OBJECT_ID ||
+		   (ddc_line == IMAC5K_PRIMARY_DDC_LINE &&
+		    ddc_channel == IMAC5K_PRIMARY_DDC_HW_CHANNEL &&
+		    enc_transmitter == IMAC5K_PRIMARY_TRANSMITTER)) {
+		win_role = "primary";
+		expected_selector = IMAC5K_WIN_PRIMARY_SELECTOR;
+		expected_aux_pin = IMAC5K_WIN_PRIMARY_AUX_PIN;
+		object_id_ok = raw_link_id == IMAC5K_WIN_PRIMARY_OBJECT_ID;
+		ddc_line_ok = ddc_line == IMAC5K_PRIMARY_DDC_LINE;
+		ddc_channel_ok = ddc_channel == IMAC5K_PRIMARY_DDC_HW_CHANNEL;
+		transmitter_ok = enc_transmitter == IMAC5K_PRIMARY_TRANSMITTER;
+	}
+	win_route_ok = object_id_ok && ddc_line_ok && ddc_channel_ok && transmitter_ok &&
+		       link->aux_mode;
+
 	if (link->local_sink && link->local_sink->edid_caps.display_name[0])
 		sink_name = link->local_sink->edid_caps.display_name;
 
 	if (force_info) {
 		drm_info(dev,
-			 "IMAC5K: %s route connector=%s slot=%d link_index=%u link_id=%u/%u/%u signal=%d type=%d ep=%d internal=%u local_sink=%p sink_signal=%d sink_name=%s sink_edid_len=%u\n",
+			 "IMAC5K: %s route connector=%s slot=%d link_index=%u link_id=%u/%u/%u raw_obj=0x%x signal=%d type=%d ep=%d internal=%u local_sink=%p sink_signal=%d sink_name=%s sink_edid_len=%u\n",
 			 tag, connector_name, link_slot, link->link_index,
 			 link->link_id.type, link->link_id.enum_id, link->link_id.id,
-			 link->connector_signal, link->type, link->ep_type,
+			 raw_link_id, link->connector_signal, link->type, link->ep_type,
 			 link->is_internal_display, link->local_sink,
 			 link->local_sink ? link->local_sink->sink_signal : SIGNAL_TYPE_NONE,
 			 sink_name,
@@ -3503,6 +3578,12 @@ static void amdgpu_dm_log_link_route(struct drm_device *dev,
 			 link->link_status.link_active, link->link_state_valid,
 			 link->cur_link_settings.link_rate,
 			 link->cur_link_settings.lane_count);
+		drm_info(dev,
+			 "IMAC5K: %s route_match connector=%s raw_obj=0x%x win_role=%s selector=0x%x win_aux_pin=%u route_ok=%u object_ok=%u ddc_line_ok=%u ddc_channel_ok=%u tx_ok=%u aux_mode=%u ddc_line=%d ddc_channel=%d transmitter=%d\n",
+			 tag, connector_name, raw_link_id, win_role,
+			 expected_selector, expected_aux_pin, win_route_ok,
+			 object_id_ok, ddc_line_ok, ddc_channel_ok, transmitter_ok,
+			 link->aux_mode, ddc_line, ddc_channel, enc_transmitter);
 	} else {
 		drm_dbg_kms(dev,
 			    "LINK_DUMP[%d]: local_sink=%p type=%d sink_signal=%d sink_count=%u edid_name=%s mst_capable=%d mst_alloc_streams=%d\n",
@@ -3514,7 +3595,8 @@ static void amdgpu_dm_log_link_route(struct drm_device *dev,
 	}
 }
 
-static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
+static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev,
+					   const char *tag)
 {
 	struct dc *dc = adev->dm.dc;
 	struct drm_device *dev = adev_to_drm(adev);
@@ -3524,6 +3606,9 @@ static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
 	if (!dc)
 		return;
 
+	if (!tag)
+		tag = "dc_link_dump";
+
 	for (li = 0; li < dc->link_count; li++) {
 		struct dc_link *l = dc->links[li];
 		int rs;
@@ -3531,7 +3616,7 @@ static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
 		if (!l)
 			continue;
 
-		amdgpu_dm_log_link_route(dev, l, "dc_link_dump",
+		amdgpu_dm_log_link_route(dev, l, tag,
 					 "<dc-link>", li, imac5k);
 
 		/* Dump remote (MST) sinks if any */
@@ -3547,8 +3632,8 @@ static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
 				rname = "n/a";
 			if (imac5k)
 				drm_info(dev,
-					 "IMAC5K: dc_link_dump remote_sink[%d:%d] sink=%p signal=%d edid_name=%s\n",
-					 li, rs, rsink, rsink->sink_signal, rname);
+					 "IMAC5K: %s remote_sink[%d:%d] sink=%p signal=%d edid_name=%s\n",
+					 tag, li, rs, rsink, rsink->sink_signal, rname);
 			else
 				drm_dbg_kms(dev,
 					    "  REMOTE_SINK[%d:%d]: sink=%p signal=%d edid_name=%s\n",
@@ -3556,44 +3641,6 @@ static void amdgpu_dm_dump_links_and_sinks(struct amdgpu_device *adev)
 		}
 	}
 }
-
-#define IMAC5K_TILE_WIDTH_MM_MIN   295
-#define IMAC5K_TILE_WIDTH_MM_MAX   305
-#define IMAC5K_TILE_HEIGHT_MM_MIN  330
-#define IMAC5K_TILE_HEIGHT_MM_MAX  345
-#define IMAC5K_TILE_HDISPLAY       2560
-#define IMAC5K_TILE_VDISPLAY       2880
-#define IMAC5K_PREBOOT_PRIMARY_TILE_X 0
-/*
- * Experiment: probe boot exposes the physical eDP head as tile 0,0, but GNOME
- * builds one logical 5K monitor while the visible image appears routed to the
- * wrong half.  Hard-swap the userspace-facing TILE locations for one build so
- * we can test whether the panel's physical stream order is reversed.
- */
-#define IMAC5K_PRIMARY_TILE_X      1
-#define IMAC5K_SECONDARY_TILE_X    0
-#define IMAC5K_TILE_Y              0
-#define IMAC5K_TILE_COLUMNS        2
-#define IMAC5K_TILE_ROWS           1
-#define IMAC5K_SECONDARY_LINK_ID   1
-#define IMAC5K_DPCD_PANEL_LATCH    0x4F1
-#define IMAC5K_DPCD_WRITE_RETRY_MS 10
-#define IMAC5K_DPCD_PANEL_LATCH_SETTLE_MS 100
-#define IMAC5K_HPD_CHECK_INTERVAL_MS 10
-#define IMAC5K_HPD_READY_TIMEOUT_MS 300
-#define IMAC5K_POST_HPD_READY_DELAY_MS 30
-#define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
-#define IMAC5K_WIN_PRIMARY_OBJECT_ID   0x3114
-#define IMAC5K_WIN_SECONDARY_SELECTOR  0x4871
-#define IMAC5K_WIN_PRIMARY_SELECTOR    0x4875
-#define IMAC5K_WIN_SECONDARY_AUX_PIN   2
-#define IMAC5K_WIN_PRIMARY_AUX_PIN     3
-#define IMAC5K_SECONDARY_DDC_LINE      GPIO_DDC_LINE_DDC3
-#define IMAC5K_PRIMARY_DDC_LINE        GPIO_DDC_LINE_DDC4
-#define IMAC5K_SECONDARY_DDC_HW_CHANNEL IMAC5K_SECONDARY_DDC_LINE
-#define IMAC5K_PRIMARY_DDC_HW_CHANNEL   IMAC5K_PRIMARY_DDC_LINE
-#define IMAC5K_SECONDARY_TRANSMITTER   TRANSMITTER_UNIPHY_D
-#define IMAC5K_PRIMARY_TRANSMITTER     TRANSMITTER_UNIPHY_C
 
 static bool amdgpu_dm_imac5k_quirk_enabled(const struct amdgpu_display_manager *dm)
 {
@@ -3677,6 +3724,8 @@ static bool amdgpu_dm_imac5k_verify_windows_route(
 	int ddc_line = GPIO_DDC_LINE_UNKNOWN;
 	int ddc_hw_channel = GPIO_DDC_LINE_UNKNOWN;
 	int transmitter = TRANSMITTER_UNKNOWN;
+	unsigned int raw_object_id;
+	bool object_id_ok;
 	bool ddc_line_ok;
 	bool ddc_hw_channel_ok;
 	bool transmitter_ok;
@@ -3710,17 +3759,20 @@ static bool amdgpu_dm_imac5k_verify_windows_route(
 	if (link->link_enc)
 		transmitter = link->link_enc->transmitter;
 
+	raw_object_id = amdgpu_dm_imac5k_raw_object_id(link->link_id);
+	object_id_ok = raw_object_id == expected_object_id;
 	ddc_line_ok = ddc_line == expected_ddc_line;
 	ddc_hw_channel_ok = ddc_hw_channel == expected_ddc_hw_channel;
 	transmitter_ok = transmitter == expected_transmitter;
 	aux_mode_ok = link->aux_mode;
-	ok = ddc_line_ok && ddc_hw_channel_ok && transmitter_ok && aux_mode_ok;
+	ok = object_id_ok && ddc_line_ok && ddc_hw_channel_ok &&
+	     transmitter_ok && aux_mode_ok;
 
 	drm_info(dev,
-		 "IMAC5K: %s %s Windows-route %s for %s connector=%s link=%u expected_obj=0x%x selector=0x%x win_aux_pin=%u expected_ddc=%s/%d expected_hw_channel=%s/%d expected_tx=%s/%d actual_ddc=%s/%d actual_hw_channel=%s/%d actual_tx=%s/%d ddc_line_ok=%u hw_channel_ok=%u tx_ok=%u aux_mode=%u aux_ok=%u ddc=%p ddc_pin=%p link_enc=%p hpd=%u/%u link_active=%u link_state_valid=%u\n",
+		 "IMAC5K: %s %s Windows-route %s for %s connector=%s link=%u expected_obj=0x%x actual_obj=0x%x object_ok=%u selector=0x%x win_aux_pin=%u expected_ddc=%s/%d expected_hw_channel=%s/%d expected_tx=%s/%d actual_ddc=%s/%d actual_hw_channel=%s/%d actual_tx=%s/%d ddc_line_ok=%u hw_channel_ok=%u tx_ok=%u aux_mode=%u aux_ok=%u ddc=%p ddc_pin=%p link_enc=%p hpd=%u/%u link_active=%u link_state_valid=%u\n",
 		 tag, role, ok ? "ok" : "mismatch", operation, connector_name,
-		 link->link_index, expected_object_id, expected_selector,
-		 expected_aux_pin,
+		 link->link_index, expected_object_id, raw_object_id,
+		 object_id_ok, expected_selector, expected_aux_pin,
 		 amdgpu_dm_imac5k_ddc_line_name(expected_ddc_line),
 		 expected_ddc_line,
 		 amdgpu_dm_imac5k_ddc_line_name(expected_ddc_hw_channel),
@@ -3766,8 +3818,7 @@ static bool amdgpu_dm_imac5k_has_primary_tile(const struct amdgpu_dm_connector *
 	return connector->has_tile &&
 	       connector->num_h_tile == IMAC5K_TILE_COLUMNS &&
 	       connector->num_v_tile == IMAC5K_TILE_ROWS &&
-	       (connector->tile_h_loc == IMAC5K_PREBOOT_PRIMARY_TILE_X ||
-		connector->tile_h_loc == IMAC5K_PRIMARY_TILE_X) &&
+	       connector->tile_h_loc == IMAC5K_PRIMARY_TILE_X &&
 	       connector->tile_v_loc == IMAC5K_TILE_Y &&
 	       connector->tile_h_size == IMAC5K_TILE_HDISPLAY &&
 	       connector->tile_v_size == IMAC5K_TILE_VDISPLAY;
@@ -3798,6 +3849,141 @@ static bool amdgpu_dm_imac5k_is_secondary_head(const struct amdgpu_dm_connector 
 	       (aconnector->connector_id == IMAC5K_SECONDARY_LINK_ID ||
 		!strcmp(aconnector->base.name, "DP-1")) &&
 	       aconnector->dc_link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT;
+}
+
+static bool amdgpu_dm_imac5k_should_log_userspace_contract(
+		const struct amdgpu_dm_connector *aconnector)
+{
+	if (!aconnector)
+		return false;
+
+	return amdgpu_dm_imac5k_is_primary_head(aconnector) ||
+	       aconnector->imac5k_secondary_head ||
+	       amdgpu_dm_imac5k_is_secondary_head(aconnector);
+}
+
+static void amdgpu_dm_imac5k_format_tile_blob(
+		const struct drm_connector *connector,
+		char *buf,
+		size_t len)
+{
+	if (!connector || !buf || !len)
+		return;
+
+	if (!connector->has_tile || !connector->tile_group) {
+		strscpy(buf, "none", len);
+		return;
+	}
+
+	snprintf(buf, len, "%d:%d:%d:%d:%d:%d:%d:%d",
+		 connector->tile_group->id,
+		 connector->tile_is_single_monitor,
+		 connector->num_h_tile,
+		 connector->num_v_tile,
+		 connector->tile_h_loc,
+		 connector->tile_v_loc,
+		 connector->tile_h_size,
+		 connector->tile_v_size);
+}
+
+static bool amdgpu_dm_imac5k_mutter_tile_shape_ok(
+		const struct drm_connector *connector)
+{
+	return connector &&
+	       connector->has_tile &&
+	       connector->tile_group &&
+	       connector->num_h_tile == IMAC5K_TILE_COLUMNS &&
+	       connector->num_v_tile == IMAC5K_TILE_ROWS &&
+	       connector->tile_v_loc == IMAC5K_TILE_Y &&
+	       connector->tile_h_loc < IMAC5K_TILE_COLUMNS &&
+	       connector->tile_h_size == IMAC5K_TILE_HDISPLAY &&
+	       connector->tile_v_size == IMAC5K_TILE_VDISPLAY;
+}
+
+static void amdgpu_dm_imac5k_log_tile_contract(
+		struct amdgpu_dm_connector *aconnector,
+		const char *tag)
+{
+	struct drm_connector *connector;
+	char tile_blob[96];
+	const u8 *topology = NULL;
+
+	if (!aconnector || !aconnector->base.dev)
+		return;
+
+	if (!amdgpu_dm_imac5k_quirk_enabled(&drm_to_adev(aconnector->base.dev)->dm) ||
+	    !amdgpu_dm_imac5k_should_log_userspace_contract(aconnector))
+		return;
+
+	connector = &aconnector->base;
+	amdgpu_dm_imac5k_format_tile_blob(connector, tile_blob, sizeof(tile_blob));
+	if (connector->tile_group)
+		topology = connector->tile_group->group_data;
+
+	drm_info(connector->dev,
+		 "IMAC5K: %s mutter_tile connector=%s status=%d has_tile=%u blob=\"%s\" mutter_shape_ok=%u group_id=%d group_data=%02x%02x%02x%02x%02x%02x%02x%02x single=%u grid=%ux%u loc=%u,%u size=%ux%u\n",
+		 tag, connector->name, connector->status, connector->has_tile,
+		 tile_blob, amdgpu_dm_imac5k_mutter_tile_shape_ok(connector),
+		 connector->tile_group ? connector->tile_group->id : -1,
+		 topology ? topology[0] : 0, topology ? topology[1] : 0,
+		 topology ? topology[2] : 0, topology ? topology[3] : 0,
+		 topology ? topology[4] : 0, topology ? topology[5] : 0,
+		 topology ? topology[6] : 0, topology ? topology[7] : 0,
+		 connector->tile_is_single_monitor, connector->num_h_tile,
+		 connector->num_v_tile, connector->tile_h_loc,
+		 connector->tile_v_loc, connector->tile_h_size,
+		 connector->tile_v_size);
+}
+
+static void amdgpu_dm_imac5k_log_modes(
+		struct amdgpu_dm_connector *aconnector,
+		const char *tag)
+{
+	struct drm_connector *connector;
+	struct drm_display_mode *mode;
+	char tile_blob[96];
+	unsigned int probed = 0, modes = 0, idx = 0;
+
+	if (!aconnector || !aconnector->base.dev)
+		return;
+
+	if (!amdgpu_dm_imac5k_quirk_enabled(&drm_to_adev(aconnector->base.dev)->dm) ||
+	    !amdgpu_dm_imac5k_should_log_userspace_contract(aconnector))
+		return;
+
+	connector = &aconnector->base;
+	amdgpu_dm_imac5k_format_tile_blob(connector, tile_blob, sizeof(tile_blob));
+
+	list_for_each_entry(mode, &connector->probed_modes, head)
+		probed++;
+	list_for_each_entry(mode, &connector->modes, head)
+		modes++;
+
+	drm_info(connector->dev,
+		 "IMAC5K: %s mutter_modes connector=%s status=%d num_modes=%d probed_list=%u modes_list=%u tile_blob=\"%s\"\n",
+		 tag, connector->name, connector->status,
+		 aconnector->num_modes, probed, modes, tile_blob);
+
+	list_for_each_entry(mode, &connector->probed_modes, head) {
+		drm_info(connector->dev,
+			 "IMAC5K: %s mutter_probed_mode connector=%s idx=%u name=%s clock=%d h=%d/%d/%d/%d v=%d/%d/%d/%d flags=0x%x type=0x%x status=%d\n",
+			 tag, connector->name, idx++, mode->name, mode->clock,
+			 mode->hdisplay, mode->hsync_start, mode->hsync_end,
+			 mode->htotal, mode->vdisplay, mode->vsync_start,
+			 mode->vsync_end, mode->vtotal, mode->flags,
+			 mode->type, mode->status);
+	}
+
+	idx = 0;
+	list_for_each_entry(mode, &connector->modes, head) {
+		drm_info(connector->dev,
+			 "IMAC5K: %s mutter_current_mode connector=%s idx=%u name=%s clock=%d h=%d/%d/%d/%d v=%d/%d/%d/%d flags=0x%x type=0x%x status=%d\n",
+			 tag, connector->name, idx++, mode->name, mode->clock,
+			 mode->hdisplay, mode->hsync_start, mode->hsync_end,
+			 mode->htotal, mode->vdisplay, mode->vsync_start,
+			 mode->vsync_end, mode->vtotal, mode->flags,
+			 mode->type, mode->status);
+	}
 }
 
 static struct amdgpu_dm_connector *
@@ -3849,8 +4035,16 @@ static void amdgpu_dm_imac5k_apply_tile_property(
 	if (connector->tile_group != reference_tile_group) {
 		tile_group = drm_mode_get_tile_group(connector->dev,
 				(const char *)reference_tile_group->group_data);
-		if (!tile_group)
+		if (!tile_group) {
+			const u8 *topology = reference_tile_group->group_data;
+
+			drm_info(connector->dev,
+				 "IMAC5K: failed to acquire %s TILE group for %s from reference group_id=%d group_data=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+				 role, connector->name, reference_tile_group->id,
+				 topology[0], topology[1], topology[2], topology[3],
+				 topology[4], topology[5], topology[6], topology[7]);
 			return;
+		}
 
 		if (connector->tile_group)
 			drm_mode_put_tile_group(connector->dev,
@@ -3858,8 +4052,14 @@ static void amdgpu_dm_imac5k_apply_tile_property(
 		connector->tile_group = tile_group;
 	}
 
+	if (single_monitor != IMAC5K_TILE_SINGLE_MONITOR)
+		drm_info(connector->dev,
+			 "IMAC5K: overriding %s TILE single_monitor on %s from %u to %u to match one physical 2x1 panel\n",
+			 role, connector->name, single_monitor,
+			 IMAC5K_TILE_SINGLE_MONITOR);
+
 	connector->has_tile = true;
-	connector->tile_is_single_monitor = single_monitor;
+	connector->tile_is_single_monitor = IMAC5K_TILE_SINGLE_MONITOR;
 	connector->num_h_tile = IMAC5K_TILE_COLUMNS;
 	connector->num_v_tile = IMAC5K_TILE_ROWS;
 	connector->tile_h_loc = tile_x;
@@ -3872,6 +4072,8 @@ static void amdgpu_dm_imac5k_apply_tile_property(
 		drm_info(connector->dev,
 			 "IMAC5K: failed to set %s TILE property on %s (%d)\n",
 			 role, connector->name, ret);
+	else
+		amdgpu_dm_imac5k_log_tile_contract(aconnector, role);
 }
 
 static void amdgpu_dm_imac5k_apply_primary_tile_property(
@@ -3890,109 +4092,300 @@ static void amdgpu_dm_imac5k_apply_primary_tile_property(
 		return;
 
 	connector = &primary->base;
-	if (!connector->has_tile || !connector->tile_group)
+	if (!connector->has_tile || !connector->tile_group) {
+		drm_info(connector->dev,
+			 "IMAC5K: primary TILE apply skipped on %s: has_tile=%u tile_group=%p\n",
+			 connector->name, connector->has_tile,
+			 connector->tile_group);
 		return;
-
-	amdgpu_dm_imac5k_apply_tile_property(primary, connector->tile_group,
-					     connector->tile_is_single_monitor,
-					     IMAC5K_PRIMARY_TILE_X, "primary");
-}
-
-static void amdgpu_dm_imac5k_apply_pair_tile_properties(
-		struct amdgpu_dm_connector *primary,
-		struct amdgpu_dm_connector *secondary)
-{
-	struct drm_connector *primary_connector;
-	struct drm_tile_group *tile_group;
-	bool single_monitor;
-
-	if (!primary)
-		return;
-
-	primary_connector = &primary->base;
-	if (!primary_connector->has_tile || !primary_connector->tile_group)
-		return;
-
-	tile_group = primary_connector->tile_group;
-	single_monitor = primary_connector->tile_is_single_monitor;
-
-	amdgpu_dm_imac5k_apply_tile_property(primary, tile_group, single_monitor,
-					     IMAC5K_PRIMARY_TILE_X, "primary");
-
-	if (secondary)
-		amdgpu_dm_imac5k_apply_tile_property(secondary, tile_group,
-						     single_monitor,
-						     IMAC5K_SECONDARY_TILE_X,
-						     "secondary");
-}
-
-static void amdgpu_dm_imac5k_update_edid_block_checksum(u8 *block)
-{
-	u8 sum = 0;
-	int i;
-
-	block[EDID_LENGTH - 1] = 0;
-	for (i = 0; i < EDID_LENGTH - 1; i++)
-		sum += block[i];
-	block[EDID_LENGTH - 1] = 0 - sum;
-}
-
-static u8 *amdgpu_dm_imac5k_clone_secondary_tile_edid(const struct edid *edid,
-						      size_t edid_len,
-						      bool *tile_patched)
-{
-	u8 *edid_copy;
-	unsigned int block_count;
-	unsigned int block_idx;
-
-	if (tile_patched)
-		*tile_patched = false;
-
-	if (!edid || edid_len < EDID_LENGTH)
-		return NULL;
-
-	edid_copy = kmemdup(edid, edid_len, GFP_KERNEL);
-	if (!edid_copy)
-		return NULL;
-
-	block_count = edid_len / EDID_LENGTH;
-	for (block_idx = 1; block_idx < block_count; block_idx++) {
-		u8 *extension = edid_copy + block_idx * EDID_LENGTH;
-		unsigned int displayid_end;
-		unsigned int offset;
-
-		if (extension[0] != 0x70)
-			continue;
-
-		displayid_end = min_t(unsigned int, 5 + extension[2],
-				      EDID_LENGTH - 1);
-
-		for (offset = 5; offset + 3 <= displayid_end;) {
-			u8 tag = extension[offset];
-			u8 block_len = extension[offset + 2];
-			unsigned int payload = offset + 3;
-			unsigned int next = payload + block_len;
-
-			if (next > displayid_end)
-				break;
-
-			if ((tag == 0x12 || tag == 0x28) && block_len >= 4) {
-				u8 *topo = extension + payload + 1;
-
-				topo[1] = (IMAC5K_SECONDARY_TILE_X << 4) |
-					  IMAC5K_TILE_Y;
-				topo[2] &= ~0x0f;
-				amdgpu_dm_imac5k_update_edid_block_checksum(extension);
-				if (tile_patched)
-					*tile_patched = true;
-				return edid_copy;
-			}
-
-			offset = next;
-		}
 	}
 
-	return edid_copy;
+	amdgpu_dm_imac5k_apply_tile_property(primary, connector->tile_group,
+					     IMAC5K_TILE_SINGLE_MONITOR,
+					     IMAC5K_PRIMARY_TILE_X, "primary");
+}
+
+static bool amdgpu_dm_imac5k_real_secondary_route_available(
+		struct amdgpu_dm_connector *secondary,
+		const char *tag)
+{
+	struct amdgpu_display_manager *dm;
+	struct dc_link *link;
+	struct drm_device *dev;
+	bool real_current_sink;
+	bool aux_evidence;
+	bool route_ok;
+	bool route_known;
+
+	if (!secondary || !secondary->base.dev || !secondary->dc_link)
+		return false;
+
+	dev = secondary->base.dev;
+	dm = &drm_to_adev(dev)->dm;
+	link = secondary->dc_link;
+
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm) ||
+	    (!secondary->imac5k_secondary_head &&
+	     !amdgpu_dm_imac5k_is_secondary_head(secondary)))
+		return false;
+
+	route_ok = amdgpu_dm_imac5k_verify_windows_route(dev, link, tag,
+			secondary->base.name, true, "secondary-route-proof");
+	real_current_sink = (link->local_sink &&
+			     link->local_sink != secondary->dc_em_sink) ||
+			    (secondary->dc_sink &&
+			     secondary->dc_sink != secondary->dc_em_sink);
+	aux_evidence = secondary->imac5k_source_dpcd_programmed ||
+		       secondary->imac5k_dpcd_4f1_asserted ||
+		       secondary->imac5k_dpcd_111_asserted;
+	route_known = secondary->imac5k_real_route_seen ||
+		      secondary->imac5k_preserved_edid_valid ||
+		      real_current_sink || aux_evidence;
+
+	if (route_ok && real_current_sink)
+		secondary->imac5k_real_route_seen = true;
+
+	if (!route_ok || !route_known)
+		drm_info(dev,
+			 "IMAC5K: %s secondary route proof failed on %s route_ok=%u route_known=%u real_current_sink=%u real_route_seen=%u preserved_edid=%u aux_evidence=%u source_dpcd=%u dpcd4f1=%u dpcd111=%u\n",
+			 tag, secondary->base.name, route_ok, route_known,
+			 real_current_sink, secondary->imac5k_real_route_seen,
+			 secondary->imac5k_preserved_edid_valid, aux_evidence,
+			 secondary->imac5k_source_dpcd_programmed,
+			 secondary->imac5k_dpcd_4f1_asserted,
+			 secondary->imac5k_dpcd_111_asserted);
+
+	return route_ok && route_known;
+}
+
+static void amdgpu_dm_imac5k_snapshot_secondary_metadata(
+		struct amdgpu_dm_connector *secondary,
+		const char *tag)
+{
+	struct amdgpu_display_manager *dm;
+	struct drm_connector *connector;
+	struct drm_device *dev;
+	struct dc_link *link;
+	struct dc_sink *sink;
+	const u8 *topology = NULL;
+	bool route_ok;
+	bool real_sink;
+	bool tile_now;
+
+	if (!secondary || !secondary->base.dev || !secondary->dc_link)
+		return;
+
+	dev = secondary->base.dev;
+	dm = &drm_to_adev(dev)->dm;
+	link = secondary->dc_link;
+	connector = &secondary->base;
+
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm) ||
+	    !amdgpu_dm_imac5k_is_secondary_head(secondary))
+		return;
+
+	route_ok = amdgpu_dm_imac5k_verify_windows_route(dev, link, tag,
+			connector->name, true, "secondary-metadata-snapshot");
+	if (!route_ok)
+		return;
+
+	sink = link->local_sink ? link->local_sink : secondary->dc_sink;
+	real_sink = sink && sink != secondary->dc_em_sink;
+	if (!real_sink) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary metadata snapshot skipped on %s: no real live sink local_sink=%p dc_sink=%p em_sink=%p\n",
+			 tag, connector->name, link->local_sink,
+			 secondary->dc_sink, secondary->dc_em_sink);
+		return;
+	}
+
+	secondary->imac5k_real_route_seen = true;
+
+	if (sink->dc_edid.length &&
+	    sink->dc_edid.length <= sizeof(secondary->imac5k_preserved_edid.raw_edid)) {
+		memcpy(&secondary->imac5k_preserved_edid, &sink->dc_edid,
+		       sizeof(secondary->imac5k_preserved_edid));
+		secondary->imac5k_preserved_edid_valid = true;
+	}
+
+	tile_now = connector->has_tile && connector->tile_group;
+	if (tile_now) {
+		topology = connector->tile_group->group_data;
+		memcpy(secondary->imac5k_preserved_tile_group, topology,
+		       sizeof(secondary->imac5k_preserved_tile_group));
+		secondary->imac5k_preserved_tile_single_monitor =
+			connector->tile_is_single_monitor;
+		secondary->imac5k_preserved_num_h_tile = connector->num_h_tile;
+		secondary->imac5k_preserved_num_v_tile = connector->num_v_tile;
+		secondary->imac5k_preserved_tile_h_loc = connector->tile_h_loc;
+		secondary->imac5k_preserved_tile_v_loc = connector->tile_v_loc;
+		secondary->imac5k_preserved_tile_h_size = connector->tile_h_size;
+		secondary->imac5k_preserved_tile_v_size = connector->tile_v_size;
+		secondary->imac5k_preserved_tile_valid = true;
+	}
+
+	drm_info(dev,
+		 "IMAC5K: %s secondary metadata snapshot on %s real_route_seen=%u sink=%p edid_len=%u preserved_edid=%u tile_now=%u preserved_tile=%u group_data=%02x%02x%02x%02x%02x%02x%02x%02x single=%u grid=%ux%u loc=%u,%u size=%ux%u mutter_shape_ok=%u\n",
+		 tag, connector->name, secondary->imac5k_real_route_seen, sink,
+		 sink->dc_edid.length, secondary->imac5k_preserved_edid_valid,
+		 tile_now, secondary->imac5k_preserved_tile_valid,
+		 secondary->imac5k_preserved_tile_group[0],
+		 secondary->imac5k_preserved_tile_group[1],
+		 secondary->imac5k_preserved_tile_group[2],
+		 secondary->imac5k_preserved_tile_group[3],
+		 secondary->imac5k_preserved_tile_group[4],
+		 secondary->imac5k_preserved_tile_group[5],
+		 secondary->imac5k_preserved_tile_group[6],
+		 secondary->imac5k_preserved_tile_group[7],
+		 secondary->imac5k_preserved_tile_single_monitor,
+		 secondary->imac5k_preserved_num_h_tile,
+		 secondary->imac5k_preserved_num_v_tile,
+		 secondary->imac5k_preserved_tile_h_loc,
+		 secondary->imac5k_preserved_tile_v_loc,
+		 secondary->imac5k_preserved_tile_h_size,
+		 secondary->imac5k_preserved_tile_v_size,
+		 amdgpu_dm_imac5k_mutter_tile_shape_ok(connector));
+}
+
+static bool amdgpu_dm_imac5k_apply_preserved_secondary_tile_property(
+		struct amdgpu_dm_connector *secondary,
+		const char *tag)
+{
+	struct drm_connector *connector;
+	struct drm_tile_group *tile_group;
+	int ret;
+
+	if (!secondary || !secondary->base.dev ||
+	    !secondary->imac5k_preserved_tile_valid)
+		return false;
+
+	connector = &secondary->base;
+	tile_group = drm_mode_get_tile_group(connector->dev,
+			(const char *)secondary->imac5k_preserved_tile_group);
+	if (!tile_group)
+		tile_group = drm_mode_create_tile_group(connector->dev,
+			(const char *)secondary->imac5k_preserved_tile_group);
+
+	if (!tile_group) {
+		drm_info(connector->dev,
+			 "IMAC5K: %s preserved secondary TILE apply skipped on %s: cannot get/create group_data=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+			 tag, connector->name,
+			 secondary->imac5k_preserved_tile_group[0],
+			 secondary->imac5k_preserved_tile_group[1],
+			 secondary->imac5k_preserved_tile_group[2],
+			 secondary->imac5k_preserved_tile_group[3],
+			 secondary->imac5k_preserved_tile_group[4],
+			 secondary->imac5k_preserved_tile_group[5],
+			 secondary->imac5k_preserved_tile_group[6],
+			 secondary->imac5k_preserved_tile_group[7]);
+		return false;
+	}
+
+	if (connector->tile_group != tile_group) {
+		if (connector->tile_group)
+			drm_mode_put_tile_group(connector->dev,
+					connector->tile_group);
+		connector->tile_group = tile_group;
+	} else {
+		drm_mode_put_tile_group(connector->dev, tile_group);
+	}
+
+	if (secondary->imac5k_preserved_tile_h_loc != IMAC5K_SECONDARY_TILE_X ||
+	    secondary->imac5k_preserved_tile_v_loc != IMAC5K_TILE_Y ||
+	    secondary->imac5k_preserved_num_h_tile != IMAC5K_TILE_COLUMNS ||
+	    secondary->imac5k_preserved_num_v_tile != IMAC5K_TILE_ROWS ||
+	    secondary->imac5k_preserved_tile_h_size != IMAC5K_TILE_HDISPLAY ||
+	    secondary->imac5k_preserved_tile_v_size != IMAC5K_TILE_VDISPLAY)
+		drm_info(connector->dev,
+			 "IMAC5K: %s preserved secondary TILE on %s had non-canonical fields single=%u grid=%ux%u loc=%u,%u size=%ux%u; forcing Windows route model right tile 1,0 size 2560x2880\n",
+			 tag, connector->name,
+			 secondary->imac5k_preserved_tile_single_monitor,
+			 secondary->imac5k_preserved_num_h_tile,
+			 secondary->imac5k_preserved_num_v_tile,
+			 secondary->imac5k_preserved_tile_h_loc,
+			 secondary->imac5k_preserved_tile_v_loc,
+			 secondary->imac5k_preserved_tile_h_size,
+			 secondary->imac5k_preserved_tile_v_size);
+
+	connector->has_tile = true;
+	connector->tile_is_single_monitor = IMAC5K_TILE_SINGLE_MONITOR;
+	connector->num_h_tile = IMAC5K_TILE_COLUMNS;
+	connector->num_v_tile = IMAC5K_TILE_ROWS;
+	connector->tile_h_loc = IMAC5K_SECONDARY_TILE_X;
+	connector->tile_v_loc = IMAC5K_TILE_Y;
+	connector->tile_h_size = IMAC5K_TILE_HDISPLAY;
+	connector->tile_v_size = IMAC5K_TILE_VDISPLAY;
+
+	ret = drm_connector_set_tile_property(connector);
+	if (ret) {
+		drm_info(connector->dev,
+			 "IMAC5K: %s failed to set preserved secondary TILE property on %s (%d)\n",
+			 tag, connector->name, ret);
+		return false;
+	}
+
+	amdgpu_dm_imac5k_log_tile_contract(secondary, tag);
+	return true;
+}
+
+static void amdgpu_dm_imac5k_apply_secondary_tile_property(
+		struct amdgpu_dm_connector *secondary)
+{
+	struct amdgpu_dm_connector *primary;
+	struct drm_connector *primary_connector;
+	struct drm_connector *secondary_connector;
+
+	if (!secondary || !secondary->base.dev)
+		return;
+
+	if (!secondary->imac5k_secondary_head)
+		return;
+
+	if (!amdgpu_dm_imac5k_real_secondary_route_available(secondary,
+			"secondary-tile-apply"))
+		return;
+
+	if (amdgpu_dm_imac5k_apply_preserved_secondary_tile_property(
+			secondary, "secondary-preserved"))
+		return;
+
+	primary = amdgpu_dm_imac5k_find_primary_tiled_head(secondary->base.dev);
+	if (!primary) {
+		drm_info(secondary->base.dev,
+			 "IMAC5K: secondary TILE apply skipped on %s: no primary eDP tile with EDID found yet\n",
+			 secondary->base.name);
+		return;
+	}
+
+	primary_connector = &primary->base;
+	secondary_connector = &secondary->base;
+	if (!primary_connector->has_tile || !primary_connector->tile_group) {
+		drm_info(secondary_connector->dev,
+			 "IMAC5K: secondary TILE apply skipped on %s: primary %s has_tile=%u tile_group=%p\n",
+			 secondary_connector->name, primary_connector->name,
+			 primary_connector->has_tile, primary_connector->tile_group);
+		return;
+	}
+
+	drm_info(secondary_connector->dev,
+		 "IMAC5K: applying secondary TILE on %s from primary %s only after proving real 0x3113 route; preserved own secondary tile unavailable preserved_edid=%u real_route_seen=%u\n",
+		 secondary_connector->name, primary_connector->name,
+		 secondary->imac5k_preserved_edid_valid,
+		 secondary->imac5k_real_route_seen);
+
+	amdgpu_dm_imac5k_apply_tile_property(secondary,
+					     primary_connector->tile_group,
+					     IMAC5K_TILE_SINGLE_MONITOR,
+					     IMAC5K_SECONDARY_TILE_X,
+					     "secondary");
+
+	drm_info(secondary_connector->dev,
+		 "IMAC5K: applied secondary TILE property on %s from primary %s loc=%u,%u group=%p single=%u\n",
+		 secondary_connector->name, primary_connector->name,
+		 secondary_connector->tile_h_loc,
+		 secondary_connector->tile_v_loc,
+		 secondary_connector->tile_group,
+		 secondary_connector->tile_is_single_monitor);
 }
 
 static void amdgpu_dm_imac5k_mark_secondary_head(struct amdgpu_dm_connector *aconnector)
@@ -4022,6 +4415,7 @@ static void amdgpu_dm_imac5k_mark_secondary_head(struct amdgpu_dm_connector *aco
 	aconnector->imac5k_secondary_head = true;
 	dm->imac5k_secondary_head_detected = true;
 	dm->imac5k_plain_boot_candidate_seen = false;
+	amdgpu_dm_imac5k_apply_secondary_tile_property(aconnector);
 }
 
 static void amdgpu_dm_imac5k_note_plain_boot_candidate(struct amdgpu_dm_connector *aconnector)
@@ -4033,7 +4427,8 @@ static void amdgpu_dm_imac5k_note_plain_boot_candidate(struct amdgpu_dm_connecto
 		return;
 
 	dm = &drm_to_adev(aconnector->base.dev)->dm;
-	if (!dm->imac5k_plain_boot_synth_quirk || dm->imac5k_secondary_head_detected)
+	if (!dm->imac5k_plain_boot_route_probe_quirk ||
+	    dm->imac5k_secondary_head_detected)
 		return;
 
 	if (!amdgpu_dm_imac5k_is_primary_head(aconnector))
@@ -4045,102 +4440,92 @@ static void amdgpu_dm_imac5k_note_plain_boot_candidate(struct amdgpu_dm_connecto
 	dev = aconnector->base.dev;
 	dm->imac5k_plain_boot_candidate_seen = true;
 	drm_info(dev,
-		 "IMAC5K: Stage2 scaffold candidate observed on %s; primary internal tile is present without a preserved secondary head\n",
+		 "IMAC5K: Stage2 real-route candidate observed on %s; primary internal tile is present without a preserved secondary 0x3113 head\n",
 		 aconnector->base.name);
 }
 
-static void amdgpu_dm_imac5k_seed_emulated_sink(struct amdgpu_dm_connector *aconnector)
-{
-	struct drm_device *dev;
-	struct dc_sink_init_data init_params = { 0 };
-	const struct drm_edid *drm_edid;
-	const struct edid *edid;
-	struct amdgpu_dm_connector *primary = NULL;
-	u8 *edid_copy;
-	size_t edid_len;
-	bool tile_patched;
-
-	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
-		return;
-
-	if (!aconnector->imac5k_secondary_head || aconnector->imac5k_em_sink_seeded)
-		return;
-
-	drm_edid = aconnector->drm_edid;
-	if (!drm_edid) {
-		primary = amdgpu_dm_imac5k_find_primary_tiled_head(aconnector->base.dev);
-		if (!primary)
-			return;
-		drm_edid = primary->drm_edid;
-	}
-
-	if (!drm_edid)
-		return;
-
-	edid = drm_edid_raw(drm_edid);
-	if (!edid)
-		return;
-	edid_len = (edid->extensions + 1) * EDID_LENGTH;
-	edid_copy = amdgpu_dm_imac5k_clone_secondary_tile_edid(edid, edid_len,
-							       &tile_patched);
-	if (!edid_copy)
-		return;
-
-	init_params.link = aconnector->dc_link;
-	init_params.sink_signal = aconnector->dc_sink ?
-		aconnector->dc_sink->sink_signal : SIGNAL_TYPE_DISPLAY_PORT;
-
-	if (!aconnector->dc_em_sink) {
-		aconnector->dc_em_sink = dc_link_add_remote_sink(aconnector->dc_link,
-								 edid_copy,
-								 edid_len,
-								 &init_params);
-		if (!aconnector->dc_em_sink)
-			goto out_free_edid;
-	}
-
-	if (!aconnector->drm_edid) {
-		aconnector->drm_edid = drm_edid_alloc(edid_copy, edid_len);
-		if (!aconnector->drm_edid)
-			goto out_free_edid;
-		drm_edid_connector_update(&aconnector->base, aconnector->drm_edid);
-	}
-
-	if (!aconnector->dc_sink) {
-		aconnector->dc_sink = aconnector->dc_em_sink;
-		dc_sink_retain(aconnector->dc_sink);
-	}
-
-	if (primary)
-		amdgpu_dm_imac5k_apply_pair_tile_properties(primary, aconnector);
-
-	aconnector->imac5k_em_sink_seeded = true;
-	dev = aconnector->base.dev;
-	drm_info(dev,
-		 "IMAC5K: seeded emulated sink for %s from %s to preserve swapped tiled pair primary=%u,%u secondary=%u,%u through userspace takeover edid_tile_patched=%u\n",
-		 aconnector->base.name,
-		 primary ? primary->base.name : aconnector->base.name,
-		 IMAC5K_PRIMARY_TILE_X, IMAC5K_TILE_Y,
-		 IMAC5K_SECONDARY_TILE_X, IMAC5K_TILE_Y,
-		 tile_patched);
-
-out_free_edid:
-	kfree(edid_copy);
-}
-
-static bool amdgpu_dm_imac5k_should_preserve_secondary_sink(const struct amdgpu_dm_connector *aconnector)
+static bool amdgpu_dm_imac5k_should_suppress_secondary_false_disconnect(
+		const struct amdgpu_dm_connector *aconnector,
+		const struct dc_sink *detected_sink,
+		const char *tag)
 {
 	struct amdgpu_display_manager *dm;
+	struct drm_device *dev;
+	struct dc_link *link;
+	const char *reason = "allow";
+	bool quirk;
+	bool marked_secondary;
+	bool secondary_route;
+	bool detected_disconnected;
+	bool real_live_sink;
+	bool aux_evidence;
+	bool route_ok = false;
+	bool result;
+	bool hpd_hw = false;
 
 	if (!aconnector || !aconnector->base.dev)
 		return false;
 
+	dev = aconnector->base.dev;
 	dm = &drm_to_adev(aconnector->base.dev)->dm;
+	link = aconnector->dc_link;
 
-	return amdgpu_dm_imac5k_quirk_enabled(dm) &&
-	       aconnector->imac5k_secondary_head &&
-	       aconnector->dc_em_sink &&
-	       !aconnector->mst_root;
+	quirk = amdgpu_dm_imac5k_quirk_enabled(dm);
+	marked_secondary = aconnector->imac5k_secondary_head;
+	secondary_route = amdgpu_dm_imac5k_is_secondary_head(aconnector);
+	detected_disconnected = !detected_sink;
+	real_live_sink = aconnector->dc_sink &&
+			 aconnector->dc_sink != aconnector->dc_em_sink;
+	aux_evidence = aconnector->imac5k_source_dpcd_programmed ||
+		       aconnector->imac5k_dpcd_4f1_asserted ||
+		       aconnector->imac5k_dpcd_111_asserted;
+
+	if (quirk && marked_secondary && secondary_route && link)
+		route_ok = amdgpu_dm_imac5k_verify_windows_route(dev, link,
+				tag, aconnector->base.name, true,
+				"false-disconnect-gate");
+
+	if (link && link->dc && link->dc->link_srv)
+		hpd_hw = dc_link_get_hpd_state(link);
+
+	result = quirk && marked_secondary && secondary_route &&
+		 detected_disconnected && real_live_sink && !aconnector->mst_root &&
+		 aux_evidence && route_ok;
+
+	if (!quirk)
+		reason = "quirk-disabled";
+	else if (!marked_secondary)
+		reason = "not-marked-secondary";
+	else if (!secondary_route)
+		reason = "not-windows-secondary-route";
+	else if (aconnector->mst_root)
+		reason = "mst-root";
+	else if (!detected_disconnected)
+		reason = "not-a-disconnect";
+	else if (!real_live_sink)
+		reason = "no-real-live-sink";
+	else if (!aux_evidence)
+		reason = "no-aux-dpcd-evidence";
+	else if (!route_ok)
+		reason = "route-mismatch";
+
+	if (quirk && (marked_secondary || secondary_route))
+		drm_info(dev,
+			 "IMAC5K: %s false_disconnect_gate result=%u reason=%s connector=%s marked_secondary=%u secondary_route=%u detected_disconnected=%u real_live_sink=%u aux_evidence=%u dpcd_111=%u source_dpcd=%u dpcd_4f1=%u route_ok=%u mst_root=%u dc_sink=%p em_sink=%p detected_sink=%p local_sink=%p hpd=%u/%u link_active=%u link_state_valid=%u\n",
+			 tag, result, reason, aconnector->base.name,
+			 marked_secondary, secondary_route, detected_disconnected,
+			 real_live_sink,
+			 aux_evidence, aconnector->imac5k_dpcd_111_asserted,
+			 aconnector->imac5k_source_dpcd_programmed,
+			 aconnector->imac5k_dpcd_4f1_asserted, route_ok,
+			 !!aconnector->mst_root, aconnector->dc_sink,
+			 aconnector->dc_em_sink, detected_sink,
+			 link ? link->local_sink : NULL,
+			 link ? link->hpd_status : 0, hpd_hw,
+			 link ? link->link_status.link_active : 0,
+			 link ? link->link_state_valid : 0);
+
+	return result;
 }
 
 static void amdgpu_dm_imac5k_log_connector(struct amdgpu_dm_connector *aconnector,
@@ -4161,7 +4546,7 @@ static void amdgpu_dm_imac5k_log_connector(struct amdgpu_dm_connector *aconnecto
 	connector = &aconnector->base;
 
 	drm_info(dev,
-		 "IMAC5K: %s connector=%s id=%u type=%d signal=%d internal=%u dc_sink=%p em_sink=%p secondary=%u seeded=%u size=%ux%u modes=%d status=%d tile=%u %ux%u loc=%u,%u size=%ux%u\n",
+		 "IMAC5K: %s connector=%s id=%u type=%d signal=%d internal=%u dc_sink=%p em_sink=%p secondary=%u dpcd111_attempted=%u dpcd111_asserted=%u source_dpcd=%u dpcd4f1=%u real_route=%u preserved_edid=%u/%u preserved_tile=%u size=%ux%u modes=%d status=%d tile=%u single=%u %ux%u loc=%u,%u size=%ux%u\n",
 		 tag,
 		 connector->name,
 		 aconnector->connector_id,
@@ -4171,18 +4556,27 @@ static void amdgpu_dm_imac5k_log_connector(struct amdgpu_dm_connector *aconnecto
 		 aconnector->dc_sink,
 		 aconnector->dc_em_sink,
 		 aconnector->imac5k_secondary_head,
-		 aconnector->imac5k_em_sink_seeded,
+		 aconnector->imac5k_dpcd_111_attempted,
+		 aconnector->imac5k_dpcd_111_asserted,
+		 aconnector->imac5k_source_dpcd_programmed,
+		 aconnector->imac5k_dpcd_4f1_asserted,
+		 aconnector->imac5k_real_route_seen,
+		 aconnector->imac5k_preserved_edid_valid,
+		 aconnector->imac5k_preserved_edid.length,
+		 aconnector->imac5k_preserved_tile_valid,
 		 connector->display_info.width_mm,
 		 connector->display_info.height_mm,
 		 aconnector->num_modes,
 		 connector->status,
 		 connector->has_tile,
+		 connector->tile_is_single_monitor,
 		 connector->num_h_tile,
 		 connector->num_v_tile,
 		 connector->tile_h_loc,
 		 connector->tile_v_loc,
 		 connector->tile_h_size,
 		 connector->tile_v_size);
+	amdgpu_dm_imac5k_log_tile_contract(aconnector, tag);
 
 	amdgpu_dm_log_link_route(dev, aconnector->dc_link, tag,
 				 connector->name,
@@ -4241,9 +4635,12 @@ amdgpu_dm_imac5k_wait_secondary_aux_ready(
 	bool hpd_hw_initial;
 	bool hpd_initial;
 	bool hpd_ready;
+	bool aux_dpcd_ready = false;
 	bool waited_before;
+	enum dc_status dpcd_rev_status = DC_ERROR_UNEXPECTED;
 	u32 elapsed_ms = 0;
 	u32 post_delay_ms = 0;
+	u8 dpcd_rev = 0;
 	int link_connector_id = CONNECTOR_ID_UNKNOWN;
 	int enc_connector_id = CONNECTOR_ID_UNKNOWN;
 
@@ -4272,6 +4669,13 @@ amdgpu_dm_imac5k_wait_secondary_aux_ready(
 	hpd_cached_initial = link->hpd_status;
 	hpd_initial = hpd_hw_initial || hpd_cached_initial;
 	hpd_ready = hpd_initial;
+	if (!hpd_ready && link->local_sink) {
+		dpcd_rev_status = core_link_read_dpcd(link, DP_DPCD_REV,
+						      &dpcd_rev,
+						      sizeof(dpcd_rev));
+		aux_dpcd_ready = dpcd_rev_status == DC_OK && dpcd_rev != 0;
+		hpd_ready = aux_dpcd_ready;
+	}
 	while (!hpd_ready && elapsed_ms < IMAC5K_HPD_READY_TIMEOUT_MS) {
 		msleep(IMAC5K_HPD_CHECK_INTERVAL_MS);
 		elapsed_ms += IMAC5K_HPD_CHECK_INTERVAL_MS;
@@ -4280,6 +4684,14 @@ amdgpu_dm_imac5k_wait_secondary_aux_ready(
 	hpd_hw_final = dc_link_get_hpd_state(link);
 	hpd_cached_final = link->hpd_status;
 
+	if (!hpd_ready && link->local_sink) {
+		dpcd_rev_status = core_link_read_dpcd(link, DP_DPCD_REV,
+						      &dpcd_rev,
+						      sizeof(dpcd_rev));
+		aux_dpcd_ready = dpcd_rev_status == DC_OK && dpcd_rev != 0;
+		hpd_ready = aux_dpcd_ready;
+	}
+
 	if (hpd_ready && !aconnector->imac5k_aux_ready_wait_done) {
 		post_delay_ms = IMAC5K_POST_HPD_READY_DELAY_MS;
 		msleep(post_delay_ms);
@@ -4287,14 +4699,150 @@ amdgpu_dm_imac5k_wait_secondary_aux_ready(
 	}
 
 	drm_info(dev,
-		 "IMAC5K: %s secondary AUX-ready wait %s link=%u signal=%d link_conn=%d enc_conn=%d live_sink=%u hpd_initial=%u hw_hpd=%u/%u cached_hpd=%u/%u hpd_ready=%u elapsed_ms=%u post_delay_ms=%u waited_before=%u\n",
+		 "IMAC5K: %s secondary AUX-ready wait %s link=%u signal=%d link_conn=%d enc_conn=%d live_sink=%u hpd_initial=%u hw_hpd=%u/%u cached_hpd=%u/%u hpd_ready=%u aux_dpcd_ready=%u dpcd000=%02x status000=%d elapsed_ms=%u post_delay_ms=%u waited_before=%u\n",
 		 tag, aconnector->base.name, link->link_index,
 		 link->connector_signal, link_connector_id, enc_connector_id,
 		 !!link->local_sink, hpd_initial, hpd_hw_initial, hpd_hw_final,
-		 hpd_cached_initial, hpd_cached_final, hpd_ready, elapsed_ms,
+		 hpd_cached_initial, hpd_cached_final, hpd_ready,
+		 aux_dpcd_ready, dpcd_rev, dpcd_rev_status, elapsed_ms,
 		 post_delay_ms, waited_before);
 
 	return hpd_ready;
+}
+
+static bool amdgpu_dm_imac5k_link_rate_is_windows_class2(enum dc_link_rate rate)
+{
+	return rate >= LINK_RATE_UHBR10 && rate <= LINK_RATE_UHBR20;
+}
+
+static bool
+amdgpu_dm_imac5k_program_secondary_dpcd_111(
+		struct amdgpu_dm_connector *aconnector,
+		const char *tag,
+		bool force)
+{
+	struct drm_device *dev;
+	struct dc_link *link;
+	enum dc_status read_status;
+	enum dc_status write_status = DC_ERROR_UNEXPECTED;
+	enum dc_status verify_status = DC_ERROR_UNEXPECTED;
+	u8 old_ctrl = 0;
+	u8 new_ctrl = 0;
+	u8 verify_ctrl = 0;
+	bool class2;
+	bool signal_ok;
+	bool should_write;
+	bool was_asserted;
+
+	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
+		return false;
+
+	if (!aconnector->imac5k_secondary_head)
+		return false;
+
+	dev = aconnector->base.dev;
+	link = aconnector->dc_link;
+	was_asserted = aconnector->imac5k_dpcd_111_asserted;
+
+	if (!link->ctx) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary DPCD 0x111 skipped on %s link=%u: missing dc ctx\n",
+			 tag, aconnector->base.name, link->link_index);
+		return was_asserted;
+	}
+
+	if (!amdgpu_dm_imac5k_verify_windows_route(dev, link, tag,
+						   aconnector->base.name,
+						   true, "dpcd-0x111")) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary DPCD 0x111 skipped on %s link=%u: Windows-equivalent route mismatch previously_asserted=%u\n",
+			 tag, aconnector->base.name, link->link_index,
+			 was_asserted);
+		return was_asserted;
+	}
+
+	read_status = core_link_read_dpcd(link, DP_MSTM_CTRL,
+					 &old_ctrl, sizeof(old_ctrl));
+	if (read_status != DC_OK) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary DPCD 0x111 read failed on %s link=%u status=%d previously_asserted=%u\n",
+			 tag, aconnector->base.name, link->link_index,
+			 read_status, was_asserted);
+		return was_asserted;
+	}
+
+	if (old_ctrl & DP_MST_EN)
+		aconnector->imac5k_dpcd_111_asserted = true;
+
+	signal_ok = link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT;
+	class2 = amdgpu_dm_imac5k_link_rate_is_windows_class2(
+			link->cur_link_settings.link_rate) ||
+		 amdgpu_dm_imac5k_link_rate_is_windows_class2(
+			link->verified_link_cap.link_rate) ||
+		 amdgpu_dm_imac5k_link_rate_is_windows_class2(
+			link->reported_link_cap.link_rate) ||
+		 amdgpu_dm_imac5k_link_rate_is_windows_class2(
+			link->preferred_link_setting.link_rate);
+	should_write = signal_ok && class2;
+	aconnector->imac5k_dpcd_111_attempted = true;
+
+	if (!should_write) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary DPCD 0x111 no-write on %s link=%u old=0x%02x status=%d signal=%d signal_ok=%u class2=%u asserted=%u rates cur=%d verified=%d reported=%d preferred=%d lanes cur=%d verified=%d reported=%d preferred=%d previously_asserted=%u\n",
+			 tag, aconnector->base.name, link->link_index,
+			 old_ctrl, read_status, link->connector_signal, signal_ok,
+			 class2, aconnector->imac5k_dpcd_111_asserted,
+			 link->cur_link_settings.link_rate,
+			 link->verified_link_cap.link_rate,
+			 link->reported_link_cap.link_rate,
+			 link->preferred_link_setting.link_rate,
+			 link->cur_link_settings.lane_count,
+			 link->verified_link_cap.lane_count,
+			 link->reported_link_cap.lane_count,
+			 link->preferred_link_setting.lane_count, was_asserted);
+		return aconnector->imac5k_dpcd_111_asserted;
+	}
+
+	new_ctrl = old_ctrl | DP_MST_EN;
+	if ((old_ctrl & DP_MST_EN) && !force) {
+		drm_info(dev,
+			 "IMAC5K: %s secondary DPCD 0x111 already set on %s link=%u old=0x%02x signal=%d rates cur=%d verified=%d reported=%d preferred=%d\n",
+			 tag, aconnector->base.name, link->link_index,
+			 old_ctrl, link->connector_signal,
+			 link->cur_link_settings.link_rate,
+			 link->verified_link_cap.link_rate,
+			 link->reported_link_cap.link_rate,
+			 link->preferred_link_setting.link_rate);
+		return true;
+	}
+
+	write_status = core_link_write_dpcd(link, DP_MSTM_CTRL,
+					    &new_ctrl, sizeof(new_ctrl));
+	if (write_status == DC_OK)
+		verify_status = core_link_read_dpcd(link, DP_MSTM_CTRL,
+						    &verify_ctrl,
+						    sizeof(verify_ctrl));
+
+	if (write_status == DC_OK &&
+	    (verify_status != DC_OK || (verify_ctrl & DP_MST_EN)))
+		aconnector->imac5k_dpcd_111_asserted = true;
+
+	drm_info(dev,
+		 "IMAC5K: %s secondary DPCD 0x111 RMW on %s link=%u old=0x%02x new=0x%02x write_status=%d verify=0x%02x verify_status=%d asserted=%u force=%u signal=%d class2=%u rates cur=%d verified=%d reported=%d preferred=%d lanes cur=%d verified=%d reported=%d preferred=%d\n",
+		 tag, aconnector->base.name, link->link_index,
+		 old_ctrl, new_ctrl, write_status, verify_ctrl, verify_status,
+		 aconnector->imac5k_dpcd_111_asserted, force,
+		 link->connector_signal, class2,
+		 link->cur_link_settings.link_rate,
+		 link->verified_link_cap.link_rate,
+		 link->reported_link_cap.link_rate,
+		 link->preferred_link_setting.link_rate,
+		 link->cur_link_settings.lane_count,
+		 link->verified_link_cap.lane_count,
+		 link->reported_link_cap.lane_count,
+		 link->preferred_link_setting.lane_count);
+
+	return aconnector->imac5k_dpcd_111_asserted;
 }
 
 static bool
@@ -4490,10 +5038,12 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd(
 	}
 
 	/*
-	 * Windows publishes source-DPCD before link training. Log 0x111 here
-	 * read-only because Windows conditionally touches it on the signal-32
-	 * class-2 path, but we are not ready to mutate that register yet.
+	 * Windows conditionally sets DPCD 0x111 bit 0 on the signal-32/class-2
+	 * path before source-DPCD publication and link training. Keep the write
+	 * behind the exact secondary route and class gate proven by RE-B.
 	 */
+	amdgpu_dm_imac5k_program_secondary_dpcd_111(aconnector, tag, force);
+
 	mst_status = core_link_read_dpcd(link, DP_MSTM_CTRL,
 					&mst_ctrl, sizeof(mst_ctrl));
 
@@ -4515,10 +5065,11 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd(
 			 table_revision[0], table_revision[1], table_revision[2]);
 
 	drm_info(dev,
-		 "IMAC5K: %s secondary source-DPCD %s link=%u dce=%d live_sink=%u force=%u previously_programmed=%u 0x111=%02x status_111=%d 0x310=%02x %02x %02x status=%d programmed=%u\n",
+		 "IMAC5K: %s secondary source-DPCD %s link=%u dce=%d live_sink=%u force=%u previously_programmed=%u dpcd111_attempted=%u dpcd111_asserted=%u 0x111=%02x status_111=%d 0x310=%02x %02x %02x status=%d programmed=%u\n",
 		 tag, aconnector->base.name, link->link_index,
 		 link->ctx->dce_version, !!link->local_sink, force,
-		 was_programmed, mst_ctrl, mst_status,
+		 was_programmed, aconnector->imac5k_dpcd_111_attempted,
+		 aconnector->imac5k_dpcd_111_asserted, mst_ctrl, mst_status,
 		 table_revision[0], table_revision[1], table_revision[2],
 		 status, aconnector->imac5k_source_dpcd_programmed);
 
@@ -4680,8 +5231,8 @@ static void amdgpu_dm_imac5k_note_two_stream_state(struct drm_device *dev,
 		 tag, dc_state->stream_count, tile_streams);
 }
 
-static bool amdgpu_dm_imac5k_should_suppress_stream_drop(struct drm_device *dev,
-							 struct dc_state *dc_state)
+static void amdgpu_dm_imac5k_note_stream_drop_attempt(struct drm_device *dev,
+						      struct dc_state *dc_state)
 {
 	struct amdgpu_display_manager *dm;
 	struct dc_state *current_state;
@@ -4690,17 +5241,17 @@ static bool amdgpu_dm_imac5k_should_suppress_stream_drop(struct drm_device *dev,
 	u32 current_tile_streams = 0;
 
 	if (!dev || !dc_state)
-		return false;
+		return;
 
 	dm = &drm_to_adev(dev)->dm;
 	if (!amdgpu_dm_imac5k_quirk_enabled(dm) ||
 	    !dm->imac5k_secondary_head_detected ||
 	    !dm->imac5k_two_tile_streams_seen)
-		return false;
+		return;
 
 	new_tile_streams = amdgpu_dm_imac5k_count_tile_streams(dc_state);
 	if (dc_state->stream_count >= 2 && new_tile_streams >= 2)
-		return false;
+		return;
 
 	current_state = dm->dc ? dm->dc->current_state : NULL;
 	if (current_state) {
@@ -4710,16 +5261,20 @@ static bool amdgpu_dm_imac5k_should_suppress_stream_drop(struct drm_device *dev,
 	}
 
 	if (current_tile_streams < 2)
-		return false;
+		return;
 
-	dm->imac5k_stream_drop_suppressions++;
+	dm->imac5k_stream_drop_attempts++;
 	drm_info(dev,
-		 "IMAC5K: suppressing transient stream drop #%u proposed_streams=%u proposed_tile_streams=%u current_streams=%u current_tile_streams=%u\n",
-		 dm->imac5k_stream_drop_suppressions,
+		 "IMAC5K: observed tiled stream drop attempt #%u task=%s pid=%d proposed_streams=%u proposed_tile_streams=%u current_streams=%u current_tile_streams=%u; allowing commit, no emulated/suppressed iMac5K path\n",
+		 dm->imac5k_stream_drop_attempts,
+		 current->comm, task_pid_nr(current),
 		 dc_state->stream_count, new_tile_streams,
 		 current_stream_count, current_tile_streams);
+}
 
-	return true;
+static int amdgpu_dm_imac5k_pipe_index(const struct pipe_ctx *pipe)
+{
+	return pipe ? pipe->pipe_idx : -1;
 }
 
 static void amdgpu_dm_imac5k_log_streams(struct drm_device *dev,
@@ -4739,32 +5294,96 @@ static void amdgpu_dm_imac5k_log_streams(struct drm_device *dev,
 
 	tile_streams = amdgpu_dm_imac5k_count_tile_streams(dc_state);
 	drm_info(dev,
-		 "IMAC5K: %s stream_count=%u tile_streams=%u plain_boot_candidate=%u secondary_detected=%u guard_armed=%u suppressions=%u\n",
+		 "IMAC5K: %s stream_count=%u tile_streams=%u plain_boot_candidate=%u secondary_detected=%u two_tile_seen=%u stream_drop_attempts=%u\n",
 		 tag, dc_state->stream_count,
 		 tile_streams,
 		 dm->imac5k_plain_boot_candidate_seen,
 		 dm->imac5k_secondary_head_detected,
 		 dm->imac5k_two_tile_streams_seen,
-		 dm->imac5k_stream_drop_suppressions);
+		 dm->imac5k_stream_drop_attempts);
 
 	for (i = 0; i < dc_state->stream_count; i++) {
 		const struct dc_stream_state *stream = dc_state->streams[i];
+		const struct dc_stream_status *status = &dc_state->stream_status[i];
 
 		if (!stream)
 			continue;
 
 		drm_info(dev,
-			 "IMAC5K: %s stream[%u] %ux%u src=%dx%d dst=%dx%d boot_odm=%u seamless=%u context=%p\n",
+			 "IMAC5K: %s stream[%u] %ux%u src=%dx%d+%d+%d dst=%dx%d+%d+%d link=%u signal=%d boot_odm=%u seamless=%u planes=%d otg=%d enc=%d context=%p\n",
 			 tag, i,
 			 stream->timing.h_addressable,
 			 stream->timing.v_addressable,
 			 stream->src.width,
 			 stream->src.height,
+			 stream->src.x,
+			 stream->src.y,
 			 stream->dst.width,
 			 stream->dst.height,
+			 stream->dst.x,
+			 stream->dst.y,
+			 stream->link ? stream->link->link_index : 0xffffffffu,
+			 stream->link ? stream->link->connector_signal : SIGNAL_TYPE_NONE,
 			 stream->apply_boot_odm_mode,
 			 stream->apply_seamless_boot_optimization,
+			 status->plane_count,
+			 status->primary_otg_inst,
+			 status->stream_enc_inst,
 			 stream->dm_stream_context);
+	}
+
+	for (i = 0; i < MAX_PIPES; i++) {
+		const struct pipe_ctx *pipe = &dc_state->res_ctx.pipe_ctx[i];
+		const struct dc_plane_state *plane = pipe->plane_state;
+		const struct dc_stream_state *stream = pipe->stream;
+		const struct scaler_data *scl = &pipe->plane_res.scl_data;
+
+		if (!stream && !plane)
+			continue;
+
+		drm_info(dev,
+			 "IMAC5K: %s pipe[%u] pipe_idx=%u stream=%p tile_stream=%u plane=%p top=%d bottom=%d prev_odm=%d next_odm=%d tg=%p opp=%p hubp=%p dpp=%p link=%u signal=%d timing=%ux%u stream_src=%dx%d+%d+%d stream_dst=%dx%d+%d+%d viewport=%dx%d+%d+%d recout=%dx%d+%d+%d hactive=%d vactive=%d plane_src=%dx%d+%d+%d plane_dst=%dx%d+%d+%d plane_clip=%dx%d+%d+%d visible=%u layer=%d\n",
+			 tag, i, pipe->pipe_idx, stream,
+			 amdgpu_dm_imac5k_is_tile_stream(stream), plane,
+			 amdgpu_dm_imac5k_pipe_index(pipe->top_pipe),
+			 amdgpu_dm_imac5k_pipe_index(pipe->bottom_pipe),
+			 amdgpu_dm_imac5k_pipe_index(pipe->prev_odm_pipe),
+			 amdgpu_dm_imac5k_pipe_index(pipe->next_odm_pipe),
+			 pipe->stream_res.tg,
+			 pipe->stream_res.opp,
+			 pipe->plane_res.hubp,
+			 pipe->plane_res.dpp,
+			 stream && stream->link ? stream->link->link_index : 0xffffffffu,
+			 stream && stream->link ? stream->link->connector_signal : SIGNAL_TYPE_NONE,
+			 stream ? stream->timing.h_addressable : 0,
+			 stream ? stream->timing.v_addressable : 0,
+			 stream ? stream->src.width : 0,
+			 stream ? stream->src.height : 0,
+			 stream ? stream->src.x : 0,
+			 stream ? stream->src.y : 0,
+			 stream ? stream->dst.width : 0,
+			 stream ? stream->dst.height : 0,
+			 stream ? stream->dst.x : 0,
+			 stream ? stream->dst.y : 0,
+			 scl->viewport.width, scl->viewport.height,
+			 scl->viewport.x, scl->viewport.y,
+			 scl->recout.width, scl->recout.height,
+			 scl->recout.x, scl->recout.y,
+			 scl->h_active, scl->v_active,
+			 plane ? plane->src_rect.width : 0,
+			 plane ? plane->src_rect.height : 0,
+			 plane ? plane->src_rect.x : 0,
+			 plane ? plane->src_rect.y : 0,
+			 plane ? plane->dst_rect.width : 0,
+			 plane ? plane->dst_rect.height : 0,
+			 plane ? plane->dst_rect.x : 0,
+			 plane ? plane->dst_rect.y : 0,
+			 plane ? plane->clip_rect.width : 0,
+			 plane ? plane->clip_rect.height : 0,
+			 plane ? plane->clip_rect.x : 0,
+			 plane ? plane->clip_rect.y : 0,
+			 plane ? plane->visible : 0,
+			 plane ? plane->layer_index : -1);
 	}
 }
 
@@ -4808,6 +5427,198 @@ static void amdgpu_dm_imac5k_log_crtc_update(struct amdgpu_display_manager *dm,
 			dm_old_crtc_state->stream->apply_boot_odm_mode : 0,
 		 (dm_old_crtc_state && dm_old_crtc_state->stream) ?
 			dm_old_crtc_state->stream->apply_seamless_boot_optimization : 0);
+}
+
+static const char *amdgpu_dm_imac5k_plane_type_name(enum drm_plane_type type)
+{
+	switch (type) {
+	case DRM_PLANE_TYPE_OVERLAY:
+		return "overlay";
+	case DRM_PLANE_TYPE_PRIMARY:
+		return "primary";
+	case DRM_PLANE_TYPE_CURSOR:
+		return "cursor";
+	default:
+		return "unknown";
+	}
+}
+
+static bool amdgpu_dm_imac5k_atomic_state_interesting(
+		struct drm_device *dev,
+		struct drm_atomic_state *state)
+{
+	struct drm_connector *connector;
+	struct drm_connector_state *new_con_state;
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *new_crtc_state;
+	int i;
+
+	if (!dev || !state)
+		return false;
+
+	for_each_new_connector_in_state(state, connector, new_con_state, i) {
+		struct amdgpu_dm_connector *aconnector;
+
+		if (!connector || connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK)
+			continue;
+
+		aconnector = to_amdgpu_dm_connector(connector);
+		if (amdgpu_dm_imac5k_should_log_userspace_contract(aconnector))
+			return true;
+	}
+
+	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
+		if (!new_crtc_state)
+			continue;
+
+		if (drm_atomic_crtc_needs_modeset(new_crtc_state) ||
+		    new_crtc_state->active_changed ||
+		    new_crtc_state->connectors_changed ||
+		    new_crtc_state->mode_changed)
+			return true;
+	}
+
+	return false;
+}
+
+static void amdgpu_dm_imac5k_log_atomic_state(
+		struct drm_device *dev,
+		struct drm_atomic_state *state,
+		const char *tag)
+{
+	struct amdgpu_display_manager *dm;
+	struct drm_connector *connector;
+	struct drm_connector_state *new_con_state;
+	struct drm_crtc *crtc;
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_plane *plane;
+	struct drm_plane_state *new_plane_state;
+	int i;
+
+	if (!dev || !state)
+		return;
+
+	dm = &drm_to_adev(dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm) ||
+	    !amdgpu_dm_imac5k_atomic_state_interesting(dev, state))
+		return;
+
+	drm_info(dev,
+		 "IMAC5K: %s mutter_atomic begin task=%s pid=%d secondary_detected=%u two_tile_seen=%u stream_drop_attempts=%u\n",
+		 tag, current->comm, task_pid_nr(current),
+		 dm->imac5k_secondary_head_detected,
+		 dm->imac5k_two_tile_streams_seen,
+		 dm->imac5k_stream_drop_attempts);
+
+	for_each_new_connector_in_state(state, connector, new_con_state, i) {
+		struct amdgpu_dm_connector *aconnector;
+		char tile_blob[96];
+
+		if (!connector || connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK)
+			continue;
+
+		aconnector = to_amdgpu_dm_connector(connector);
+		if (!amdgpu_dm_imac5k_should_log_userspace_contract(aconnector) &&
+		    !connector->has_tile)
+			continue;
+
+		amdgpu_dm_imac5k_format_tile_blob(connector, tile_blob, sizeof(tile_blob));
+		drm_info(dev,
+			 "IMAC5K: %s mutter_atomic_connector connector=%s id=%u status=%d crtc=%d has_tile=%u blob=\"%s\" mutter_shape_ok=%u modes=%d secondary=%u\n",
+			 tag, connector->name, connector->base.id,
+			 connector->status,
+			 new_con_state && new_con_state->crtc ?
+				new_con_state->crtc->base.id : 0,
+			 connector->has_tile, tile_blob,
+			 amdgpu_dm_imac5k_mutter_tile_shape_ok(connector),
+			 aconnector->num_modes,
+			 aconnector->imac5k_secondary_head);
+	}
+
+	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
+		if (!crtc || !new_crtc_state)
+			continue;
+
+		drm_info(dev,
+			 "IMAC5K: %s mutter_atomic_crtc crtc=%d active=%u enable=%u needs_modeset=%u mode_changed=%u active_changed=%u connectors_changed=%u planes_changed=%u mode=%s %dx%d adjusted=%s %dx%d plane_mask=0x%x connector_mask=0x%x\n",
+			 tag, crtc->base.id, new_crtc_state->active,
+			 new_crtc_state->enable,
+			 drm_atomic_crtc_needs_modeset(new_crtc_state),
+			 new_crtc_state->mode_changed,
+			 new_crtc_state->active_changed,
+			 new_crtc_state->connectors_changed,
+			 new_crtc_state->planes_changed,
+			 new_crtc_state->mode.name,
+			 new_crtc_state->mode.hdisplay,
+			 new_crtc_state->mode.vdisplay,
+			 new_crtc_state->adjusted_mode.name,
+			 new_crtc_state->adjusted_mode.hdisplay,
+			 new_crtc_state->adjusted_mode.vdisplay,
+			 new_crtc_state->plane_mask,
+			 new_crtc_state->connector_mask);
+	}
+
+	for_each_new_plane_in_state(state, plane, new_plane_state, i) {
+		struct drm_framebuffer *fb;
+		u32 format = 0;
+
+		if (!plane || !new_plane_state || plane->type == DRM_PLANE_TYPE_CURSOR)
+			continue;
+
+		fb = new_plane_state->fb;
+		if (!fb && !new_plane_state->crtc)
+			continue;
+
+		if (fb && fb->format)
+			format = fb->format->format;
+
+		drm_info(dev,
+			 "IMAC5K: %s mutter_atomic_plane plane=%s id=%u type=%s crtc=%d fb=%u fb_size=%ux%u pitch=%u format=0x%x modifier=0x%llx src=%u,%u %ux%u raw=0x%x,0x%x 0x%x,0x%x crtc_rect=%d,%d %ux%u zpos=%u normalized_zpos=%u alpha=%u\n",
+			 tag, plane->name ? plane->name : "<plane>",
+			 plane->base.id,
+			 amdgpu_dm_imac5k_plane_type_name(plane->type),
+			 new_plane_state->crtc ? new_plane_state->crtc->base.id : 0,
+			 fb ? fb->base.id : 0,
+			 fb ? fb->width : 0,
+			 fb ? fb->height : 0,
+			 fb ? fb->pitches[0] : 0,
+			 format,
+			 (unsigned long long)(fb ? fb->modifier : 0),
+			 new_plane_state->src_x >> 16,
+			 new_plane_state->src_y >> 16,
+			 new_plane_state->src_w >> 16,
+			 new_plane_state->src_h >> 16,
+			 new_plane_state->src_x,
+			 new_plane_state->src_y,
+			 new_plane_state->src_w,
+			 new_plane_state->src_h,
+			 new_plane_state->crtc_x,
+			 new_plane_state->crtc_y,
+			 new_plane_state->crtc_w,
+			 new_plane_state->crtc_h,
+			 new_plane_state->zpos,
+			 new_plane_state->normalized_zpos,
+			 new_plane_state->alpha);
+	}
+
+	drm_info(dev, "IMAC5K: %s mutter_atomic end\n", tag);
+}
+
+static void amdgpu_dm_imac5k_log_hotplug_event(struct drm_device *dev,
+					       const char *tag)
+{
+	struct amdgpu_display_manager *dm;
+
+	if (!dev)
+		return;
+
+	dm = &drm_to_adev(dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm))
+		return;
+
+	drm_info(dev,
+		 "IMAC5K: %s emitting DRM hotplug/resource event; userspace should rescan TILE blobs and modes\n",
+		 tag);
 }
 
 static int dm_resume(struct amdgpu_ip_block *ip_block)
@@ -5021,12 +5832,13 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
 	 * is complete for all connectors. This provides a comprehensive view of the
 	 * final state without repeating the dump for each connector.
 	 */
-	amdgpu_dm_dump_links_and_sinks(adev);
+	amdgpu_dm_dump_links_and_sinks(adev, "resume_post_detect");
 
 	amdgpu_dm_irq_resume_late(adev);
 
 	amdgpu_dm_smu_write_watermarks_table(adev);
 
+	amdgpu_dm_imac5k_log_hotplug_event(ddev, "dm_resume");
 	drm_kms_helper_hotplug_event(ddev);
 
 	return 0;
@@ -5220,17 +6032,18 @@ void amdgpu_dm_update_connector_after_detect(
 	if (sink && sink->sink_signal == SIGNAL_TYPE_DISPLAY_PORT_MST)
 		return;
 
+	if (sink)
+		amdgpu_dm_imac5k_snapshot_secondary_metadata(aconnector,
+							     "detect_live_pretrain");
 	amdgpu_dm_imac5k_mark_secondary_head(aconnector);
 	if (sink)
 		amdgpu_dm_imac5k_program_secondary_source_dpcd(aconnector,
 							       "detect_live_pretrain",
 							       true, false);
-	amdgpu_dm_imac5k_seed_emulated_sink(aconnector);
 	amdgpu_dm_imac5k_note_plain_boot_candidate(aconnector);
 	amdgpu_dm_imac5k_apply_primary_tile_property(aconnector);
 
-	if (aconnector->dc_sink == sink &&
-	    !amdgpu_dm_imac5k_should_preserve_secondary_sink(aconnector)) {
+	if (aconnector->dc_sink == sink) {
 		amdgpu_dm_imac5k_log_connector(aconnector, "detect_unchanged");
 
 		/*
@@ -5284,6 +6097,9 @@ void amdgpu_dm_update_connector_after_detect(
 						  connector->display_info.source_physical_address);
 		}
 
+		amdgpu_dm_imac5k_snapshot_secondary_metadata(aconnector,
+							     "detect_connected_edid");
+
 		if (!aconnector->timing_requested) {
 			aconnector->timing_requested =
 				kzalloc_obj(struct dc_crtc_timing);
@@ -5298,41 +6114,67 @@ void amdgpu_dm_update_connector_after_detect(
 		amdgpu_dm_imac5k_program_secondary_source_dpcd(aconnector,
 							       "detect_connected_pretrain",
 							       true, false);
-		amdgpu_dm_imac5k_seed_emulated_sink(aconnector);
 		amdgpu_dm_imac5k_note_plain_boot_candidate(aconnector);
 		amdgpu_dm_imac5k_apply_primary_tile_property(aconnector);
 	} else {
-		if (amdgpu_dm_imac5k_should_preserve_secondary_sink(aconnector)) {
+		if (amdgpu_dm_imac5k_should_suppress_secondary_false_disconnect(
+					aconnector, sink,
+					"detect_false_disconnect_gate")) {
+			struct dc_link *link = aconnector->dc_link;
+			struct dc_sink *live_sink = aconnector->dc_sink;
+			enum dc_connection_type old_type = link->type;
+			bool had_local_sink = !!link->local_sink;
+			bool hpd_hw = link->dc && link->dc->link_srv ?
+				      dc_link_get_hpd_state(link) : false;
+
 			drm_info(dev,
-				 "IMAC5K: preserving secondary tiled head on %s using emulated sink after the physical sink disappeared\n",
+				 "IMAC5K: suppressing secondary false disconnect on %s before live 0x3113 object teardown\n",
 				 connector->name);
 
-			hdmi_cec_unset_edid(aconnector);
-			drm_dp_cec_unset_edid(&aconnector->dm_dp_aux.aux);
-
-			if (aconnector->dc_sink && aconnector->dc_sink != aconnector->dc_em_sink) {
-				amdgpu_dm_update_freesync_caps(connector, NULL);
-				dc_sink_release(aconnector->dc_sink);
+			if (!link->local_sink) {
+				link->local_sink = live_sink;
+				dc_sink_retain(link->local_sink);
 			}
+			link->type = dc_connection_single;
+			if (!link->dpcd_sink_count)
+				link->dpcd_sink_count = 1;
 
-			if (aconnector->dc_sink != aconnector->dc_em_sink) {
-				aconnector->dc_sink = aconnector->dc_em_sink;
-				dc_sink_retain(aconnector->dc_sink);
-			}
-
-			if (!aconnector->drm_edid && aconnector->dc_em_sink->dc_edid.length) {
+			if (!aconnector->drm_edid &&
+			    (live_sink->dc_edid.length ||
+			     aconnector->imac5k_preserved_edid_valid)) {
+				const struct dc_edid *edid_src =
+					live_sink->dc_edid.length ?
+					&live_sink->dc_edid :
+					&aconnector->imac5k_preserved_edid;
 				const struct edid *edid =
-					(const struct edid *)aconnector->dc_em_sink->dc_edid.raw_edid;
+					(const struct edid *)edid_src->raw_edid;
 
 				aconnector->drm_edid =
-					drm_edid_alloc(edid, aconnector->dc_em_sink->dc_edid.length);
+					drm_edid_alloc(edid, edid_src->length);
 				drm_edid_connector_update(connector, aconnector->drm_edid);
+				drm_info(dev,
+					 "IMAC5K: restored secondary DRM EDID on %s during false-disconnect suppression from %s len=%u\n",
+					 connector->name,
+					 live_sink->dc_edid.length ? "live-sink" :
+					 "preserved-real-route",
+					 edid_src->length);
 			}
+
+			amdgpu_dm_imac5k_snapshot_secondary_metadata(aconnector,
+								     "detect_false_disconnect_suppressed");
+			amdgpu_dm_imac5k_apply_secondary_tile_property(aconnector);
+
+			drm_info(dev,
+				 "IMAC5K: kept secondary real link backend on %s link=%u old_type=%d new_type=%d had_local_sink=%u local_sink=%p live_sink=%p dpcd_sink_count=%u hpd=%u/%u\n",
+				 connector->name, link->link_index, old_type,
+				 link->type, had_local_sink, link->local_sink,
+				 live_sink, link->dpcd_sink_count,
+				 link->hpd_status, hpd_hw);
 
 			amdgpu_dm_update_freesync_caps(connector, aconnector->drm_edid);
 			update_connector_ext_caps(aconnector);
 			update_subconnector_property(aconnector);
-			amdgpu_dm_imac5k_log_connector(aconnector, "detect_preserve_secondary");
+			amdgpu_dm_imac5k_log_connector(aconnector, "detect_false_disconnect_suppressed");
 
 			if (!drm_kms_helper_is_poll_worker())
 				mutex_unlock(&dev->mode_config.mutex);
@@ -5437,8 +6279,10 @@ static void hdmi_hpd_debounce_work(struct work_struct *work)
 		drm_modeset_unlock_all(dev);
 
 		/* Only notify OS if sink actually changed */
-		if (!fake_reconnect && aconnector->base.force == DRM_FORCE_UNSPECIFIED)
+		if (!fake_reconnect && aconnector->base.force == DRM_FORCE_UNSPECIFIED) {
+			amdgpu_dm_imac5k_log_hotplug_event(dev, "hpd_debounce");
 			drm_kms_helper_hotplug_event(dev);
+		}
 	}
 
 	/* Release the cached sink reference */
@@ -6998,6 +7842,8 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 		goto fail;
 	}
 
+	amdgpu_dm_dump_links_and_sinks(adev, "boot_pre_detect");
+
 	/* loops over all connectors on the board */
 	for (i = 0; i < link_cnt; i++) {
 		struct dc_link *link = NULL;
@@ -7082,11 +7928,12 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 			}
 		}
 		amdgpu_set_panel_orientation(&aconnector->base);
+		amdgpu_dm_imac5k_snapshot_secondary_metadata(aconnector,
+							     "boot_detect");
 		amdgpu_dm_imac5k_mark_secondary_head(aconnector);
 		amdgpu_dm_imac5k_program_secondary_source_dpcd(aconnector,
 							       "boot_detect_pretrain",
 							       true, false);
-		amdgpu_dm_imac5k_seed_emulated_sink(aconnector);
 		amdgpu_dm_imac5k_note_plain_boot_candidate(aconnector);
 		amdgpu_dm_imac5k_apply_primary_tile_property(aconnector);
 		amdgpu_dm_imac5k_log_connector(aconnector, "boot_detect");
@@ -7096,7 +7943,7 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 	 * is complete for all connectors. This provides a comprehensive view of the
 	 * final state without repeating the dump for each connector.
 	 */
-	amdgpu_dm_dump_links_and_sinks(adev);
+	amdgpu_dm_dump_links_and_sinks(adev, "boot_post_detect");
 
 	/* Software is initialized. Now we can register interrupt handlers. */
 	switch (adev->asic_type) {
@@ -8967,14 +9814,6 @@ amdgpu_dm_connector_detect(struct drm_connector *connector, bool force)
 		(!aconnector->dc_sink || aconnector->dc_sink->edid_caps.analog))
 		return amdgpu_dm_connector_poll(aconnector, force);
 
-	if (!aconnector->dc_sink &&
-	    amdgpu_dm_imac5k_should_preserve_secondary_sink(aconnector)) {
-		drm_info(connector->dev,
-			 "IMAC5K: reporting %s as connected via preserved secondary emulated sink\n",
-			 connector->name);
-		return connector_status_connected;
-	}
-
 	return (aconnector->dc_sink ? connector_status_connected :
 			connector_status_disconnected);
 }
@@ -10373,6 +11212,7 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 		amdgpu_dm_connector_add_freesync_modes(connector, drm_edid);
 	}
 	amdgpu_dm_fbc_init(connector);
+	amdgpu_dm_imac5k_log_modes(amdgpu_dm_connector, "get_modes");
 
 	return amdgpu_dm_connector->num_modes;
 }
@@ -11870,11 +12710,7 @@ static bool amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 	bool set_backlight_level = false;
 
 	amdgpu_dm_imac5k_log_streams(dev, dc_state, "commit_streams_begin");
-	if (amdgpu_dm_imac5k_should_suppress_stream_drop(dev, dc_state)) {
-		amdgpu_dm_imac5k_log_streams(dev, dc_state,
-					      "commit_streams_suppressed");
-		return false;
-	}
+	amdgpu_dm_imac5k_note_stream_drop_attempt(dev, dc_state);
 
 	/* Disable writeback */
 	for_each_old_connector_in_state(state, connector, old_con_state, i) {
@@ -12366,9 +13202,9 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 	struct drm_connector_state *old_con_state = NULL, *new_con_state = NULL;
 	struct dm_crtc_state *dm_old_crtc_state, *dm_new_crtc_state;
 	int crtc_disable_count = 0;
-	bool imac5k_stream_commit_suppressed = false;
 
 	trace_amdgpu_dm_atomic_commit_tail_begin(state);
+	amdgpu_dm_imac5k_log_atomic_state(dev, state, "atomic_commit_tail_input");
 
 	drm_atomic_helper_update_legacy_modeset_state(dev, state);
 	drm_dp_mst_atomic_wait_for_dependencies(state);
@@ -12377,8 +13213,7 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 	if (dm_state && dm_state->context) {
 		dc_state = dm_state->context;
 		amdgpu_dm_imac5k_log_streams(dev, dc_state, "atomic_commit_tail_pre");
-		imac5k_stream_commit_suppressed =
-			!amdgpu_dm_commit_streams(state, dc_state);
+		amdgpu_dm_commit_streams(state, dc_state);
 		amdgpu_dm_imac5k_log_streams(dev, dc_state, "atomic_commit_tail_post");
 	}
 
@@ -12518,8 +13353,7 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 		enum amdgpu_dm_pipe_crc_source cur_crc_src;
 #endif
 		/* Count number of newly disabled CRTCs for dropping PM refs later. */
-		if (!imac5k_stream_commit_suppressed &&
-		    old_crtc_state->active && !new_crtc_state->active)
+		if (old_crtc_state->active && !new_crtc_state->active)
 			crtc_disable_count++;
 
 		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
@@ -14497,8 +15331,20 @@ fail:
 		drm_dbg_atomic(dev, "Atomic check stopped to avoid deadlock.\n");
 	else if (ret == -EINTR || ret == -EAGAIN || ret == -ERESTARTSYS)
 		drm_dbg_atomic(dev, "Atomic check stopped due to signal.\n");
-	else
+	else {
 		drm_dbg_atomic(dev, "Atomic check failed with err: %d\n", ret);
+		if (amdgpu_dm_imac5k_quirk_enabled(&adev->dm)) {
+			drm_info(dev,
+				 "IMAC5K: atomic_check_fail ret=%d lock_and_validation_needed=%u\n",
+				 ret, lock_and_validation_needed);
+			amdgpu_dm_imac5k_log_atomic_state(dev, state,
+							  "atomic_check_fail");
+			if (dm_state && dm_state->context)
+				amdgpu_dm_imac5k_log_streams(dev,
+						dm_state->context,
+						"atomic_check_fail_context");
+		}
+	}
 
 	trace_amdgpu_dm_atomic_check_finish(state, ret);
 

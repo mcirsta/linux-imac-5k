@@ -32,6 +32,7 @@
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_plane.h>
+#include "dc_types.h"
 #include "link_service_types.h"
 #include <drm/drm_writeback.h>
 
@@ -676,12 +677,13 @@ struct amdgpu_display_manager {
 	bool imac5k_tiled_display_quirk;
 
 	/**
-	 * @imac5k_plain_boot_synth_quirk:
+	 * @imac5k_plain_boot_route_probe_quirk:
 	 *
-	 * Stage 2 scaffolding flag. The current patch does not synthesize the
-	 * split state yet, but it records when the machine is a candidate.
+	 * Stage 2 route-discovery scaffolding flag. The current patch does not
+	 * synthesize a connector; it records when the real secondary 0x3113
+	 * route is missing on plain boot.
 	 */
-	bool imac5k_plain_boot_synth_quirk;
+	bool imac5k_plain_boot_route_probe_quirk;
 
 	/**
 	 * @imac5k_secondary_head_detected:
@@ -695,26 +697,26 @@ struct amdgpu_display_manager {
 	 * @imac5k_two_tile_streams_seen:
 	 *
 	 * Armed after DC has accepted a two-stream 2560x2880 tiled iMac5K
-	 * state. Later transient userspace modesets may briefly propose fewer
-	 * streams; the bring-up quirk can then avoid tearing down the trained
-	 * firmware display pair while userspace rebuilds the same topology.
+	 * state. Later userspace modesets that propose fewer streams are logged
+	 * but not suppressed; the Windows-like path must keep the real split
+	 * topology alive in DC rather than masking bad commits.
 	 */
 	bool imac5k_two_tile_streams_seen;
 
 	/**
-	 * @imac5k_stream_drop_suppressions:
+	 * @imac5k_stream_drop_attempts:
 	 *
-	 * Diagnostic counter for suppressed transient drops below the armed
+	 * Diagnostic counter for userspace/DC states that drop below the armed
 	 * two-stream iMac5K state.
 	 */
-	unsigned int imac5k_stream_drop_suppressions;
+	unsigned int imac5k_stream_drop_attempts;
 
 	/**
 	 * @imac5k_plain_boot_candidate_seen:
 	 *
 	 * Set when the primary internal tile is present but the secondary half
-	 * has not been preserved/discovered, which is the Stage 2 synthesis
-	 * starting point.
+	 * has not been preserved/discovered, which is the Stage 2 real-route
+	 * construction starting point.
 	 */
 	bool imac5k_plain_boot_candidate_seen;
 
@@ -889,16 +891,25 @@ struct amdgpu_dm_connector {
 	bool timing_changed;
 	struct dc_crtc_timing *timing_requested;
 
-	/*
-	 * Temporary iMac 5K bring-up markers. The secondary DP half is backed
-	 * by an emulated sink so the first real userspace modeset does not
-	 * immediately collapse the tiled boot configuration.
-	 */
+	/* Temporary iMac 5K bring-up markers for the real secondary DP half. */
 	bool imac5k_secondary_head;
-	bool imac5k_em_sink_seeded;
 	bool imac5k_aux_ready_wait_done;
+	bool imac5k_dpcd_111_attempted;
+	bool imac5k_dpcd_111_asserted;
 	bool imac5k_source_dpcd_programmed;
 	bool imac5k_dpcd_4f1_asserted;
+	bool imac5k_real_route_seen;
+	bool imac5k_preserved_edid_valid;
+	struct dc_edid imac5k_preserved_edid;
+	bool imac5k_preserved_tile_valid;
+	uint8_t imac5k_preserved_tile_group[8];
+	bool imac5k_preserved_tile_single_monitor;
+	unsigned int imac5k_preserved_num_h_tile;
+	unsigned int imac5k_preserved_num_v_tile;
+	unsigned int imac5k_preserved_tile_h_loc;
+	unsigned int imac5k_preserved_tile_v_loc;
+	unsigned int imac5k_preserved_tile_h_size;
+	unsigned int imac5k_preserved_tile_v_size;
 
 	/* Adaptive Sync */
 	bool pack_sdp_v1_3;
