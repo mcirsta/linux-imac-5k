@@ -896,6 +896,9 @@ struct amdgpu_dm_connector {
 	bool imac5k_aux_ready_wait_done;
 	bool imac5k_dpcd_111_attempted;
 	bool imac5k_dpcd_111_asserted;
+	bool imac5k_dpcd_10a_attempted;
+	bool imac5k_dpcd_10a_asserted;
+	bool imac5k_dpcd_316_observed;
 	bool imac5k_source_dpcd_programmed;
 	bool imac5k_dpcd_4f1_asserted;
 	bool imac5k_real_route_seen;

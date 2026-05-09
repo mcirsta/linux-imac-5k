@@ -33,6 +33,7 @@
 #include "link_dp_capability.h"
 #include "dm_helpers.h"
 #include "dal_asic_id.h"
+#include "grph_object_id.h"
 #include "link_dp_phy.h"
 #include "dce/dmub_psr.h"
 #include "dc/dc_dmub_srv.h"
@@ -45,6 +46,27 @@
 #define DC_LOGGER_INIT(logger)
 
 #define DP_SINK_PR_ENABLE_AND_CONFIGURATION		0x37B
+#define IMAC5K_WIN_SECONDARY_OBJECT_ID			0x3113
+#define IMAC5K_WIN_SECONDARY_DDC_HW_INST		2
+
+static bool link_is_imac5k_secondary_assr_route(const struct dc_link *link)
+{
+	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
+		return false;
+
+	if (dal_graphics_object_id_to_uint(link->link_id) !=
+	    IMAC5K_WIN_SECONDARY_OBJECT_ID)
+		return false;
+
+	if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
+		return false;
+
+	if (!link->link_enc ||
+	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
+		return false;
+
+	return true;
+}
 
 /* Travis */
 static const uint8_t DP_VGA_LVDS_CONVERTER_ID_2[] = "sivarT";
@@ -140,6 +162,17 @@ enum dp_panel_mode dp_get_panel_mode(struct dc_link *link)
 		default:
 			break;
 		}
+	}
+
+	if (link->dpcd_caps.panel_mode_edp &&
+	    link_is_imac5k_secondary_assr_route(link)) {
+		DC_LOG_DETECTION_DP_CAPS("%d iMac5K secondary 0x3113 ASSR panel mode: raw_obj=0x%x ddc_hw=%u tx=%d internal=%d\n",
+					 link->link_index,
+					 dal_graphics_object_id_to_uint(link->link_id),
+					 link->ddc_hw_inst,
+					 link->link_enc ? link->link_enc->transmitter : 0,
+					 link->is_internal_display);
+		return DP_PANEL_MODE_EDP;
 	}
 
 	if (link->dpcd_caps.panel_mode_edp &&
