@@ -4780,22 +4780,10 @@ amdgpu_dm_imac5k_program_secondary_assr_10a(
 	if (old_cfg & DP_ALTERNATE_SCRAMBLER_RESET_ENABLE)
 		aconnector->imac5k_dpcd_10a_asserted = true;
 
-	if (!link->dpcd_caps.panel_mode_edp &&
-	    !(old_cfg & DP_ALTERNATE_SCRAMBLER_RESET_ENABLE)) {
-		drm_info(dev,
-			 "IMAC5K: %s secondary DPCD 0x10A ASSR no-write on %s link=%u old=0x%02x panel_mode_edp=%u signal=%d internal=%u raw_obj=0x%x previously_asserted=%u\n",
-			 tag, aconnector->base.name, link->link_index,
-			 old_cfg, link->dpcd_caps.panel_mode_edp,
-			 link->connector_signal, link->is_internal_display,
-			 amdgpu_dm_imac5k_raw_object_id(link->link_id),
-			 was_asserted);
-		return aconnector->imac5k_dpcd_10a_asserted;
-	}
-
 	new_cfg = old_cfg | DP_ALTERNATE_SCRAMBLER_RESET_ENABLE;
 	if ((old_cfg & DP_ALTERNATE_SCRAMBLER_RESET_ENABLE) && !force) {
 		drm_info(dev,
-			 "IMAC5K: %s secondary DPCD 0x10A ASSR already set on %s link=%u old=0x%02x panel_mode_edp=%u signal=%d internal=%u raw_obj=0x%x rates cur=%d verified=%d reported=%d preferred=%d lanes cur=%d verified=%d reported=%d preferred=%d\n",
+			 "IMAC5K: %s secondary DPCD 0x10A ASSR already set on %s link=%u old=0x%02x windows_route_policy=1 panel_mode_edp=%u signal=%d internal=%u raw_obj=0x%x rates cur=%d verified=%d reported=%d preferred=%d lanes cur=%d verified=%d reported=%d preferred=%d\n",
 			 tag, aconnector->base.name, link->link_index,
 			 old_cfg, link->dpcd_caps.panel_mode_edp,
 			 link->connector_signal, link->is_internal_display,
@@ -4825,7 +4813,7 @@ amdgpu_dm_imac5k_program_secondary_assr_10a(
 		aconnector->imac5k_dpcd_10a_asserted = true;
 
 	drm_info(dev,
-		 "IMAC5K: %s secondary DPCD 0x10A ASSR RMW on %s link=%u old=0x%02x new=0x%02x write_status=%d verify=0x%02x verify_status=%d asserted=%u force=%u panel_mode_edp=%u signal=%d internal=%u raw_obj=0x%x rates cur=%d verified=%d reported=%d preferred=%d lanes cur=%d verified=%d reported=%d preferred=%d\n",
+		 "IMAC5K: %s secondary DPCD 0x10A ASSR RMW on %s link=%u old=0x%02x new=0x%02x write_status=%d verify=0x%02x verify_status=%d asserted=%u force=%u windows_route_policy=1 panel_mode_edp=%u signal=%d internal=%u raw_obj=0x%x rates cur=%d verified=%d reported=%d preferred=%d lanes cur=%d verified=%d reported=%d preferred=%d\n",
 		 tag, aconnector->base.name, link->link_index,
 		 old_cfg, new_cfg, write_status, verify_cfg, verify_status,
 		 aconnector->imac5k_dpcd_10a_asserted, force,
@@ -4845,7 +4833,7 @@ amdgpu_dm_imac5k_program_secondary_assr_10a(
 }
 
 static void
-amdgpu_dm_imac5k_clear_secondary_dpcd_111(
+amdgpu_dm_imac5k_log_secondary_dpcd_111(
 		struct amdgpu_dm_connector *aconnector,
 		const char *tag)
 {
@@ -4853,15 +4841,10 @@ amdgpu_dm_imac5k_clear_secondary_dpcd_111(
 	struct dc_link *link;
 	enum dc_status rev_status;
 	enum dc_status read_status;
-	enum dc_status write_status = DC_ERROR_UNEXPECTED;
-	enum dc_status verify_status = DC_ERROR_UNEXPECTED;
 	u8 rev = 0;
 	u8 old_ctrl = 0;
-	u8 new_ctrl = 0;
-	u8 verify_ctrl = 0;
 	bool observed_set;
 	bool rev_12_plus;
-	bool cleared = false;
 
 	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
 		return;
@@ -4874,16 +4857,16 @@ amdgpu_dm_imac5k_clear_secondary_dpcd_111(
 
 	if (!link->ctx) {
 		drm_info(dev,
-			 "IMAC5K: %s secondary DPCD 0x111 clear skipped on %s link=%u: missing dc ctx\n",
+			 "IMAC5K: %s secondary DPCD 0x111 diagnostic skipped on %s link=%u: missing dc ctx\n",
 			 tag, aconnector->base.name, link->link_index);
 		return;
 	}
 
 	if (!amdgpu_dm_imac5k_verify_windows_route(dev, link, tag,
 						   aconnector->base.name,
-						   true, "dpcd-0x111-clear")) {
+						   true, "dpcd-0x111-diagnostic")) {
 		drm_info(dev,
-			 "IMAC5K: %s secondary DPCD 0x111 clear skipped on %s link=%u: Windows-equivalent route mismatch previously_seen=%u\n",
+			 "IMAC5K: %s secondary DPCD 0x111 diagnostic skipped on %s link=%u: Windows-equivalent route mismatch previously_seen=%u\n",
 			 tag, aconnector->base.name, link->link_index,
 			 aconnector->imac5k_dpcd_111_asserted);
 		return;
@@ -4900,29 +4883,17 @@ amdgpu_dm_imac5k_clear_secondary_dpcd_111(
 	if (observed_set)
 		aconnector->imac5k_dpcd_111_asserted = true;
 
-	if (read_status == DC_OK && observed_set && rev_12_plus) {
-		new_ctrl = old_ctrl & (u8)~DP_MST_EN;
-		write_status = core_link_write_dpcd(link, DP_MSTM_CTRL,
-						    &new_ctrl,
-						    sizeof(new_ctrl));
-		if (write_status == DC_OK)
-			verify_status = core_link_read_dpcd(link, DP_MSTM_CTRL,
-							    &verify_ctrl,
-							    sizeof(verify_ctrl));
-		cleared = write_status == DC_OK &&
-			  (verify_status != DC_OK || !(verify_ctrl & DP_MST_EN));
-		if (cleared)
-			aconnector->imac5k_dpcd_111_asserted = false;
-	}
-
 	drm_info(dev,
-		 "IMAC5K: %s secondary DPCD 0x111 stream-enable clear on %s link=%u rev=0x%02x rev_status=%d rev_12_plus=%u old=0x%02x read_status=%d observed_set=%u new=0x%02x write_status=%d verify=0x%02x verify_status=%d cleared=%u current_seen=%u signal=%d internal=%u raw_obj=0x%x\n",
+		 "IMAC5K: %s secondary DPCD 0x111 diagnostic on %s link=%u rev=0x%02x rev_status=%d rev_12_plus=%u old=0x%02x read_status=%d observed_set=%u current_seen=%u signal=%d internal=%u raw_obj=0x%x rates cur=%d verified=%d reported=%d preferred=%d\n",
 		 tag, aconnector->base.name, link->link_index, rev, rev_status,
-		 rev_12_plus, old_ctrl, read_status, observed_set, new_ctrl,
-		 write_status, verify_ctrl, verify_status, cleared,
+		 rev_12_plus, old_ctrl, read_status, observed_set,
 		 aconnector->imac5k_dpcd_111_asserted, link->connector_signal,
 		 link->is_internal_display,
-		 amdgpu_dm_imac5k_raw_object_id(link->link_id));
+		 amdgpu_dm_imac5k_raw_object_id(link->link_id),
+		 link->cur_link_settings.link_rate,
+		 link->verified_link_cap.link_rate,
+		 link->reported_link_cap.link_rate,
+		 link->preferred_link_setting.link_rate);
 }
 
 static void
@@ -4936,11 +4907,13 @@ amdgpu_dm_imac5k_log_secondary_stream_dpcd_state(
 	enum dc_status status_10a = DC_ERROR_UNEXPECTED;
 	enum dc_status status_111 = DC_ERROR_UNEXPECTED;
 	enum dc_status status_316 = DC_ERROR_UNEXPECTED;
+	enum dc_status status_32f = DC_ERROR_UNEXPECTED;
 	enum dc_status status_4f1 = DC_ERROR_UNEXPECTED;
 	enum dc_status status_205 = DC_ERROR_UNEXPECTED;
 	u8 dpcd_10a = 0;
 	u8 dpcd_111 = 0;
 	u8 dpcd_316 = 0;
+	u8 dpcd_32f = 0;
 	u8 dpcd_4f1 = 0;
 	u8 dpcd_205 = 0;
 
@@ -4975,6 +4948,8 @@ amdgpu_dm_imac5k_log_secondary_stream_dpcd_state(
 					&dpcd_111, sizeof(dpcd_111));
 	status_316 = core_link_read_dpcd(link, IMAC5K_DPCD_STREAM_SOURCE_FLAG,
 					&dpcd_316, sizeof(dpcd_316));
+	status_32f = core_link_read_dpcd(link, DP_SOURCE_BACKLIGHT_ENABLE,
+					&dpcd_32f, sizeof(dpcd_32f));
 	status_4f1 = core_link_read_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
 					&dpcd_4f1, sizeof(dpcd_4f1));
 	status_205 = core_link_read_dpcd(link, DP_SINK_STATUS,
@@ -4987,7 +4962,7 @@ amdgpu_dm_imac5k_log_secondary_stream_dpcd_state(
 		aconnector->imac5k_dpcd_316_observed = true;
 
 	drm_info(dev,
-		 "IMAC5K: %s secondary DPCD snapshot stage=%s connector=%s link=%u raw_obj=0x%x live_sink=%u link_active=%u link_state_valid=%u hpd=%u/%u 0x10A=0x%02x status10a=%d assr=%u 0x111=0x%02x status111=%d 0x316=0x%02x status316=%d 0x4F1=0x%02x status4f1=%d 0x205=0x%02x status205=%d\n",
+		 "IMAC5K: %s secondary DPCD snapshot stage=%s connector=%s link=%u raw_obj=0x%x live_sink=%u link_active=%u link_state_valid=%u hpd=%u/%u 0x10A=0x%02x status10a=%d assr=%u 0x111=0x%02x status111=%d 0x316=0x%02x status316=%d 0x32F=0x%02x status32f=%d 0x4F1=0x%02x status4f1=%d 0x205=0x%02x status205=%d\n",
 		 tag, stage ? stage : "<none>", aconnector->base.name,
 		 link->link_index, amdgpu_dm_imac5k_raw_object_id(link->link_id),
 		 !!link->local_sink, link->link_status.link_active,
@@ -4995,8 +4970,8 @@ amdgpu_dm_imac5k_log_secondary_stream_dpcd_state(
 		 link->dc && link->dc->link_srv ? dc_link_get_hpd_state(link) : 0,
 		 dpcd_10a, status_10a,
 		 !!(dpcd_10a & DP_ALTERNATE_SCRAMBLER_RESET_ENABLE),
-		 dpcd_111, status_111, dpcd_316, status_316, dpcd_4f1,
-		 status_4f1, dpcd_205, status_205);
+		 dpcd_111, status_111, dpcd_316, status_316, dpcd_32f,
+		 status_32f, dpcd_4f1, status_4f1, dpcd_205, status_205);
 }
 
 static bool
@@ -5256,7 +5231,7 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd(
 	 * to miss this because the secondary is DisplayPort but not marked
 	 * internal; keep this write tied to the exact 0x3113 route.
 	 */
-	amdgpu_dm_imac5k_clear_secondary_dpcd_111(aconnector, tag);
+	amdgpu_dm_imac5k_log_secondary_dpcd_111(aconnector, tag);
 	amdgpu_dm_imac5k_program_secondary_assr_10a(aconnector, tag, force);
 
 	mst_status = core_link_read_dpcd(link, DP_MSTM_CTRL,
@@ -5336,7 +5311,7 @@ amdgpu_dm_imac5k_finalize_secondary_dpcd(struct amdgpu_dm_connector *aconnector,
 	}
 
 	amdgpu_dm_imac5k_program_secondary_assr_10a(aconnector, tag, false);
-	amdgpu_dm_imac5k_clear_secondary_dpcd_111(aconnector, tag);
+	amdgpu_dm_imac5k_log_secondary_dpcd_111(aconnector, tag);
 	amdgpu_dm_imac5k_log_secondary_stream_dpcd_state(aconnector, tag,
 							 "before-4f1");
 
