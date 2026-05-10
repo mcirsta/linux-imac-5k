@@ -319,6 +319,17 @@ struct hpd_rx_irq_offload_work {
 	struct amdgpu_device *adev;
 };
 
+enum amdgpu_dm_imac5k_state {
+	AMDGPU_DM_IMAC5K_STATE_OFF = 0,
+	AMDGPU_DM_IMAC5K_STATE_PRIMARY_SEEN,
+	AMDGPU_DM_IMAC5K_STATE_SECONDARY_ROUTE_SEEN,
+	AMDGPU_DM_IMAC5K_STATE_SECONDARY_AUX_ARMED,
+	AMDGPU_DM_IMAC5K_STATE_ONE_TILE_DEFERRED,
+	AMDGPU_DM_IMAC5K_STATE_PAIR_READY,
+	AMDGPU_DM_IMAC5K_STATE_FIRST_TWO_STREAM_COMMIT,
+	AMDGPU_DM_IMAC5K_STATE_DEGRADED_ONE_TILE,
+};
+
 /**
  * struct amdgpu_display_manager - Central amdgpu display manager device
  *
@@ -694,6 +705,38 @@ struct amdgpu_display_manager {
 	bool imac5k_secondary_head_detected;
 
 	/**
+	 * @imac5k_primary_head_seen:
+	 *
+	 * True once the primary internal 2560x2880 tile has been identified and
+	 * its TILE property has been normalized.
+	 */
+	bool imac5k_primary_head_seen;
+
+	/**
+	 * @imac5k_pair_ready:
+	 *
+	 * True once both real tile heads have compatible TILE metadata and the
+	 * secondary 0x3113 AUX path has the pre-userspace setup evidence that
+	 * Windows keeps before grouped commit.
+	 */
+	bool imac5k_pair_ready;
+
+	/**
+	 * @imac5k_state:
+	 *
+	 * Lightweight bring-up state machine used only for the iMac 5K quirk.
+	 * It records how far the real two-tile path progressed before userspace.
+	 */
+	enum amdgpu_dm_imac5k_state imac5k_state;
+
+	/**
+	 * @imac5k_state_transitions:
+	 *
+	 * Diagnostic counter for state-machine transitions.
+	 */
+	unsigned int imac5k_state_transitions;
+
+	/**
 	 * @imac5k_two_tile_streams_seen:
 	 *
 	 * Armed after DC has accepted a two-stream 2560x2880 tiled iMac5K
@@ -710,6 +753,14 @@ struct amdgpu_display_manager {
 	 * two-stream iMac5K state.
 	 */
 	unsigned int imac5k_stream_drop_attempts;
+
+	/**
+	 * @imac5k_primary_only_deferrals:
+	 *
+	 * Diagnostic counter for primary-only tiled commits deferred by the
+	 * readiness barrier after the secondary route has already been armed.
+	 */
+	unsigned int imac5k_primary_only_deferrals;
 
 	/**
 	 * @imac5k_plain_boot_candidate_seen:

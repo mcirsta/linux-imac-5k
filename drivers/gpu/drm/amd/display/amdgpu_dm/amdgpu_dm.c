@@ -236,6 +236,8 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state);
 
 static int amdgpu_dm_atomic_check(struct drm_device *dev,
 				  struct drm_atomic_state *state);
+static void amdgpu_dm_imac5k_connector_hotplug_event(struct drm_connector *connector,
+						     const char *tag);
 
 static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector);
 static void handle_hpd_rx_irq(void *param);
@@ -1549,7 +1551,8 @@ static void force_connector_state(
 	mutex_unlock(&connector->dev->mode_config.mutex);
 
 	mutex_lock(&aconnector->hpd_lock);
-	drm_kms_helper_connector_hotplug_event(connector);
+	amdgpu_dm_imac5k_connector_hotplug_event(connector,
+						 "force_connector_state");
 	mutex_unlock(&aconnector->hpd_lock);
 }
 
@@ -3653,6 +3656,81 @@ static bool amdgpu_dm_imac5k_quirk_enabled(const struct amdgpu_display_manager *
 	return dm && dm->imac5k_tiled_display_quirk;
 }
 
+static const char *amdgpu_dm_imac5k_state_name(enum amdgpu_dm_imac5k_state state)
+{
+	switch (state) {
+	case AMDGPU_DM_IMAC5K_STATE_OFF:
+		return "off";
+	case AMDGPU_DM_IMAC5K_STATE_PRIMARY_SEEN:
+		return "primary-seen";
+	case AMDGPU_DM_IMAC5K_STATE_SECONDARY_ROUTE_SEEN:
+		return "secondary-route-seen";
+	case AMDGPU_DM_IMAC5K_STATE_SECONDARY_AUX_ARMED:
+		return "secondary-aux-armed";
+	case AMDGPU_DM_IMAC5K_STATE_ONE_TILE_DEFERRED:
+		return "one-tile-deferred";
+	case AMDGPU_DM_IMAC5K_STATE_PAIR_READY:
+		return "pair-ready";
+	case AMDGPU_DM_IMAC5K_STATE_FIRST_TWO_STREAM_COMMIT:
+		return "first-two-stream-commit";
+	case AMDGPU_DM_IMAC5K_STATE_DEGRADED_ONE_TILE:
+		return "degraded-one-tile";
+	default:
+		return "unknown";
+	}
+}
+
+static void amdgpu_dm_imac5k_set_state(struct drm_device *dev,
+				       enum amdgpu_dm_imac5k_state state,
+				       const char *reason)
+{
+	struct amdgpu_display_manager *dm;
+	enum amdgpu_dm_imac5k_state old_state;
+
+	if (!dev)
+		return;
+
+	dm = &drm_to_adev(dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm))
+		return;
+
+	old_state = dm->imac5k_state;
+	if (old_state == state)
+		return;
+
+	/*
+	 * Keep the log as a monotonic bring-up trace. The only intentionally
+	 * non-monotonic recovery is from a deferred one-tile userspace attempt
+	 * into the proper pair-ready/two-stream states.
+	 */
+	if (state < old_state &&
+	    old_state != AMDGPU_DM_IMAC5K_STATE_ONE_TILE_DEFERRED &&
+	    !(state == AMDGPU_DM_IMAC5K_STATE_ONE_TILE_DEFERRED &&
+	      old_state < AMDGPU_DM_IMAC5K_STATE_FIRST_TWO_STREAM_COMMIT))
+		return;
+
+	dm->imac5k_state = state;
+	dm->imac5k_state_transitions++;
+
+	drm_info(dev,
+		 "IMAC5K: state %s -> %s reason=%s transitions=%u primary_seen=%u secondary_detected=%u pair_ready=%u two_tile_seen=%u stream_drop_attempts=%u primary_only_deferrals=%u\n",
+		 amdgpu_dm_imac5k_state_name(old_state),
+		 amdgpu_dm_imac5k_state_name(state),
+		 reason ? reason : "<none>",
+		 dm->imac5k_state_transitions,
+		 dm->imac5k_primary_head_seen,
+		 dm->imac5k_secondary_head_detected,
+		 dm->imac5k_pair_ready,
+		 dm->imac5k_two_tile_streams_seen,
+		 dm->imac5k_stream_drop_attempts,
+		 dm->imac5k_primary_only_deferrals);
+}
+
+static bool amdgpu_dm_imac5k_update_pair_readiness(struct drm_device *dev,
+						   const char *tag);
+static void amdgpu_dm_imac5k_apply_secondary_tile_property(
+		struct amdgpu_dm_connector *secondary);
+
 static const char *amdgpu_dm_imac5k_ddc_line_name(int line)
 {
 	switch (line) {
@@ -4022,6 +4100,35 @@ amdgpu_dm_imac5k_find_primary_tiled_head(struct drm_device *dev)
 	return primary;
 }
 
+static struct amdgpu_dm_connector *
+amdgpu_dm_imac5k_find_secondary_head(struct drm_device *dev)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	struct amdgpu_dm_connector *secondary = NULL;
+
+	if (!dev)
+		return NULL;
+
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		struct amdgpu_dm_connector *candidate;
+
+		if (connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK)
+			continue;
+
+		candidate = to_amdgpu_dm_connector(connector);
+		if (candidate->imac5k_secondary_head ||
+		    amdgpu_dm_imac5k_is_secondary_head(candidate)) {
+			secondary = candidate;
+			break;
+		}
+	}
+	drm_connector_list_iter_end(&iter);
+
+	return secondary;
+}
+
 static void amdgpu_dm_imac5k_apply_tile_property(
 		struct amdgpu_dm_connector *aconnector,
 		struct drm_tile_group *reference_tile_group,
@@ -4087,6 +4194,7 @@ static void amdgpu_dm_imac5k_apply_primary_tile_property(
 {
 	struct amdgpu_display_manager *dm;
 	struct drm_connector *connector;
+	struct amdgpu_dm_connector *secondary;
 
 	if (!primary || !primary->base.dev)
 		return;
@@ -4106,9 +4214,21 @@ static void amdgpu_dm_imac5k_apply_primary_tile_property(
 		return;
 	}
 
+	dm->imac5k_primary_head_seen = true;
+	amdgpu_dm_imac5k_set_state(connector->dev,
+				   AMDGPU_DM_IMAC5K_STATE_PRIMARY_SEEN,
+				   "primary-tile-apply");
+
 	amdgpu_dm_imac5k_apply_tile_property(primary, connector->tile_group,
 					     IMAC5K_TILE_SINGLE_MONITOR,
 					     IMAC5K_PRIMARY_TILE_X, "primary");
+
+	secondary = amdgpu_dm_imac5k_find_secondary_head(connector->dev);
+	if (secondary && secondary->imac5k_secondary_head)
+		amdgpu_dm_imac5k_apply_secondary_tile_property(secondary);
+
+	amdgpu_dm_imac5k_update_pair_readiness(connector->dev,
+					       "primary-tile-apply");
 }
 
 static bool amdgpu_dm_imac5k_real_secondary_route_available(
@@ -4163,6 +4283,98 @@ static bool amdgpu_dm_imac5k_real_secondary_route_available(
 			 secondary->imac5k_dpcd_111_asserted);
 
 	return route_ok && route_known;
+}
+
+static bool
+amdgpu_dm_imac5k_secondary_aux_armed(const struct amdgpu_dm_connector *secondary)
+{
+	return secondary &&
+	       secondary->imac5k_dpcd_10a_asserted &&
+	       secondary->imac5k_source_dpcd_programmed &&
+	       secondary->imac5k_dpcd_4f1_asserted;
+}
+
+static bool amdgpu_dm_imac5k_update_pair_readiness(struct drm_device *dev,
+						   const char *tag)
+{
+	struct amdgpu_display_manager *dm;
+	struct amdgpu_dm_connector *primary;
+	struct amdgpu_dm_connector *secondary;
+	bool primary_tile_ok;
+	bool secondary_tile_ok;
+	bool secondary_route_ok;
+	bool secondary_aux_armed;
+
+	if (!dev)
+		return false;
+
+	dm = &drm_to_adev(dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm))
+		return false;
+
+	primary = amdgpu_dm_imac5k_find_primary_tiled_head(dev);
+	secondary = amdgpu_dm_imac5k_find_secondary_head(dev);
+	primary_tile_ok = primary &&
+			  amdgpu_dm_imac5k_mutter_tile_shape_ok(&primary->base);
+	secondary_tile_ok = secondary &&
+			    amdgpu_dm_imac5k_mutter_tile_shape_ok(&secondary->base);
+	secondary_route_ok = secondary &&
+			     amdgpu_dm_imac5k_real_secondary_route_available(
+				     secondary, tag ? tag : "pair-readiness");
+	secondary_aux_armed = amdgpu_dm_imac5k_secondary_aux_armed(secondary);
+
+	if (primary_tile_ok) {
+		dm->imac5k_primary_head_seen = true;
+		amdgpu_dm_imac5k_set_state(dev,
+				AMDGPU_DM_IMAC5K_STATE_PRIMARY_SEEN, tag);
+	}
+
+	if (secondary_route_ok) {
+		dm->imac5k_secondary_head_detected = true;
+		amdgpu_dm_imac5k_set_state(dev,
+				AMDGPU_DM_IMAC5K_STATE_SECONDARY_ROUTE_SEEN,
+				tag);
+	}
+
+	if (secondary_aux_armed)
+		amdgpu_dm_imac5k_set_state(dev,
+				AMDGPU_DM_IMAC5K_STATE_SECONDARY_AUX_ARMED,
+				tag);
+
+	if (primary_tile_ok && secondary_tile_ok && secondary_route_ok &&
+	    secondary_aux_armed) {
+		if (!dm->imac5k_pair_ready)
+			drm_info(dev,
+				 "IMAC5K: pair ready before userspace handoff tag=%s primary=%s secondary=%s primary_tile_ok=%u secondary_tile_ok=%u route_ok=%u aux_armed=%u dpcd10a=%u source_dpcd=%u dpcd4f1=%u\n",
+				 tag ? tag : "<none>",
+				 primary ? primary->base.name : "<none>",
+				 secondary ? secondary->base.name : "<none>",
+				 primary_tile_ok, secondary_tile_ok,
+				 secondary_route_ok, secondary_aux_armed,
+				 secondary ? secondary->imac5k_dpcd_10a_asserted : 0,
+				 secondary ? secondary->imac5k_source_dpcd_programmed : 0,
+				 secondary ? secondary->imac5k_dpcd_4f1_asserted : 0);
+		dm->imac5k_pair_ready = true;
+		dm->imac5k_plain_boot_candidate_seen = false;
+		amdgpu_dm_imac5k_set_state(dev,
+				AMDGPU_DM_IMAC5K_STATE_PAIR_READY, tag);
+		return true;
+	}
+
+	if (dm->imac5k_primary_head_seen && dm->imac5k_secondary_head_detected &&
+	    !dm->imac5k_pair_ready)
+		drm_info(dev,
+			 "IMAC5K: pair not ready yet tag=%s primary=%s secondary=%s primary_tile_ok=%u secondary_tile_ok=%u route_ok=%u aux_armed=%u dpcd10a=%u source_dpcd=%u dpcd4f1=%u\n",
+			 tag ? tag : "<none>",
+			 primary ? primary->base.name : "<none>",
+			 secondary ? secondary->base.name : "<none>",
+			 primary_tile_ok, secondary_tile_ok,
+			 secondary_route_ok, secondary_aux_armed,
+			 secondary ? secondary->imac5k_dpcd_10a_asserted : 0,
+			 secondary ? secondary->imac5k_source_dpcd_programmed : 0,
+			 secondary ? secondary->imac5k_dpcd_4f1_asserted : 0);
+
+	return false;
 }
 
 static void amdgpu_dm_imac5k_snapshot_secondary_metadata(
@@ -4353,8 +4565,11 @@ static void amdgpu_dm_imac5k_apply_secondary_tile_property(
 		return;
 
 	if (amdgpu_dm_imac5k_apply_preserved_secondary_tile_property(
-			secondary, "secondary-preserved"))
+			secondary, "secondary-preserved")) {
+		amdgpu_dm_imac5k_update_pair_readiness(secondary->base.dev,
+						       "secondary-preserved");
 		return;
+	}
 
 	primary = amdgpu_dm_imac5k_find_primary_tiled_head(secondary->base.dev);
 	if (!primary) {
@@ -4393,6 +4608,9 @@ static void amdgpu_dm_imac5k_apply_secondary_tile_property(
 		 secondary_connector->tile_v_loc,
 		 secondary_connector->tile_group,
 		 secondary_connector->tile_is_single_monitor);
+
+	amdgpu_dm_imac5k_update_pair_readiness(secondary_connector->dev,
+					       "secondary-tile-apply");
 }
 
 static void amdgpu_dm_imac5k_mark_secondary_head(struct amdgpu_dm_connector *aconnector)
@@ -4422,6 +4640,9 @@ static void amdgpu_dm_imac5k_mark_secondary_head(struct amdgpu_dm_connector *aco
 	aconnector->imac5k_secondary_head = true;
 	dm->imac5k_secondary_head_detected = true;
 	dm->imac5k_plain_boot_candidate_seen = false;
+	amdgpu_dm_imac5k_set_state(aconnector->base.dev,
+				   AMDGPU_DM_IMAC5K_STATE_SECONDARY_ROUTE_SEEN,
+				   "secondary-head-detected");
 	amdgpu_dm_imac5k_apply_secondary_tile_property(aconnector);
 }
 
@@ -5142,6 +5363,14 @@ amdgpu_dm_imac5k_write_secondary_4f1_latch(
 		 hpd_cached_before, hpd_cached_after, dpcd_rev,
 		 dpcd_rev_status, sink_status, sink_status_status);
 
+	if (aconnector->imac5k_dpcd_4f1_asserted) {
+		if (amdgpu_dm_imac5k_secondary_aux_armed(aconnector))
+			amdgpu_dm_imac5k_set_state(dev,
+				AMDGPU_DM_IMAC5K_STATE_SECONDARY_AUX_ARMED,
+				tag);
+		amdgpu_dm_imac5k_update_pair_readiness(dev, tag);
+	}
+
 	return aconnector->imac5k_dpcd_4f1_asserted;
 }
 
@@ -5178,6 +5407,12 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd(
 								   tag,
 								   IMAC5K_4F1_REQUIRE_LIVE_SINK |
 								   IMAC5K_4F1_SETTLE_AFTER_ATTEMPT);
+		if (amdgpu_dm_imac5k_secondary_aux_armed(aconnector))
+			amdgpu_dm_imac5k_set_state(aconnector->base.dev,
+				AMDGPU_DM_IMAC5K_STATE_SECONDARY_AUX_ARMED,
+				tag);
+		amdgpu_dm_imac5k_update_pair_readiness(aconnector->base.dev,
+						       tag);
 		return true;
 	}
 
@@ -5271,6 +5506,11 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd(
 		amdgpu_dm_imac5k_write_secondary_4f1_latch(aconnector, tag,
 							   IMAC5K_4F1_REQUIRE_LIVE_SINK |
 							   IMAC5K_4F1_SETTLE_AFTER_ATTEMPT);
+
+	if (amdgpu_dm_imac5k_secondary_aux_armed(aconnector))
+		amdgpu_dm_imac5k_set_state(dev,
+			AMDGPU_DM_IMAC5K_STATE_SECONDARY_AUX_ARMED, tag);
+	amdgpu_dm_imac5k_update_pair_readiness(dev, tag);
 
 	return aconnector->imac5k_source_dpcd_programmed;
 }
@@ -5430,6 +5670,10 @@ static void amdgpu_dm_imac5k_note_two_stream_state(struct drm_device *dev,
 		return;
 
 	dm->imac5k_two_tile_streams_seen = true;
+	dm->imac5k_pair_ready = true;
+	amdgpu_dm_imac5k_set_state(dev,
+				   AMDGPU_DM_IMAC5K_STATE_FIRST_TWO_STREAM_COMMIT,
+				   tag);
 	drm_info(dev,
 		 "IMAC5K: two-stream guard armed at %s stream_count=%u tile_streams=%u\n",
 		 tag, dc_state->stream_count, tile_streams);
@@ -5468,12 +5712,66 @@ static void amdgpu_dm_imac5k_note_stream_drop_attempt(struct drm_device *dev,
 		return;
 
 	dm->imac5k_stream_drop_attempts++;
+	amdgpu_dm_imac5k_set_state(dev,
+				   AMDGPU_DM_IMAC5K_STATE_DEGRADED_ONE_TILE,
+				   "commit_streams_drop");
 	drm_info(dev,
-		 "IMAC5K: observed tiled stream drop attempt #%u task=%s pid=%d proposed_streams=%u proposed_tile_streams=%u current_streams=%u current_tile_streams=%u; allowing commit, no emulated/suppressed iMac5K path\n",
+		 "IMAC5K: observed tiled stream drop attempt #%u task=%s pid=%d proposed_streams=%u proposed_tile_streams=%u current_streams=%u current_tile_streams=%u; commit reached tail after readiness check\n",
 		 dm->imac5k_stream_drop_attempts,
 		 current->comm, task_pid_nr(current),
 		 dc_state->stream_count, new_tile_streams,
 		 current_stream_count, current_tile_streams);
+}
+
+static int amdgpu_dm_imac5k_check_readiness_barrier(struct drm_device *dev,
+						    struct dc_state *dc_state,
+						    const char *tag)
+{
+	struct amdgpu_display_manager *dm;
+	struct amdgpu_dm_connector *secondary;
+	u32 tile_streams;
+
+	if (!dev || !dc_state)
+		return 0;
+
+	dm = &drm_to_adev(dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm))
+		return 0;
+
+	amdgpu_dm_imac5k_update_pair_readiness(dev, tag);
+
+	if (!dm->imac5k_primary_head_seen ||
+	    !dm->imac5k_secondary_head_detected)
+		return 0;
+
+	tile_streams = amdgpu_dm_imac5k_count_tile_streams(dc_state);
+	if (tile_streams != 1)
+		return 0;
+
+	secondary = amdgpu_dm_imac5k_find_secondary_head(dev);
+	if (!amdgpu_dm_imac5k_secondary_aux_armed(secondary))
+		return 0;
+
+	dm->imac5k_primary_only_deferrals++;
+	amdgpu_dm_imac5k_set_state(dev,
+				   AMDGPU_DM_IMAC5K_STATE_ONE_TILE_DEFERRED,
+				   tag);
+	drm_info(dev,
+		 "IMAC5K: readiness barrier rejected primary-only takeover #%u tag=%s task=%s pid=%d proposed_streams=%u proposed_tile_streams=%u state=%s pair_ready=%u primary_seen=%u secondary_detected=%u secondary=%s dpcd10a=%u source_dpcd=%u dpcd4f1=%u two_tile_seen=%u\n",
+		 dm->imac5k_primary_only_deferrals,
+		 tag ? tag : "<none>", current->comm, task_pid_nr(current),
+		 dc_state->stream_count, tile_streams,
+		 amdgpu_dm_imac5k_state_name(dm->imac5k_state),
+		 dm->imac5k_pair_ready,
+		 dm->imac5k_primary_head_seen,
+		 dm->imac5k_secondary_head_detected,
+		 secondary ? secondary->base.name : "<none>",
+		 secondary ? secondary->imac5k_dpcd_10a_asserted : 0,
+		 secondary ? secondary->imac5k_source_dpcd_programmed : 0,
+		 secondary ? secondary->imac5k_dpcd_4f1_asserted : 0,
+		 dm->imac5k_two_tile_streams_seen);
+
+	return -EINVAL;
 }
 
 static int amdgpu_dm_imac5k_pipe_index(const struct pipe_ctx *pipe)
@@ -5498,13 +5796,17 @@ static void amdgpu_dm_imac5k_log_streams(struct drm_device *dev,
 
 	tile_streams = amdgpu_dm_imac5k_count_tile_streams(dc_state);
 	drm_info(dev,
-		 "IMAC5K: %s stream_count=%u tile_streams=%u plain_boot_candidate=%u secondary_detected=%u two_tile_seen=%u stream_drop_attempts=%u\n",
+		 "IMAC5K: %s stream_count=%u tile_streams=%u state=%s primary_seen=%u pair_ready=%u plain_boot_candidate=%u secondary_detected=%u two_tile_seen=%u stream_drop_attempts=%u primary_only_deferrals=%u\n",
 		 tag, dc_state->stream_count,
 		 tile_streams,
+		 amdgpu_dm_imac5k_state_name(dm->imac5k_state),
+		 dm->imac5k_primary_head_seen,
+		 dm->imac5k_pair_ready,
 		 dm->imac5k_plain_boot_candidate_seen,
 		 dm->imac5k_secondary_head_detected,
 		 dm->imac5k_two_tile_streams_seen,
-		 dm->imac5k_stream_drop_attempts);
+		 dm->imac5k_stream_drop_attempts,
+		 dm->imac5k_primary_only_deferrals);
 
 	for (i = 0; i < dc_state->stream_count; i++) {
 		const struct dc_stream_state *stream = dc_state->streams[i];
@@ -5820,9 +6122,65 @@ static void amdgpu_dm_imac5k_log_hotplug_event(struct drm_device *dev,
 	if (!amdgpu_dm_imac5k_quirk_enabled(dm))
 		return;
 
+	amdgpu_dm_imac5k_update_pair_readiness(dev, tag);
+
 	drm_info(dev,
-		 "IMAC5K: %s emitting DRM hotplug/resource event; userspace should rescan TILE blobs and modes\n",
-		 tag);
+		 "IMAC5K: %s emitting DRM hotplug/resource event state=%s pair_ready=%u primary_seen=%u secondary_detected=%u; userspace should rescan TILE blobs and modes\n",
+		 tag, amdgpu_dm_imac5k_state_name(dm->imac5k_state),
+		 dm->imac5k_pair_ready, dm->imac5k_primary_head_seen,
+		 dm->imac5k_secondary_head_detected);
+}
+
+static bool amdgpu_dm_imac5k_should_defer_hotplug(struct drm_device *dev,
+						  const char *tag)
+{
+	struct amdgpu_display_manager *dm;
+
+	if (!dev)
+		return false;
+
+	dm = &drm_to_adev(dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm))
+		return false;
+
+	amdgpu_dm_imac5k_update_pair_readiness(dev, tag);
+	if (!dm->imac5k_primary_head_seen ||
+	    !dm->imac5k_secondary_head_detected ||
+	    dm->imac5k_pair_ready)
+		return false;
+
+	drm_info(dev,
+		 "IMAC5K: %s deferring DRM hotplug/resource event until pair-ready state=%s primary_seen=%u secondary_detected=%u pair_ready=%u\n",
+		 tag ? tag : "<none>",
+		 amdgpu_dm_imac5k_state_name(dm->imac5k_state),
+		 dm->imac5k_primary_head_seen,
+		 dm->imac5k_secondary_head_detected,
+		 dm->imac5k_pair_ready);
+
+	return true;
+}
+
+static void amdgpu_dm_imac5k_drm_hotplug_event(struct drm_device *dev,
+					       const char *tag)
+{
+	if (amdgpu_dm_imac5k_should_defer_hotplug(dev, tag))
+		return;
+
+	amdgpu_dm_imac5k_log_hotplug_event(dev, tag);
+	drm_kms_helper_hotplug_event(dev);
+}
+
+static void amdgpu_dm_imac5k_connector_hotplug_event(struct drm_connector *connector,
+						     const char *tag)
+{
+	if (!connector)
+		return;
+
+	if (amdgpu_dm_imac5k_should_defer_hotplug(connector->dev, tag))
+		return;
+
+	amdgpu_dm_imac5k_log_hotplug_event(connector->dev, tag);
+	drm_kms_helper_connector_hotplug_event(connector);
 }
 
 static int dm_resume(struct amdgpu_ip_block *ip_block)
@@ -6042,8 +6400,7 @@ static int dm_resume(struct amdgpu_ip_block *ip_block)
 
 	amdgpu_dm_smu_write_watermarks_table(adev);
 
-	amdgpu_dm_imac5k_log_hotplug_event(ddev, "dm_resume");
-	drm_kms_helper_hotplug_event(ddev);
+	amdgpu_dm_imac5k_drm_hotplug_event(ddev, "dm_resume");
 
 	return 0;
 }
@@ -6484,8 +6841,7 @@ static void hdmi_hpd_debounce_work(struct work_struct *work)
 
 		/* Only notify OS if sink actually changed */
 		if (!fake_reconnect && aconnector->base.force == DRM_FORCE_UNSPECIFIED) {
-			amdgpu_dm_imac5k_log_hotplug_event(dev, "hpd_debounce");
-			drm_kms_helper_hotplug_event(dev);
+			amdgpu_dm_imac5k_drm_hotplug_event(dev, "hpd_debounce");
 		}
 	}
 
@@ -6549,7 +6905,8 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
 		drm_modeset_unlock_all(dev);
 
 		if (aconnector->base.force == DRM_FORCE_UNSPECIFIED)
-			drm_kms_helper_connector_hotplug_event(connector);
+			amdgpu_dm_imac5k_connector_hotplug_event(connector,
+								 "hpd_force_emulated");
 	} else if (debounce_required) {
 		/*
 		 * HDMI disconnect detected - schedule delayed work instead of
@@ -6592,7 +6949,8 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
 			drm_modeset_unlock_all(dev);
 
 			if (aconnector->base.force == DRM_FORCE_UNSPECIFIED)
-				drm_kms_helper_connector_hotplug_event(connector);
+				amdgpu_dm_imac5k_connector_hotplug_event(connector,
+									 "hpd_detect");
 		}
 	}
 }
@@ -6724,7 +7082,8 @@ out:
 			dm_restore_drm_connector_state(dev, connector);
 			drm_modeset_unlock_all(dev);
 
-			drm_kms_helper_connector_hotplug_event(connector);
+			amdgpu_dm_imac5k_connector_hotplug_event(connector,
+								 "hpdrx_force_emulated");
 		} else {
 			bool ret = false;
 
@@ -6743,7 +7102,8 @@ out:
 				dm_restore_drm_connector_state(dev, connector);
 				drm_modeset_unlock_all(dev);
 
-				drm_kms_helper_connector_hotplug_event(connector);
+				amdgpu_dm_imac5k_connector_hotplug_event(connector,
+									 "hpdrx_detect");
 			}
 		}
 	}
@@ -8148,6 +8508,8 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 	 * final state without repeating the dump for each connector.
 	 */
 	amdgpu_dm_dump_links_and_sinks(adev, "boot_post_detect");
+	amdgpu_dm_imac5k_update_pair_readiness(adev_to_drm(adev),
+					       "boot_post_detect");
 
 	/* Software is initialized. Now we can register interrupt handlers. */
 	switch (adev->asic_type) {
@@ -8285,7 +8647,8 @@ static ssize_t s3_debug_store(struct device *device,
 	if (ret == 0) {
 		if (s3_state) {
 			dm_resume(ip_block);
-			drm_kms_helper_hotplug_event(adev_to_drm(adev));
+			amdgpu_dm_imac5k_drm_hotplug_event(adev_to_drm(adev),
+							   "s3_debug");
 		} else
 			dm_suspend(ip_block);
 	}
@@ -10018,6 +10381,11 @@ amdgpu_dm_connector_detect(struct drm_connector *connector, bool force)
 		(!aconnector->dc_sink || aconnector->dc_sink->edid_caps.analog))
 		return amdgpu_dm_connector_poll(aconnector, force);
 
+	if (amdgpu_dm_imac5k_quirk_enabled(&drm_to_adev(connector->dev)->dm)) {
+		amdgpu_dm_imac5k_update_pair_readiness(connector->dev,
+						       "connector_detect");
+	}
+
 	return (aconnector->dc_sink ? connector_status_connected :
 			connector_status_disconnected);
 }
@@ -10194,7 +10562,7 @@ static ssize_t panel_power_savings_store(struct device *device,
 	if (ret)
 		return ret;
 
-	drm_kms_helper_hotplug_event(dev);
+	amdgpu_dm_imac5k_drm_hotplug_event(dev, "panel_power_savings");
 
 	return count;
 }
@@ -11416,6 +11784,7 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 		amdgpu_dm_connector_add_freesync_modes(connector, drm_edid);
 	}
 	amdgpu_dm_fbc_init(connector);
+	amdgpu_dm_imac5k_update_pair_readiness(connector->dev, "get_modes");
 	amdgpu_dm_imac5k_log_modes(amdgpu_dm_connector, "get_modes");
 
 	return amdgpu_dm_connector->num_modes;
@@ -15457,6 +15826,11 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 			ret = -EINVAL;
 			goto fail;
 		}
+		ret = amdgpu_dm_imac5k_check_readiness_barrier(dev,
+							       dm_state->context,
+							       "atomic_check");
+		if (ret)
+			goto fail;
 	} else {
 		/*
 		 * The commit is a fast update. Fast updates shouldn't change

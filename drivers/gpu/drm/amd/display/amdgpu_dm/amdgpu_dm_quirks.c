@@ -182,8 +182,13 @@ void retrieve_dmi_info(struct amdgpu_display_manager *dm)
 	dm->imac5k_tiled_display_quirk = false;
 	dm->imac5k_plain_boot_route_probe_quirk = false;
 	dm->imac5k_secondary_head_detected = false;
+	dm->imac5k_primary_head_seen = false;
+	dm->imac5k_pair_ready = false;
+	dm->imac5k_state = AMDGPU_DM_IMAC5K_STATE_OFF;
+	dm->imac5k_state_transitions = 0;
 	dm->imac5k_two_tile_streams_seen = false;
 	dm->imac5k_stream_drop_attempts = 0;
+	dm->imac5k_primary_only_deferrals = 0;
 	dm->imac5k_plain_boot_candidate_seen = false;
 
 	dmi_id = dmi_check_system(dmi_quirk_table);
