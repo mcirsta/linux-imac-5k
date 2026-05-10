@@ -326,8 +326,8 @@ enum amdgpu_dm_imac5k_state {
 	AMDGPU_DM_IMAC5K_STATE_SECONDARY_AUX_ARMED,
 	AMDGPU_DM_IMAC5K_STATE_ONE_TILE_DEFERRED,
 	AMDGPU_DM_IMAC5K_STATE_PAIR_READY,
+	AMDGPU_DM_IMAC5K_STATE_SECONDARY_STREAM_INSTALLED,
 	AMDGPU_DM_IMAC5K_STATE_FIRST_TWO_STREAM_COMMIT,
-	AMDGPU_DM_IMAC5K_STATE_DEGRADED_ONE_TILE,
 };
 
 /**
@@ -722,6 +722,16 @@ struct amdgpu_display_manager {
 	bool imac5k_pair_ready;
 
 	/**
+	 * @imac5k_stream_handoff_ready:
+	 *
+	 * True once a proposed or committed DC state contains both real tile
+	 * streams: the primary 0x3114/eDP half and the secondary 0x3113/DP
+	 * half. RE-15 showed that Windows' grouped path needs the secondary
+	 * live stream installed, not just route/AUX/TILE evidence.
+	 */
+	bool imac5k_stream_handoff_ready;
+
+	/**
 	 * @imac5k_state:
 	 *
 	 * Lightweight bring-up state machine used only for the iMac 5K quirk.
@@ -740,17 +750,18 @@ struct amdgpu_display_manager {
 	 * @imac5k_two_tile_streams_seen:
 	 *
 	 * Armed after DC has accepted a two-stream 2560x2880 tiled iMac5K
-	 * state. Later userspace modesets that propose fewer streams are logged
-	 * but not suppressed; the Windows-like path must keep the real split
-	 * topology alive in DC rather than masking bad commits.
+	 * state. Later userspace modesets that propose fewer streams are
+	 * rejected while the current DC state still has both real tile roles,
+	 * matching the Windows behavior found in RE-16: partial modesets carry
+	 * the unmentioned live peer stream forward instead of clearing it.
 	 */
 	bool imac5k_two_tile_streams_seen;
 
 	/**
 	 * @imac5k_stream_drop_attempts:
 	 *
-	 * Diagnostic counter for userspace/DC states that drop below the armed
-	 * two-stream iMac5K state.
+	 * Diagnostic counter for userspace/DC states rejected because they
+	 * would drop below the armed two-stream iMac5K state.
 	 */
 	unsigned int imac5k_stream_drop_attempts;
 

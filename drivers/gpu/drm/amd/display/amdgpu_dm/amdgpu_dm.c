@@ -3671,10 +3671,10 @@ static const char *amdgpu_dm_imac5k_state_name(enum amdgpu_dm_imac5k_state state
 		return "one-tile-deferred";
 	case AMDGPU_DM_IMAC5K_STATE_PAIR_READY:
 		return "pair-ready";
+	case AMDGPU_DM_IMAC5K_STATE_SECONDARY_STREAM_INSTALLED:
+		return "secondary-stream-installed";
 	case AMDGPU_DM_IMAC5K_STATE_FIRST_TWO_STREAM_COMMIT:
 		return "first-two-stream-commit";
-	case AMDGPU_DM_IMAC5K_STATE_DEGRADED_ONE_TILE:
-		return "degraded-one-tile";
 	default:
 		return "unknown";
 	}
@@ -3713,7 +3713,7 @@ static void amdgpu_dm_imac5k_set_state(struct drm_device *dev,
 	dm->imac5k_state_transitions++;
 
 	drm_info(dev,
-		 "IMAC5K: state %s -> %s reason=%s transitions=%u primary_seen=%u secondary_detected=%u pair_ready=%u two_tile_seen=%u stream_drop_attempts=%u primary_only_deferrals=%u\n",
+		 "IMAC5K: state %s -> %s reason=%s transitions=%u primary_seen=%u secondary_detected=%u pair_ready=%u stream_handoff_ready=%u two_tile_seen=%u stream_drop_attempts=%u primary_only_deferrals=%u\n",
 		 amdgpu_dm_imac5k_state_name(old_state),
 		 amdgpu_dm_imac5k_state_name(state),
 		 reason ? reason : "<none>",
@@ -3721,6 +3721,7 @@ static void amdgpu_dm_imac5k_set_state(struct drm_device *dev,
 		 dm->imac5k_primary_head_seen,
 		 dm->imac5k_secondary_head_detected,
 		 dm->imac5k_pair_ready,
+		 dm->imac5k_stream_handoff_ready,
 		 dm->imac5k_two_tile_streams_seen,
 		 dm->imac5k_stream_drop_attempts,
 		 dm->imac5k_primary_only_deferrals);
@@ -3777,6 +3778,47 @@ static const char *amdgpu_dm_imac5k_transmitter_name(int transmitter)
 	default:
 		return "TRANSMITTER_UNKNOWN";
 	}
+}
+
+static bool amdgpu_dm_imac5k_link_matches_windows_role(
+		const struct dc_link *link,
+		bool secondary)
+{
+	struct ddc *ddc_pin = NULL;
+	const int expected_ddc_line = secondary ? IMAC5K_SECONDARY_DDC_LINE :
+						 IMAC5K_PRIMARY_DDC_LINE;
+	const int expected_ddc_hw_channel = secondary ?
+					    IMAC5K_SECONDARY_DDC_HW_CHANNEL :
+					    IMAC5K_PRIMARY_DDC_HW_CHANNEL;
+	const int expected_transmitter = secondary ? IMAC5K_SECONDARY_TRANSMITTER :
+						      IMAC5K_PRIMARY_TRANSMITTER;
+	const unsigned int expected_object_id = secondary ?
+					       IMAC5K_WIN_SECONDARY_OBJECT_ID :
+					       IMAC5K_WIN_PRIMARY_OBJECT_ID;
+	int ddc_line = GPIO_DDC_LINE_UNKNOWN;
+	int ddc_hw_channel = GPIO_DDC_LINE_UNKNOWN;
+	int transmitter = TRANSMITTER_UNKNOWN;
+
+	if (!link)
+		return false;
+
+	if (amdgpu_dm_imac5k_raw_object_id(link->link_id) == expected_object_id)
+		return true;
+
+	if (link->ddc)
+		ddc_pin = get_ddc_pin(link->ddc);
+
+	if (ddc_pin) {
+		ddc_line = dal_ddc_get_line(ddc_pin);
+		ddc_hw_channel = ddc_pin->hw_info.ddc_channel;
+	}
+
+	if (link->link_enc)
+		transmitter = link->link_enc->transmitter;
+
+	return ddc_line == expected_ddc_line &&
+	       ddc_hw_channel == expected_ddc_hw_channel &&
+	       transmitter == expected_transmitter;
 }
 
 static bool amdgpu_dm_imac5k_verify_windows_route(
@@ -4345,7 +4387,7 @@ static bool amdgpu_dm_imac5k_update_pair_readiness(struct drm_device *dev,
 	    secondary_aux_armed) {
 		if (!dm->imac5k_pair_ready)
 			drm_info(dev,
-				 "IMAC5K: pair ready before userspace handoff tag=%s primary=%s secondary=%s primary_tile_ok=%u secondary_tile_ok=%u route_ok=%u aux_armed=%u dpcd10a=%u source_dpcd=%u dpcd4f1=%u\n",
+				 "IMAC5K: route/AUX pair ready before stream handoff tag=%s primary=%s secondary=%s primary_tile_ok=%u secondary_tile_ok=%u route_ok=%u aux_armed=%u dpcd10a=%u source_dpcd=%u dpcd4f1=%u\n",
 				 tag ? tag : "<none>",
 				 primary ? primary->base.name : "<none>",
 				 secondary ? secondary->base.name : "<none>",
@@ -4852,6 +4894,77 @@ static u32 amdgpu_dm_imac5k_count_tile_streams(const struct dc_state *dc_state)
 	}
 
 	return count;
+}
+
+static void amdgpu_dm_imac5k_count_tile_stream_roles(
+		const struct dc_state *dc_state,
+		u32 *tile_streams,
+		u32 *primary_tile_streams,
+		u32 *secondary_tile_streams,
+		u32 *unknown_tile_streams)
+{
+	u32 tile_count = 0;
+	u32 primary_count = 0;
+	u32 secondary_count = 0;
+	u32 unknown_count = 0;
+	u32 i;
+
+	if (dc_state) {
+		for (i = 0; i < dc_state->stream_count; i++) {
+			const struct dc_stream_state *stream = dc_state->streams[i];
+
+			if (!amdgpu_dm_imac5k_is_tile_stream(stream))
+				continue;
+
+			tile_count++;
+			if (amdgpu_dm_imac5k_link_matches_windows_role(stream->link,
+								       false))
+				primary_count++;
+			else if (amdgpu_dm_imac5k_link_matches_windows_role(stream->link,
+									    true))
+				secondary_count++;
+			else
+				unknown_count++;
+		}
+	}
+
+	if (tile_streams)
+		*tile_streams = tile_count;
+	if (primary_tile_streams)
+		*primary_tile_streams = primary_count;
+	if (secondary_tile_streams)
+		*secondary_tile_streams = secondary_count;
+	if (unknown_tile_streams)
+		*unknown_tile_streams = unknown_count;
+}
+
+static bool amdgpu_dm_imac5k_has_two_real_tile_streams(
+		const struct dc_state *dc_state)
+{
+	u32 primary_tile_streams;
+	u32 secondary_tile_streams;
+
+	amdgpu_dm_imac5k_count_tile_stream_roles(dc_state, NULL,
+						 &primary_tile_streams,
+						 &secondary_tile_streams,
+						 NULL);
+
+	return primary_tile_streams > 0 && secondary_tile_streams > 0;
+}
+
+static const char *amdgpu_dm_imac5k_stream_role_name(
+		const struct dc_stream_state *stream)
+{
+	if (!amdgpu_dm_imac5k_is_tile_stream(stream))
+		return "non-tile";
+
+	if (amdgpu_dm_imac5k_link_matches_windows_role(stream->link, false))
+		return "primary";
+
+	if (amdgpu_dm_imac5k_link_matches_windows_role(stream->link, true))
+		return "secondary";
+
+	return "unknown-tile";
 }
 
 static bool
@@ -5656,6 +5769,9 @@ static void amdgpu_dm_imac5k_note_two_stream_state(struct drm_device *dev,
 {
 	struct amdgpu_display_manager *dm;
 	u32 tile_streams;
+	u32 primary_tile_streams;
+	u32 secondary_tile_streams;
+	u32 unknown_tile_streams;
 
 	if (!dev || !dc_state)
 		return;
@@ -5665,8 +5781,35 @@ static void amdgpu_dm_imac5k_note_two_stream_state(struct drm_device *dev,
 	    !dm->imac5k_secondary_head_detected)
 		return;
 
-	tile_streams = amdgpu_dm_imac5k_count_tile_streams(dc_state);
-	if (tile_streams < 2 || dm->imac5k_two_tile_streams_seen)
+	amdgpu_dm_imac5k_count_tile_stream_roles(dc_state, &tile_streams,
+						 &primary_tile_streams,
+						 &secondary_tile_streams,
+						 &unknown_tile_streams);
+	if (!amdgpu_dm_imac5k_has_two_real_tile_streams(dc_state)) {
+		if (tile_streams >= 2)
+			drm_info(dev,
+				 "IMAC5K: two-tile proposal lacks real Windows role pairing at %s stream_count=%u tile_streams=%u primary_tile_streams=%u secondary_tile_streams=%u unknown_tile_streams=%u\n",
+				 tag ? tag : "<none>", dc_state->stream_count,
+				 tile_streams, primary_tile_streams,
+				 secondary_tile_streams, unknown_tile_streams);
+		return;
+	}
+
+	if (!dm->imac5k_stream_handoff_ready) {
+		dm->imac5k_stream_handoff_ready = true;
+		amdgpu_dm_imac5k_set_state(dev,
+				AMDGPU_DM_IMAC5K_STATE_SECONDARY_STREAM_INSTALLED,
+				tag);
+		drm_info(dev,
+			 "IMAC5K: secondary stream installed at %s task=%s pid=%d stream_count=%u tile_streams=%u primary_tile_streams=%u secondary_tile_streams=%u unknown_tile_streams=%u pair_ready=%u secondary_detected=%u\n",
+			 tag ? tag : "<none>", current->comm, task_pid_nr(current),
+			 dc_state->stream_count, tile_streams,
+			 primary_tile_streams, secondary_tile_streams,
+			 unknown_tile_streams, dm->imac5k_pair_ready,
+			 dm->imac5k_secondary_head_detected);
+	}
+
+	if (dm->imac5k_two_tile_streams_seen)
 		return;
 
 	dm->imac5k_two_tile_streams_seen = true;
@@ -5675,52 +5818,10 @@ static void amdgpu_dm_imac5k_note_two_stream_state(struct drm_device *dev,
 				   AMDGPU_DM_IMAC5K_STATE_FIRST_TWO_STREAM_COMMIT,
 				   tag);
 	drm_info(dev,
-		 "IMAC5K: two-stream guard armed at %s stream_count=%u tile_streams=%u\n",
-		 tag, dc_state->stream_count, tile_streams);
-}
-
-static void amdgpu_dm_imac5k_note_stream_drop_attempt(struct drm_device *dev,
-						      struct dc_state *dc_state)
-{
-	struct amdgpu_display_manager *dm;
-	struct dc_state *current_state;
-	u32 new_tile_streams;
-	u32 current_stream_count = 0;
-	u32 current_tile_streams = 0;
-
-	if (!dev || !dc_state)
-		return;
-
-	dm = &drm_to_adev(dev)->dm;
-	if (!amdgpu_dm_imac5k_quirk_enabled(dm) ||
-	    !dm->imac5k_secondary_head_detected ||
-	    !dm->imac5k_two_tile_streams_seen)
-		return;
-
-	new_tile_streams = amdgpu_dm_imac5k_count_tile_streams(dc_state);
-	if (dc_state->stream_count >= 2 && new_tile_streams >= 2)
-		return;
-
-	current_state = dm->dc ? dm->dc->current_state : NULL;
-	if (current_state) {
-		current_stream_count = current_state->stream_count;
-		current_tile_streams =
-			amdgpu_dm_imac5k_count_tile_streams(current_state);
-	}
-
-	if (current_tile_streams < 2)
-		return;
-
-	dm->imac5k_stream_drop_attempts++;
-	amdgpu_dm_imac5k_set_state(dev,
-				   AMDGPU_DM_IMAC5K_STATE_DEGRADED_ONE_TILE,
-				   "commit_streams_drop");
-	drm_info(dev,
-		 "IMAC5K: observed tiled stream drop attempt #%u task=%s pid=%d proposed_streams=%u proposed_tile_streams=%u current_streams=%u current_tile_streams=%u; commit reached tail after readiness check\n",
-		 dm->imac5k_stream_drop_attempts,
-		 current->comm, task_pid_nr(current),
-		 dc_state->stream_count, new_tile_streams,
-		 current_stream_count, current_tile_streams);
+		 "IMAC5K: two-stream guard armed at %s stream_count=%u tile_streams=%u primary_tile_streams=%u secondary_tile_streams=%u unknown_tile_streams=%u\n",
+		 tag ? tag : "<none>", dc_state->stream_count, tile_streams,
+		 primary_tile_streams, secondary_tile_streams,
+		 unknown_tile_streams);
 }
 
 static int amdgpu_dm_imac5k_check_readiness_barrier(struct drm_device *dev,
@@ -5729,7 +5830,16 @@ static int amdgpu_dm_imac5k_check_readiness_barrier(struct drm_device *dev,
 {
 	struct amdgpu_display_manager *dm;
 	struct amdgpu_dm_connector *secondary;
+	struct dc_state *current_state;
 	u32 tile_streams;
+	u32 primary_tile_streams;
+	u32 secondary_tile_streams;
+	u32 unknown_tile_streams;
+	u32 current_stream_count = 0;
+	u32 current_tile_streams = 0;
+	u32 current_primary_tile_streams = 0;
+	u32 current_secondary_tile_streams = 0;
+	u32 current_unknown_tile_streams = 0;
 
 	if (!dev || !dc_state)
 		return 0;
@@ -5744,7 +5854,81 @@ static int amdgpu_dm_imac5k_check_readiness_barrier(struct drm_device *dev,
 	    !dm->imac5k_secondary_head_detected)
 		return 0;
 
-	tile_streams = amdgpu_dm_imac5k_count_tile_streams(dc_state);
+	amdgpu_dm_imac5k_count_tile_stream_roles(dc_state, &tile_streams,
+						 &primary_tile_streams,
+						 &secondary_tile_streams,
+						 &unknown_tile_streams);
+
+	/*
+	 * RE-16: once both real tile roles are live, Windows preserves an
+	 * unmentioned peer by carrying its existing stream into the final
+	 * commit array. Linux does not yet synthesize that carry-forward
+	 * state here, so reject a destructive partial commit instead of
+	 * letting userspace silently clear either half.
+	 */
+	current_state = dm->dc ? dm->dc->current_state : NULL;
+	if ((dm->imac5k_stream_handoff_ready ||
+	     dm->imac5k_two_tile_streams_seen) && current_state) {
+		current_stream_count = current_state->stream_count;
+		amdgpu_dm_imac5k_count_tile_stream_roles(current_state,
+				&current_tile_streams,
+				&current_primary_tile_streams,
+				&current_secondary_tile_streams,
+				&current_unknown_tile_streams);
+		if (current_primary_tile_streams > 0 &&
+		    current_secondary_tile_streams > 0 &&
+		    (primary_tile_streams == 0 ||
+		     secondary_tile_streams == 0)) {
+			dm->imac5k_stream_drop_attempts++;
+			drm_info(dev,
+				 "IMAC5K: RE16 peer-preservation rejected destructive partial commit #%u tag=%s task=%s pid=%d proposed_streams=%u proposed_tile_streams=%u proposed_primary=%u proposed_secondary=%u proposed_unknown=%u current_streams=%u current_tile_streams=%u current_primary=%u current_secondary=%u current_unknown=%u missing_primary=%u missing_secondary=%u state=%s pair_ready=%u stream_handoff_ready=%u two_tile_seen=%u\n",
+				 dm->imac5k_stream_drop_attempts,
+				 tag ? tag : "<none>", current->comm,
+				 task_pid_nr(current), dc_state->stream_count,
+				 tile_streams, primary_tile_streams,
+				 secondary_tile_streams, unknown_tile_streams,
+				 current_stream_count, current_tile_streams,
+				 current_primary_tile_streams,
+				 current_secondary_tile_streams,
+				 current_unknown_tile_streams,
+				 primary_tile_streams == 0,
+				 secondary_tile_streams == 0,
+				 amdgpu_dm_imac5k_state_name(dm->imac5k_state),
+				 dm->imac5k_pair_ready,
+				 dm->imac5k_stream_handoff_ready,
+				 dm->imac5k_two_tile_streams_seen);
+			return -EINVAL;
+		}
+	}
+
+	if (primary_tile_streams > 0 && secondary_tile_streams > 0) {
+		if (!dm->imac5k_stream_handoff_ready) {
+			dm->imac5k_stream_handoff_ready = true;
+			amdgpu_dm_imac5k_set_state(dev,
+				AMDGPU_DM_IMAC5K_STATE_SECONDARY_STREAM_INSTALLED,
+				tag);
+			drm_info(dev,
+				 "IMAC5K: readiness barrier accepted two real tile streams tag=%s task=%s pid=%d proposed_streams=%u proposed_tile_streams=%u primary_tile_streams=%u secondary_tile_streams=%u unknown_tile_streams=%u pair_ready=%u\n",
+				 tag ? tag : "<none>", current->comm,
+				 task_pid_nr(current), dc_state->stream_count,
+				 tile_streams, primary_tile_streams,
+				 secondary_tile_streams, unknown_tile_streams,
+				 dm->imac5k_pair_ready);
+		}
+		return 0;
+	}
+
+	if (tile_streams >= 2)
+		drm_info(dev,
+			 "IMAC5K: readiness barrier saw incomplete multi-tile proposal tag=%s task=%s pid=%d proposed_streams=%u proposed_tile_streams=%u primary_tile_streams=%u secondary_tile_streams=%u unknown_tile_streams=%u state=%s pair_ready=%u stream_handoff_ready=%u\n",
+			 tag ? tag : "<none>", current->comm,
+			 task_pid_nr(current), dc_state->stream_count,
+			 tile_streams, primary_tile_streams,
+			 secondary_tile_streams, unknown_tile_streams,
+			 amdgpu_dm_imac5k_state_name(dm->imac5k_state),
+			 dm->imac5k_pair_ready,
+			 dm->imac5k_stream_handoff_ready);
+
 	if (tile_streams != 1)
 		return 0;
 
@@ -5757,12 +5941,17 @@ static int amdgpu_dm_imac5k_check_readiness_barrier(struct drm_device *dev,
 				   AMDGPU_DM_IMAC5K_STATE_ONE_TILE_DEFERRED,
 				   tag);
 	drm_info(dev,
-		 "IMAC5K: readiness barrier rejected primary-only takeover #%u tag=%s task=%s pid=%d proposed_streams=%u proposed_tile_streams=%u state=%s pair_ready=%u primary_seen=%u secondary_detected=%u secondary=%s dpcd10a=%u source_dpcd=%u dpcd4f1=%u two_tile_seen=%u\n",
+		 "IMAC5K: readiness barrier rejected pre-handoff single-tile takeover #%u tag=%s task=%s pid=%d proposed_streams=%u proposed_tile_streams=%u primary_tile_streams=%u secondary_tile_streams=%u unknown_tile_streams=%u missing_primary=%u missing_secondary=%u state=%s pair_ready=%u stream_handoff_ready=%u primary_seen=%u secondary_detected=%u secondary=%s dpcd10a=%u source_dpcd=%u dpcd4f1=%u two_tile_seen=%u\n",
 		 dm->imac5k_primary_only_deferrals,
 		 tag ? tag : "<none>", current->comm, task_pid_nr(current),
 		 dc_state->stream_count, tile_streams,
+		 primary_tile_streams, secondary_tile_streams,
+		 unknown_tile_streams,
+		 primary_tile_streams == 0,
+		 secondary_tile_streams == 0,
 		 amdgpu_dm_imac5k_state_name(dm->imac5k_state),
 		 dm->imac5k_pair_ready,
+		 dm->imac5k_stream_handoff_ready,
 		 dm->imac5k_primary_head_seen,
 		 dm->imac5k_secondary_head_detected,
 		 secondary ? secondary->base.name : "<none>",
@@ -5786,6 +5975,9 @@ static void amdgpu_dm_imac5k_log_streams(struct drm_device *dev,
 	struct amdgpu_display_manager *dm;
 	u32 i;
 	u32 tile_streams;
+	u32 primary_tile_streams;
+	u32 secondary_tile_streams;
+	u32 unknown_tile_streams;
 
 	if (!dev)
 		return;
@@ -5794,14 +5986,19 @@ static void amdgpu_dm_imac5k_log_streams(struct drm_device *dev,
 	if (!amdgpu_dm_imac5k_quirk_enabled(dm) || !dc_state)
 		return;
 
-	tile_streams = amdgpu_dm_imac5k_count_tile_streams(dc_state);
+	amdgpu_dm_imac5k_count_tile_stream_roles(dc_state, &tile_streams,
+						 &primary_tile_streams,
+						 &secondary_tile_streams,
+						 &unknown_tile_streams);
 	drm_info(dev,
-		 "IMAC5K: %s stream_count=%u tile_streams=%u state=%s primary_seen=%u pair_ready=%u plain_boot_candidate=%u secondary_detected=%u two_tile_seen=%u stream_drop_attempts=%u primary_only_deferrals=%u\n",
+		 "IMAC5K: %s stream_count=%u tile_streams=%u primary_tile_streams=%u secondary_tile_streams=%u unknown_tile_streams=%u state=%s primary_seen=%u pair_ready=%u stream_handoff_ready=%u plain_boot_candidate=%u secondary_detected=%u two_tile_seen=%u stream_drop_attempts=%u primary_only_deferrals=%u\n",
 		 tag, dc_state->stream_count,
-		 tile_streams,
+		 tile_streams, primary_tile_streams, secondary_tile_streams,
+		 unknown_tile_streams,
 		 amdgpu_dm_imac5k_state_name(dm->imac5k_state),
 		 dm->imac5k_primary_head_seen,
 		 dm->imac5k_pair_ready,
+		 dm->imac5k_stream_handoff_ready,
 		 dm->imac5k_plain_boot_candidate_seen,
 		 dm->imac5k_secondary_head_detected,
 		 dm->imac5k_two_tile_streams_seen,
@@ -5816,8 +6013,10 @@ static void amdgpu_dm_imac5k_log_streams(struct drm_device *dev,
 			continue;
 
 		drm_info(dev,
-			 "IMAC5K: %s stream[%u] %ux%u src=%dx%d+%d+%d dst=%dx%d+%d+%d link=%u signal=%d boot_odm=%u seamless=%u planes=%d otg=%d enc=%d context=%p\n",
+			 "IMAC5K: %s stream[%u] role=%s tile_stream=%u %ux%u src=%dx%d+%d+%d dst=%dx%d+%d+%d link=%u signal=%d boot_odm=%u seamless=%u planes=%d otg=%d enc=%d context=%p\n",
 			 tag, i,
+			 amdgpu_dm_imac5k_stream_role_name(stream),
+			 amdgpu_dm_imac5k_is_tile_stream(stream),
 			 stream->timing.h_addressable,
 			 stream->timing.v_addressable,
 			 stream->src.width,
@@ -5848,8 +6047,9 @@ static void amdgpu_dm_imac5k_log_streams(struct drm_device *dev,
 			continue;
 
 		drm_info(dev,
-			 "IMAC5K: %s pipe[%u] pipe_idx=%u stream=%p tile_stream=%u plane=%p top=%d bottom=%d prev_odm=%d next_odm=%d tg=%p opp=%p hubp=%p dpp=%p link=%u signal=%d timing=%ux%u stream_src=%dx%d+%d+%d stream_dst=%dx%d+%d+%d viewport=%dx%d+%d+%d recout=%dx%d+%d+%d hactive=%d vactive=%d plane_src=%dx%d+%d+%d plane_dst=%dx%d+%d+%d plane_clip=%dx%d+%d+%d visible=%u layer=%d\n",
+			 "IMAC5K: %s pipe[%u] pipe_idx=%u stream=%p role=%s tile_stream=%u plane=%p top=%d bottom=%d prev_odm=%d next_odm=%d tg=%p opp=%p hubp=%p dpp=%p link=%u signal=%d timing=%ux%u stream_src=%dx%d+%d+%d stream_dst=%dx%d+%d+%d viewport=%dx%d+%d+%d recout=%dx%d+%d+%d hactive=%d vactive=%d plane_src=%dx%d+%d+%d plane_dst=%dx%d+%d+%d plane_clip=%dx%d+%d+%d visible=%u layer=%d\n",
 			 tag, i, pipe->pipe_idx, stream,
+			 amdgpu_dm_imac5k_stream_role_name(stream),
 			 amdgpu_dm_imac5k_is_tile_stream(stream), plane,
 			 amdgpu_dm_imac5k_pipe_index(pipe->top_pipe),
 			 amdgpu_dm_imac5k_pipe_index(pipe->bottom_pipe),
@@ -13283,7 +13483,6 @@ static bool amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 	bool set_backlight_level = false;
 
 	amdgpu_dm_imac5k_log_streams(dev, dc_state, "commit_streams_begin");
-	amdgpu_dm_imac5k_note_stream_drop_attempt(dev, dc_state);
 
 	/* Disable writeback */
 	for_each_old_connector_in_state(state, connector, old_con_state, i) {
