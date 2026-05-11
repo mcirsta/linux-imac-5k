@@ -62,6 +62,10 @@
 #define IMAC5K_WINDOWS_ORDER_REQUIRED_EVIDENCE \
 	(IMAC5K_CACHED_LINK_EVIDENCE_10A | \
 	 IMAC5K_CACHED_LINK_EVIDENCE_SOURCE_DPCD)
+#ifndef DP_SOURCE_TABLE_REVISION
+#define DP_SOURCE_TABLE_REVISION 0x310
+#endif
+#define IMAC5K_DPCD_PANEL_LATCH 0x4F1
 
 void dp_log_training_result(
 	struct dc_link *link,
@@ -434,6 +438,21 @@ static bool link_is_imac5k_secondary_windows_route(const struct dc_link *link)
 	return true;
 }
 
+static bool link_is_imac5k_secondary_windows_candidate(const struct dc_link *link)
+{
+	uint32_t raw_obj;
+
+	if (!link)
+		return false;
+
+	raw_obj = dal_graphics_object_id_to_uint(link->link_id);
+
+	return raw_obj == IMAC5K_WIN_SECONDARY_OBJECT_ID ||
+	       link->ddc_hw_inst == IMAC5K_WIN_SECONDARY_DDC_HW_INST ||
+	       (link->link_enc &&
+		link->link_enc->transmitter == TRANSMITTER_UNIPHY_D);
+}
+
 static bool imac5k_secondary_should_use_windows_link_settings_order(
 	const struct dc_link *link,
 	const struct link_training_settings *lt_settings)
@@ -448,16 +467,149 @@ static bool imac5k_secondary_should_use_windows_link_settings_order(
 	if (lt_settings->link_settings.use_link_rate_set)
 		return false;
 
-	/*
-	 * Mirror Windows' order only after DM has already proved the two
-	 * prerequisites that precede link-settings writes: source-DPCD and 0x10A.
-	 */
-	if ((link->imac5k_cached_link_aux_evidence &
-	     IMAC5K_WINDOWS_ORDER_REQUIRED_EVIDENCE) !=
-	    IMAC5K_WINDOWS_ORDER_REQUIRED_EVIDENCE)
-		return false;
-
 	return true;
+}
+
+static const char *imac5k_secondary_windows_order_skip_reason(
+	const struct dc_link *link,
+	const struct link_training_settings *lt_settings)
+{
+	uint32_t raw_obj;
+
+	if (!link)
+		return "no-link";
+
+	if (!lt_settings)
+		return "no-lt-settings";
+
+	raw_obj = dal_graphics_object_id_to_uint(link->link_id);
+	if (link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
+		return "not-displayport";
+
+	if (raw_obj != IMAC5K_WIN_SECONDARY_OBJECT_ID)
+		return "not-0x3113";
+
+	if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
+		return "not-ddc3";
+
+	if (!link->link_enc)
+		return "no-link-encoder";
+
+	if (link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
+		return "not-uniphy-d";
+
+	if (link_dp_get_encoding_format(&lt_settings->link_settings) !=
+	    DP_8b_10b_ENCODING)
+		return "not-8b10b";
+
+	if (lt_settings->link_settings.use_link_rate_set)
+		return "uses-link-rate-set";
+
+	return "unknown";
+}
+
+static void imac5k_secondary_log_windows_order_skip(
+	const struct dc_link *link,
+	const struct link_training_settings *lt_settings,
+	const union lane_count_set *lane_count_set,
+	const union down_spread_ctrl *downspread)
+{
+	uint32_t raw_obj = link ? dal_graphics_object_id_to_uint(link->link_id) : 0;
+	uint32_t evidence = link ? link->imac5k_cached_link_aux_evidence : 0;
+	uint32_t missing_evidence =
+		IMAC5K_WINDOWS_ORDER_REQUIRED_EVIDENCE &
+		~evidence;
+	enum dp_link_encoding encoding = lt_settings ?
+		link_dp_get_encoding_format(&lt_settings->link_settings) :
+		DP_UNKNOWN_ENCODING;
+
+	DC_LOG_WARNING("IMAC5K: secondary 0x3113 Windows-order skipped before generic link-settings reason=%s link=%u raw_obj=0x%x signal=%d ddc_hw=%u tx=%d route_ok=%u encoding=%d use_lrs=%u req_rate=%d req_lanes=%d spread=%d enhanced=%d pattern_for_eq=%d dpcd_rev=0x%02x evidence=0x%x missing_evidence=0x%x stream_state=%d dpcd_proof=%u handoff_allowed=%u handoff_consumed=%u cur_rate=%d cur_lanes=%d dpcd100=0x%02x dpcd101=0x%02x dpcd107=0x%02x\n",
+		       imac5k_secondary_windows_order_skip_reason(link,
+								  lt_settings),
+		       link ? link->link_index : 0, raw_obj,
+		       link ? link->connector_signal : SIGNAL_TYPE_NONE,
+		       link ? link->ddc_hw_inst : 0,
+		       (link && link->link_enc) ?
+			       link->link_enc->transmitter : -1,
+		       link_is_imac5k_secondary_windows_route(link) ? 1 : 0,
+		       encoding,
+		       lt_settings ?
+			       lt_settings->link_settings.use_link_rate_set : 0,
+		       lt_settings ? lt_settings->link_settings.link_rate : 0,
+		       lt_settings ? lt_settings->link_settings.lane_count : 0,
+		       lt_settings ? lt_settings->link_settings.link_spread : 0,
+		       lt_settings ? lt_settings->enhanced_framing : 0,
+		       lt_settings ? lt_settings->pattern_for_eq : 0,
+		       link ? link->dpcd_caps.dpcd_rev.raw : 0,
+		       evidence, missing_evidence,
+		       link ? link->imac5k_stream_enable_state : 0,
+		       link ? link->imac5k_stream_state_dpcd_valid : 0,
+		       (link && link->imac5k_cached_link_handoff_allowed) ? 1 : 0,
+		       (link && link->imac5k_cached_link_handoff_consumed) ? 1 : 0,
+		       link ? link->cur_link_settings.link_rate : 0,
+		       link ? link->cur_link_settings.lane_count : 0,
+		       lt_settings ? get_dpcd_link_rate(
+				       &lt_settings->link_settings) : 0,
+		       lane_count_set ? lane_count_set->raw : 0,
+		       downspread ? downspread->raw : 0);
+}
+
+static void imac5k_secondary_log_windows_order_preconditions(
+	struct dc_link *link)
+{
+	uint8_t dpcd_10a = 0;
+	uint8_t source_table[3] = { 0 };
+	uint8_t dpcd_4f1 = 0;
+	uint8_t dpcd_205 = 0;
+	uint8_t dpcd_100_101[2] = { 0 };
+	uint8_t dpcd_202_203[2] = { 0 };
+	enum dc_status status_10a;
+	enum dc_status status_310;
+	enum dc_status status_4f1;
+	enum dc_status status_205;
+	enum dc_status status_100_101;
+	enum dc_status status_202_203;
+	bool hpd_hw = link->dc && link->dc->link_srv &&
+		link->dc->link_srv->get_hpd_state ?
+		link->dc->link_srv->get_hpd_state(link) : false;
+
+	status_10a = core_link_read_dpcd(link, DP_EDP_CONFIGURATION_SET,
+					&dpcd_10a, sizeof(dpcd_10a));
+	status_310 = core_link_read_dpcd(link, DP_SOURCE_TABLE_REVISION,
+					source_table, sizeof(source_table));
+	status_4f1 = core_link_read_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+					&dpcd_4f1, sizeof(dpcd_4f1));
+	status_205 = core_link_read_dpcd(link, DP_SINK_STATUS,
+					&dpcd_205, sizeof(dpcd_205));
+	status_100_101 = core_link_read_dpcd(link, DP_LINK_BW_SET,
+					    dpcd_100_101,
+					    sizeof(dpcd_100_101));
+	status_202_203 = core_link_read_dpcd(link,
+					    DP_LANE0_1_STATUS,
+					    dpcd_202_203,
+					    sizeof(dpcd_202_203));
+
+	DC_LOG_WARNING("IMAC5K: secondary 0x3113 Windows-order precondition snapshot link=%u evidence=0x%x missing_evidence=0x%x stream_state=%d handoff_allowed=%u handoff_consumed=%u 0x10A=0x%02x status10a=%d assr=%u 0x310=%02x %02x %02x status310=%d source_like=%u 0x4F1=0x%02x status4f1=%d 0x205=0x%02x status205=%d 0x100=0x%02x 0x101=0x%02x status100_101=%d 0x202=0x%02x 0x203=0x%02x status202_203=%d link_active=%u link_state_valid=%u hpd=%u/%u cur_rate=%d cur_lanes=%d\n",
+		       link->link_index, link->imac5k_cached_link_aux_evidence,
+		       IMAC5K_WINDOWS_ORDER_REQUIRED_EVIDENCE &
+			       ~link->imac5k_cached_link_aux_evidence,
+		       link->imac5k_stream_enable_state,
+		       link->imac5k_cached_link_handoff_allowed ? 1 : 0,
+		       link->imac5k_cached_link_handoff_consumed ? 1 : 0,
+		       dpcd_10a, status_10a,
+		       !!(dpcd_10a & DP_ALTERNATE_SCRAMBLER_RESET_ENABLE),
+		       source_table[0], source_table[1], source_table[2],
+		       status_310,
+		       status_310 == DC_OK &&
+			       source_table[1] == 0x1d &&
+			       source_table[2] == 0x03,
+		       dpcd_4f1, status_4f1, dpcd_205, status_205,
+		       dpcd_100_101[0], dpcd_100_101[1], status_100_101,
+		       dpcd_202_203[0], dpcd_202_203[1], status_202_203,
+		       link->link_status.link_active, link->link_state_valid,
+		       link->hpd_status, hpd_hw,
+		       link->cur_link_settings.link_rate,
+		       link->cur_link_settings.lane_count);
 }
 
 static enum dc_status imac5k_secondary_dpcd_set_link_settings_windows_order(
@@ -484,11 +636,13 @@ static enum dc_status imac5k_secondary_dpcd_set_link_settings_windows_order(
 	rate_lane[0] = rate;
 	rate_lane[1] = lane_count_set->raw;
 
-	DC_LOG_WARNING("IMAC5K: secondary 0x3113 Windows-order link-settings begin link=%u raw_obj=0x%x ddc_hw=%u tx=%d stream_state=%d evidence=0x%x handoff_allowed=%u handoff_consumed=%u dpcd_proof=%u cur_rate=%d cur_lanes=%d req_rate=%d req_lanes=%d dpcd100=0x%02x dpcd101=0x%02x dpcd107=0x%02x\n",
+	DC_LOG_WARNING("IMAC5K: secondary 0x3113 Windows-order link-settings begin link=%u raw_obj=0x%x ddc_hw=%u tx=%d stream_state=%d evidence=0x%x missing_evidence=0x%x forced_exact_route=1 handoff_allowed=%u handoff_consumed=%u dpcd_proof=%u cur_rate=%d cur_lanes=%d req_rate=%d req_lanes=%d dpcd100=0x%02x dpcd101=0x%02x dpcd107=0x%02x\n",
 		       link->link_index, raw_obj, link->ddc_hw_inst,
 		       link->link_enc ? link->link_enc->transmitter : -1,
 		       link->imac5k_stream_enable_state,
 		       link->imac5k_cached_link_aux_evidence,
+		       IMAC5K_WINDOWS_ORDER_REQUIRED_EVIDENCE &
+			       ~link->imac5k_cached_link_aux_evidence,
 		       link->imac5k_cached_link_handoff_allowed ? 1 : 0,
 		       link->imac5k_cached_link_handoff_consumed ? 1 : 0,
 		       link->imac5k_stream_state_dpcd_valid ? 1 : 0,
@@ -497,6 +651,8 @@ static enum dc_status imac5k_secondary_dpcd_set_link_settings_windows_order(
 		       lt_settings->link_settings.link_rate,
 		       lt_settings->link_settings.lane_count,
 		       rate_lane[0], rate_lane[1], downspread->raw);
+
+	imac5k_secondary_log_windows_order_preconditions(link);
 
 	status = core_link_write_dpcd(link, DP_LINK_BW_SET, rate_lane,
 				     sizeof(rate_lane));
@@ -1244,6 +1400,11 @@ enum dc_status dpcd_set_link_settings(
 		    link, lt_settings))
 		return imac5k_secondary_dpcd_set_link_settings_windows_order(
 			link, lt_settings, &lane_count_set, &downspread);
+
+	if (link_is_imac5k_secondary_windows_candidate(link))
+		imac5k_secondary_log_windows_order_skip(link, lt_settings,
+							&lane_count_set,
+							&downspread);
 
 	status = core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
 		&downspread.raw, sizeof(downspread));
