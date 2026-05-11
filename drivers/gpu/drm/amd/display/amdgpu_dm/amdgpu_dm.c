@@ -5557,7 +5557,8 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd(
 	struct dc_link *link;
 	enum dc_status mst_status;
 	enum dc_status status;
-	u8 table_revision[3];
+	u8 table_revision[3] = { 0 };
+	u8 expected_table_revision[3];
 	u8 mst_ctrl = 0;
 	bool was_programmed;
 
@@ -5646,23 +5647,29 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd(
 
 	dpcd_set_source_specific_data(link);
 
-	table_revision[0] = link->ctx->dce_version >= DCE_VERSION_12_0 ?
-			    0x05 : 0x04;
-	table_revision[1] = 0x1d;
-	table_revision[2] = 0x03;
+	expected_table_revision[0] = link->ctx->dce_version >= DCE_VERSION_12_0 ?
+				     0x05 : 0x04;
+	expected_table_revision[1] = 0x1d;
+	expected_table_revision[2] = 0x03;
 
-	status = core_link_write_dpcd(link, DP_SOURCE_TABLE_REVISION,
-				      table_revision, sizeof(table_revision));
-	if (status == DC_OK)
+	status = core_link_read_dpcd(link, DP_SOURCE_TABLE_REVISION,
+				     table_revision, sizeof(table_revision));
+	aconnector->imac5k_source_dpcd_programmed = false;
+	if (status == DC_OK &&
+	    table_revision[0] == expected_table_revision[0] &&
+	    table_revision[1] == expected_table_revision[1] &&
+	    table_revision[2] == expected_table_revision[2])
 		aconnector->imac5k_source_dpcd_programmed = true;
 	else
 		drm_info(dev,
-			 "IMAC5K: %s secondary source-DPCD write failed after Windows-route ok on %s link=%u status=%d 0x310=%02x %02x %02x\n",
+			 "IMAC5K: %s secondary source-DPCD lower-owner verify failed after Windows-route ok on %s link=%u status=%d 0x310=%02x %02x %02x expected=%02x %02x %02x\n",
 			 tag, aconnector->base.name, link->link_index, status,
-			 table_revision[0], table_revision[1], table_revision[2]);
+			 table_revision[0], table_revision[1], table_revision[2],
+			 expected_table_revision[0], expected_table_revision[1],
+			 expected_table_revision[2]);
 
 	drm_info(dev,
-		 "IMAC5K: %s secondary source-DPCD %s link=%u dce=%d live_sink=%u force=%u previously_programmed=%u dpcd10a_attempted=%u dpcd10a_asserted=%u dpcd111_seen=%u 0x111=%02x status_111=%d 0x310=%02x %02x %02x status=%d programmed=%u\n",
+		 "IMAC5K: %s secondary source-DPCD verify %s link=%u dce=%d live_sink=%u force=%u previously_programmed=%u dpcd10a_attempted=%u dpcd10a_asserted=%u dpcd111_seen=%u 0x111=%02x status_111=%d 0x310=%02x %02x %02x status=%d programmed=%u\n",
 		 tag, aconnector->base.name, link->link_index,
 		 link->ctx->dce_version, !!link->local_sink, force,
 		 was_programmed, aconnector->imac5k_dpcd_10a_attempted,
@@ -5812,9 +5819,9 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd_for_streams(
 			continue;
 
 		/*
-		 * Re-publish immediately before DC enables/trains the link.
-		 * DP power transitions can discard source-DPCD state, and this
-		 * mirrors the Windows ordering more closely than detect-time.
+		 * Verify/refresh through the lower source-DPCD owner. RE-23/26
+		 * showed Windows writes 0x300/0x303/0x310 before caps/training,
+		 * so this DM hook must not be the only 0x310 writer.
 		 */
 		amdgpu_dm_imac5k_program_secondary_source_dpcd(aconnector,
 							       tag, false,

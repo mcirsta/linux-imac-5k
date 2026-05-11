@@ -38,20 +38,57 @@
 #include "resource.h"
 #include "link_enc_cfg.h"
 #include "atomfirmware.h"
+#include "grph_object_id.h"
 #define DC_LOGGER \
 	link->ctx->logger
+
+#define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
+#define IMAC5K_WIN_SECONDARY_DDC_HW_INST 2
+
+static bool link_is_imac5k_secondary_power_route(const struct dc_link *link)
+{
+	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
+		return false;
+
+	if (dal_graphics_object_id_to_uint(link->link_id) !=
+	    IMAC5K_WIN_SECONDARY_OBJECT_ID)
+		return false;
+
+	if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
+		return false;
+
+	if (!link->link_enc ||
+	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
+		return false;
+
+	return true;
+}
 
 void dpcd_write_rx_power_ctrl(struct dc_link *link, bool on)
 {
 	uint8_t state;
+	enum dc_status status;
 
 	state = on ? DP_POWER_STATE_D0 : DP_POWER_STATE_D3;
 
-	if (link->sync_lt_in_progress)
+	if (link->sync_lt_in_progress) {
+		if (link_is_imac5k_secondary_power_route(link))
+			DC_LOG_WARNING("IMAC5K: secondary 0x3113 DP_SET_POWER skipped link=%u requested=0x%02x reason=sync-lt-in-progress cur_rate=%d cur_lanes=%d\n",
+				       link->link_index, state,
+				       link->cur_link_settings.link_rate,
+				       link->cur_link_settings.lane_count);
 		return;
+	}
 
-	core_link_write_dpcd(link, DP_SET_POWER, &state,
-						 sizeof(state));
+	status = core_link_write_dpcd(link, DP_SET_POWER, &state,
+				     sizeof(state));
+	if (link_is_imac5k_secondary_power_route(link))
+		DC_LOG_WARNING("IMAC5K: secondary 0x3113 DP_SET_POWER write link=%u on=%u value=0x%02x status=%d cur_rate=%d cur_lanes=%d link_active=%u link_state_valid=%u\n",
+			       link->link_index, on, state, status,
+			       link->cur_link_settings.link_rate,
+			       link->cur_link_settings.lane_count,
+			       link->link_status.link_active,
+			       link->link_state_valid);
 
 }
 
