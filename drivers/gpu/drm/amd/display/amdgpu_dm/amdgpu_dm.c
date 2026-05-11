@@ -3449,8 +3449,8 @@ static void apply_delay_after_dpcd_poweroff(struct amdgpu_device *adev,
 #define IMAC5K_POST_HPD_READY_DELAY_MS 30
 #define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
 #define IMAC5K_WIN_PRIMARY_OBJECT_ID   0x3114
-#define IMAC5K_WIN_SECONDARY_SELECTOR  0x4871
-#define IMAC5K_WIN_PRIMARY_SELECTOR    0x4875
+#define IMAC5K_SECONDARY_DDC_A_REG     0x4871 /* mmDC_GPIO_DDC3_A */
+#define IMAC5K_PRIMARY_DDC_A_REG       0x4875 /* mmDC_GPIO_DDC4_A */
 #define IMAC5K_WIN_SECONDARY_AUX_PIN   2
 #define IMAC5K_WIN_PRIMARY_AUX_PIN     3
 #define IMAC5K_SECONDARY_DDC_LINE      GPIO_DDC_LINE_DDC3
@@ -3497,7 +3497,7 @@ static void amdgpu_dm_log_link_route(struct drm_device *dev,
 	int enc_hpd_source = -1;
 	int enc_output_signals = 0;
 	unsigned int raw_link_id;
-	unsigned int expected_selector = 0;
+	unsigned int expected_ddc_a_reg = 0;
 	unsigned int expected_aux_pin = 0;
 	bool tx_is_uniphy_d = false;
 	bool object_id_ok = false;
@@ -3543,7 +3543,7 @@ static void amdgpu_dm_log_link_route(struct drm_device *dev,
 	     ddc_channel == IMAC5K_SECONDARY_DDC_HW_CHANNEL &&
 	     enc_transmitter == IMAC5K_SECONDARY_TRANSMITTER)) {
 		win_role = "secondary";
-		expected_selector = IMAC5K_WIN_SECONDARY_SELECTOR;
+		expected_ddc_a_reg = IMAC5K_SECONDARY_DDC_A_REG;
 		expected_aux_pin = IMAC5K_WIN_SECONDARY_AUX_PIN;
 		object_id_ok = raw_link_id == IMAC5K_WIN_SECONDARY_OBJECT_ID;
 		ddc_line_ok = ddc_line == IMAC5K_SECONDARY_DDC_LINE;
@@ -3554,7 +3554,7 @@ static void amdgpu_dm_log_link_route(struct drm_device *dev,
 		    ddc_channel == IMAC5K_PRIMARY_DDC_HW_CHANNEL &&
 		    enc_transmitter == IMAC5K_PRIMARY_TRANSMITTER)) {
 		win_role = "primary";
-		expected_selector = IMAC5K_WIN_PRIMARY_SELECTOR;
+		expected_ddc_a_reg = IMAC5K_PRIMARY_DDC_A_REG;
 		expected_aux_pin = IMAC5K_WIN_PRIMARY_AUX_PIN;
 		object_id_ok = raw_link_id == IMAC5K_WIN_PRIMARY_OBJECT_ID;
 		ddc_line_ok = ddc_line == IMAC5K_PRIMARY_DDC_LINE;
@@ -3586,7 +3586,7 @@ static void amdgpu_dm_log_link_route(struct drm_device *dev,
 			 link->irq_source_hpd, link->irq_source_hpd_rx,
 			 link->irq_source_read_request);
 		drm_info(dev,
-			 "IMAC5K: %s route connector=%s link_enc=%p enc_connector=%d/%d enc_id=%d/%d transmitter=%d tx_is_uniphy_d=%u preferred_engine=%d eng_id=%d link_enc_hw_inst=%u enc_hpd_source=%d enc_output_signals=0x%x link_active=%u link_state_valid=%u rate=%d lanes=%d expected_win_aux_pin_for_0x3113=2\n",
+			 "IMAC5K: %s route connector=%s link_enc=%p enc_connector=%d/%d enc_id=%d/%d transmitter=%d tx_is_uniphy_d=%u preferred_engine=%d eng_id=%d link_enc_hw_inst=%u enc_hpd_source=%d enc_output_signals=0x%x link_active=%u link_state_valid=%u rate=%d lanes=%d expected_secondary_aux_pin=2\n",
 			 tag, connector_name, link->link_enc,
 			 enc_connector_id, enc_connector_enum, enc_id, enc_enum,
 			 enc_transmitter, tx_is_uniphy_d, enc_engine, link->eng_id,
@@ -3595,9 +3595,9 @@ static void amdgpu_dm_log_link_route(struct drm_device *dev,
 			 link->cur_link_settings.link_rate,
 			 link->cur_link_settings.lane_count);
 		drm_info(dev,
-			 "IMAC5K: %s route_match connector=%s raw_obj=0x%x win_role=%s selector=0x%x win_aux_pin=%u route_ok=%u object_ok=%u ddc_line_ok=%u ddc_channel_ok=%u tx_ok=%u aux_mode=%u ddc_line=%d ddc_channel=%d transmitter=%d\n",
+			 "IMAC5K: %s route_match connector=%s raw_obj=0x%x win_role=%s ddc_a_reg=0x%x win_aux_pin=%u route_ok=%u object_ok=%u ddc_line_ok=%u ddc_channel_ok=%u tx_ok=%u aux_mode=%u ddc_line=%d ddc_channel=%d transmitter=%d\n",
 			 tag, connector_name, raw_link_id, win_role,
-			 expected_selector, expected_aux_pin, win_route_ok,
+			 expected_ddc_a_reg, expected_aux_pin, win_route_ok,
 			 object_id_ok, ddc_line_ok, ddc_channel_ok, transmitter_ok,
 			 link->aux_mode, ddc_line, ddc_channel, enc_transmitter);
 	} else {
@@ -3869,9 +3869,9 @@ static bool amdgpu_dm_imac5k_verify_windows_route(
 	const unsigned int expected_object_id = secondary ?
 					       IMAC5K_WIN_SECONDARY_OBJECT_ID :
 					       IMAC5K_WIN_PRIMARY_OBJECT_ID;
-	const unsigned int expected_selector = secondary ?
-					      IMAC5K_WIN_SECONDARY_SELECTOR :
-					      IMAC5K_WIN_PRIMARY_SELECTOR;
+	const unsigned int expected_ddc_a_reg = secondary ?
+					      IMAC5K_SECONDARY_DDC_A_REG :
+					      IMAC5K_PRIMARY_DDC_A_REG;
 	const unsigned int expected_aux_pin = secondary ?
 					     IMAC5K_WIN_SECONDARY_AUX_PIN :
 					     IMAC5K_WIN_PRIMARY_AUX_PIN;
@@ -3923,10 +3923,10 @@ static bool amdgpu_dm_imac5k_verify_windows_route(
 	     transmitter_ok && aux_mode_ok;
 
 	drm_info(dev,
-		 "IMAC5K: %s %s Windows-route %s for %s connector=%s link=%u expected_obj=0x%x actual_obj=0x%x object_ok=%u selector=0x%x win_aux_pin=%u expected_ddc=%s/%d expected_hw_channel=%s/%d expected_tx=%s/%d actual_ddc=%s/%d actual_hw_channel=%s/%d actual_tx=%s/%d ddc_line_ok=%u hw_channel_ok=%u tx_ok=%u aux_mode=%u aux_ok=%u ddc=%p ddc_pin=%p link_enc=%p hpd=%u/%u link_active=%u link_state_valid=%u\n",
+		 "IMAC5K: %s %s Windows-route %s for %s connector=%s link=%u expected_obj=0x%x actual_obj=0x%x object_ok=%u ddc_a_reg=0x%x win_aux_pin=%u expected_ddc=%s/%d expected_hw_channel=%s/%d expected_tx=%s/%d actual_ddc=%s/%d actual_hw_channel=%s/%d actual_tx=%s/%d ddc_line_ok=%u hw_channel_ok=%u tx_ok=%u aux_mode=%u aux_ok=%u ddc=%p ddc_pin=%p link_enc=%p hpd=%u/%u link_active=%u link_state_valid=%u\n",
 		 tag, role, ok ? "ok" : "mismatch", operation, connector_name,
 		 link->link_index, expected_object_id, raw_object_id,
-		 object_id_ok, expected_selector, expected_aux_pin,
+		 object_id_ok, expected_ddc_a_reg, expected_aux_pin,
 		 amdgpu_dm_imac5k_ddc_line_name(expected_ddc_line),
 		 expected_ddc_line,
 		 amdgpu_dm_imac5k_ddc_line_name(expected_ddc_hw_channel),
