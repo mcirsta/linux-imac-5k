@@ -5194,6 +5194,9 @@ amdgpu_dm_imac5k_program_secondary_assr_10a(
 	return aconnector->imac5k_dpcd_10a_asserted;
 }
 
+static bool amdgpu_dm_imac5k_lane_status_trained(u8 lane01, u8 lane23,
+						 unsigned int lane_count);
+
 static void
 amdgpu_dm_imac5k_log_secondary_dpcd_111(
 		struct amdgpu_dm_connector *aconnector,
