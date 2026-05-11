@@ -1977,6 +1977,135 @@ static void enable_link_hdmi(struct pipe_ctx *pipe_ctx)
 		read_scdc_data(link->ddc);
 }
 
+static bool imac5k_link_settings_known(const struct dc_link_settings *settings)
+{
+	return settings &&
+	       settings->link_rate != LINK_RATE_UNKNOWN &&
+	       settings->lane_count != LANE_COUNT_UNKNOWN;
+}
+
+static bool imac5k_link_settings_rate_lane_match(
+		const struct dc_link_settings *a,
+		const struct dc_link_settings *b)
+{
+	return imac5k_link_settings_known(a) &&
+	       imac5k_link_settings_known(b) &&
+	       a->link_rate == b->link_rate &&
+	       a->lane_count == b->lane_count;
+}
+
+static const char *imac5k_stream_enable_state_name(
+		enum dc_imac5k_stream_enable_state state)
+{
+	switch (state) {
+	case DC_IMAC5K_STREAM_ENABLE_STATE_OFF:
+		return "0:inactive-off";
+	case DC_IMAC5K_STREAM_ENABLE_STATE_ALREADY_LINK_CONFIGURED:
+		return "1:already-link-configured-pending-stream-enable";
+	case DC_IMAC5K_STREAM_ENABLE_STATE_NORMAL_ENABLED:
+		return "2:normal-enabled-completed";
+	case DC_IMAC5K_STREAM_ENABLE_STATE_STATE1_ENABLED:
+		return "3:state1-enabled-completed";
+	case DC_IMAC5K_STREAM_ENABLE_STATE_BLANK_QUIESCE:
+		return "4:blank-quiesce-transition";
+	case DC_IMAC5K_STREAM_ENABLE_STATE_QUIESCED:
+		return "5:quiesced-off-ish";
+	default:
+		return "unknown";
+	}
+}
+
+static bool imac5k_link_stream_state_tracked(const struct dc_link *link)
+{
+	return link &&
+	       (link->imac5k_stream_enable_state !=
+		DC_IMAC5K_STREAM_ENABLE_STATE_OFF ||
+		link->imac5k_stream_state_dpcd_valid ||
+		link->imac5k_cached_link_handoff_allowed ||
+		link->imac5k_cached_link_handoff_consumed ||
+		link->imac5k_cached_link_aux_evidence);
+}
+
+static void imac5k_set_stream_enable_state(
+		struct dc_link *link,
+		enum dc_imac5k_stream_enable_state state,
+		const char *reason)
+{
+	enum dc_imac5k_stream_enable_state old_state;
+	struct dal_logger *dc_logger;
+
+	if (!link || !link->ctx || !link->ctx->logger)
+		return;
+
+	old_state = link->imac5k_stream_enable_state;
+	if (old_state == state)
+		return;
+
+	dc_logger = link->ctx->logger;
+	link->imac5k_stream_enable_state = state;
+	DC_LOG_WARNING("IMAC5K: stream-enable-state link=%u %s -> %s reason=%s active=%u state_valid=%u dpcd_proof=%u dpcd100=0x%02x dpcd101=0x%02x dpcd003=0x%02x dpcd202=0x%02x dpcd203=0x%02x proof_rate=%d proof_lanes=%d cached_rate=%d cached_lanes=%d evidence=0x%x\n",
+			link->link_index,
+			imac5k_stream_enable_state_name(old_state),
+			imac5k_stream_enable_state_name(state),
+			reason ? reason : "<none>",
+			link->link_status.link_active, link->link_state_valid,
+			link->imac5k_stream_state_dpcd_valid,
+			link->imac5k_stream_state_dpcd_100,
+			link->imac5k_stream_state_dpcd_101,
+			link->imac5k_stream_state_dpcd_003,
+			link->imac5k_stream_state_dpcd_202,
+			link->imac5k_stream_state_dpcd_203,
+			link->imac5k_stream_state_dpcd_settings.link_rate,
+			link->imac5k_stream_state_dpcd_settings.lane_count,
+			link->imac5k_cached_link_settings.link_rate,
+			link->imac5k_cached_link_settings.lane_count,
+			link->imac5k_cached_link_aux_evidence);
+}
+
+static const char *imac5k_cached_link_handoff_blocker(
+		const struct dc_link *link,
+		const struct dc_link_settings *requested)
+{
+	if (!link)
+		return "no-link";
+	if (!link->imac5k_cached_link_handoff_allowed)
+		return "not-armed";
+	if (link->imac5k_stream_enable_state !=
+	    DC_IMAC5K_STREAM_ENABLE_STATE_ALREADY_LINK_CONFIGURED)
+		return "stream-state-not-1";
+	if (!link->imac5k_stream_state_dpcd_valid)
+		return "dpcd-trained-proof-missing";
+	if (!link->link_state_valid)
+		return "link-state-invalid";
+	if (!imac5k_link_settings_known(&link->cur_link_settings))
+		return "no-current-settings";
+	if (!imac5k_link_settings_known(&link->imac5k_cached_link_settings))
+		return "no-cached-settings";
+	if (!imac5k_link_settings_known(
+			&link->imac5k_stream_state_dpcd_settings))
+		return "no-dpcd-settings";
+	if (!imac5k_link_settings_known(requested))
+		return "no-requested-settings";
+	if (!imac5k_link_settings_rate_lane_match(
+			&link->imac5k_stream_state_dpcd_settings, requested))
+		return "requested-dpcd-mismatch";
+	if (!imac5k_link_settings_rate_lane_match(
+			&link->imac5k_cached_link_settings, requested))
+		return "requested-cached-mismatch";
+	if (!imac5k_link_settings_rate_lane_match(&link->cur_link_settings,
+						  requested))
+		return "requested-current-mismatch";
+
+	return NULL;
+}
+
+static bool imac5k_cached_link_handoff_ready(
+		const struct dc_link *link,
+		const struct dc_link_settings *requested)
+{
+	return imac5k_cached_link_handoff_blocker(link, requested) == NULL;
+}
+
 static enum dc_status enable_link_dp(struct dc_state *state,
 				     struct pipe_ctx *pipe_ctx)
 {
@@ -1994,6 +2123,12 @@ static enum dc_status enable_link_dp(struct dc_state *state,
 	/* Reduce link bandwidth between failed link training attempts. */
 	bool do_fallback = false;
 	int lt_attempts = LINK_TRAINING_ATTEMPTS;
+	const char *handoff_blocker = NULL;
+	bool cached_link_handoff_ready = false;
+	bool imac5k_stream_state_tracked = false;
+
+	DC_LOGGER_INIT(stream->ctx->logger);
+	imac5k_stream_state_tracked = imac5k_link_stream_state_tracked(link);
 
 	// Increase retry count if attempting DP1.x on FIXED_VS link
 	if (((link->chip_caps & AMD_EXT_DISPLAY_PATH_CAPS__EXT_CHIP_MASK) == AMD_EXT_DISPLAY_PATH_CAPS__DP_FIXED_VS_EN) &&
@@ -2046,15 +2181,36 @@ static enum dc_status enable_link_dp(struct dc_state *state,
 					state, false);
 	}
 
-	// during mode switch we do DP_SET_POWER off then on, and OUI is lost
-	dpcd_set_source_specific_data(link);
-	if (link->dpcd_sink_ext_caps.raw != 0) {
-		post_oui_delay += link->panel_config.pps.extra_post_OUI_ms;
-		msleep(post_oui_delay);
+	if (link->imac5k_cached_link_handoff_allowed) {
+		handoff_blocker =
+			imac5k_cached_link_handoff_blocker(link, link_settings);
+		cached_link_handoff_ready = handoff_blocker == NULL;
 	}
 
-	// similarly, mode switch can cause loss of cable ID
-	dpcd_write_cable_id_to_dprx(link);
+	if (!cached_link_handoff_ready) {
+		// during mode switch we do DP_SET_POWER off then on, and OUI is lost
+		dpcd_set_source_specific_data(link);
+		if (link->dpcd_sink_ext_caps.raw != 0) {
+			post_oui_delay += link->panel_config.pps.extra_post_OUI_ms;
+			msleep(post_oui_delay);
+		}
+
+		// similarly, mode switch can cause loss of cable ID
+		dpcd_write_cable_id_to_dprx(link);
+	} else {
+		DC_LOG_WARNING("IMAC5K: cached-link-handoff preserving source-DPCD/cable-id writes on link %u stream_state=%s evidence=0x%x dpcd_proof=%u active=%u state_valid=%u cur_rate=%d cur_lanes=%d req_rate=%d req_lanes=%d\n",
+				link->link_index,
+				imac5k_stream_enable_state_name(
+					link->imac5k_stream_enable_state),
+				link->imac5k_cached_link_aux_evidence,
+				link->imac5k_stream_state_dpcd_valid,
+				link->link_status.link_active,
+				link->link_state_valid,
+				link->cur_link_settings.link_rate,
+				link->cur_link_settings.lane_count,
+				link_settings->link_rate,
+				link_settings->lane_count);
+	}
 
 	skip_video_pattern = true;
 
@@ -2064,16 +2220,77 @@ static enum dc_status enable_link_dp(struct dc_state *state,
 	if (stream->sink_patches.oled_optimize_display_on)
 		set_default_brightness_aux(link);
 
-	if (perform_link_training_with_retries(link_settings,
-					       skip_video_pattern,
-					       lt_attempts,
-					       pipe_ctx,
-					       pipe_ctx->stream->signal,
-					       do_fallback)) {
+	if (cached_link_handoff_ready) {
+		const struct link_hwss *link_hwss =
+				get_link_hwss(link, &pipe_ctx->link_res);
+
+		if (link_dp_get_encoding_format(link_settings) ==
+		    DP_8b_10b_ENCODING)
+			link_hwss->setup_stream_encoder(pipe_ctx);
+
+		link->cur_link_settings = *link_settings;
+		link->imac5k_cached_link_handoff_allowed = false;
+		link->imac5k_cached_link_handoff_consumed = true;
+		imac5k_set_stream_enable_state(link,
+			DC_IMAC5K_STREAM_ENABLE_STATE_STATE1_ENABLED,
+			"state1-stream-enable-complete");
+		DC_LOG_WARNING("IMAC5K: cached-link-handoff accepted on link %u: skipped fresh DP training writes stream_state=%s evidence=0x%x dpcd_proof=%u dpcd_rate=%d dpcd_lanes=%d active=%u state_valid=%u rate=%d lanes=%d spread=%d\n",
+				link->link_index,
+				imac5k_stream_enable_state_name(
+					link->imac5k_stream_enable_state),
+				link->imac5k_cached_link_aux_evidence,
+				link->imac5k_stream_state_dpcd_valid,
+				link->imac5k_stream_state_dpcd_settings.link_rate,
+				link->imac5k_stream_state_dpcd_settings.lane_count,
+				link->link_status.link_active,
+				link->link_state_valid,
+				link_settings->link_rate,
+				link_settings->lane_count,
+				link_settings->link_spread);
+		status = DC_OK;
+	} else if (perform_link_training_with_retries(link_settings,
+						      skip_video_pattern,
+						      lt_attempts,
+						      pipe_ctx,
+						      pipe_ctx->stream->signal,
+						      do_fallback)) {
 		status = DC_OK;
 	} else {
 		status = DC_FAIL_DP_LINK_TRAINING;
 	}
+
+	if (link->imac5k_cached_link_handoff_allowed) {
+		DC_LOG_WARNING("IMAC5K: cached-link-handoff rejected on link %u reason=%s stream_state=%s evidence=0x%x dpcd_proof=%u dpcd_rate=%d dpcd_lanes=%d active=%u state_valid=%u cur_rate=%d cur_lanes=%d cached_rate=%d cached_lanes=%d req_rate=%d req_lanes=%d training_status=%d\n",
+				link->link_index,
+				handoff_blocker ? handoff_blocker : "unknown",
+				imac5k_stream_enable_state_name(
+					link->imac5k_stream_enable_state),
+				link->imac5k_cached_link_aux_evidence,
+				link->imac5k_stream_state_dpcd_valid,
+				link->imac5k_stream_state_dpcd_settings.link_rate,
+				link->imac5k_stream_state_dpcd_settings.lane_count,
+				link->link_status.link_active,
+				link->link_state_valid,
+				link->cur_link_settings.link_rate,
+				link->cur_link_settings.lane_count,
+				link->imac5k_cached_link_settings.link_rate,
+				link->imac5k_cached_link_settings.lane_count,
+				link_settings->link_rate,
+				link_settings->lane_count,
+				status);
+		link->imac5k_cached_link_handoff_allowed = false;
+		link->imac5k_cached_link_handoff_consumed = false;
+	}
+
+	if (!cached_link_handoff_ready && status == DC_OK &&
+	    imac5k_stream_state_tracked)
+		imac5k_set_stream_enable_state(link,
+			DC_IMAC5K_STREAM_ENABLE_STATE_NORMAL_ENABLED,
+			"normal-link-training-complete");
+	else if (status != DC_OK && imac5k_stream_state_tracked)
+		imac5k_set_stream_enable_state(link,
+			DC_IMAC5K_STREAM_ENABLE_STATE_OFF,
+			"link-enable-failed");
 
 	if (link->preferred_training_settings.fec_enable)
 		fec_enable = *link->preferred_training_settings.fec_enable;
@@ -2186,10 +2403,12 @@ static enum dc_status enable_link(
 	enum dc_status status = DC_ERROR_UNEXPECTED;
 	struct dc_stream_state *stream = pipe_ctx->stream;
 	struct dc_link *link = NULL;
+	struct dal_logger *dc_logger = NULL;
 
 	if (stream == NULL)
 		return DC_ERROR_UNEXPECTED;
 	link = stream->link;
+	dc_logger = stream->ctx->logger;
 
 	/* There's some scenarios where driver is unloaded with display
 	 * still enabled. When driver is reloaded, it may cause a display
@@ -2197,8 +2416,32 @@ static enum dc_status enable_link(
 	 * link settings. Need to call disable first before enabling at
 	 * new link settings.
 	 */
-	if (link->link_status.link_active)
-		disable_link(link, &pipe_ctx->link_res, pipe_ctx->stream->signal);
+	if (link->link_status.link_active) {
+		if ((stream->signal == SIGNAL_TYPE_DISPLAY_PORT ||
+		     stream->signal == SIGNAL_TYPE_EDP) &&
+		    imac5k_cached_link_handoff_ready(
+			    link, &pipe_ctx->link_config.dp_link_settings)) {
+			DC_LOG_WARNING("IMAC5K: cached-link-handoff preserving already-active link %u before enable signal=%d stream_state=%s evidence=0x%x dpcd_proof=%u rate=%d lanes=%d\n",
+					link->link_index, stream->signal,
+					imac5k_stream_enable_state_name(
+						link->imac5k_stream_enable_state),
+					link->imac5k_cached_link_aux_evidence,
+					link->imac5k_stream_state_dpcd_valid,
+					pipe_ctx->link_config.dp_link_settings.link_rate,
+					pipe_ctx->link_config.dp_link_settings.lane_count);
+		} else {
+			if (imac5k_link_stream_state_tracked(link))
+				imac5k_set_stream_enable_state(link,
+					DC_IMAC5K_STREAM_ENABLE_STATE_BLANK_QUIESCE,
+					"disable-before-new-enable");
+			disable_link(link, &pipe_ctx->link_res,
+				     pipe_ctx->stream->signal);
+			if (imac5k_link_stream_state_tracked(link))
+				imac5k_set_stream_enable_state(link,
+					DC_IMAC5K_STREAM_ENABLE_STATE_QUIESCED,
+					"disable-complete");
+		}
+	}
 
 	switch (pipe_ctx->stream->signal) {
 	case SIGNAL_TYPE_DISPLAY_PORT:

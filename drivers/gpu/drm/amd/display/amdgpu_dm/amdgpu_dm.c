@@ -3437,6 +3437,13 @@ static void apply_delay_after_dpcd_poweroff(struct amdgpu_device *adev,
 #define IMAC5K_4F1_ALLOW_CACHED_LINK_STATE  (1U << 2)
 #define IMAC5K_4F1_FORCE_WRITE              (1U << 3)
 #define IMAC5K_4F1_SETTLE_AFTER_ATTEMPT     (1U << 4)
+#define IMAC5K_CACHED_LINK_EVIDENCE_10A         (1U << 0)
+#define IMAC5K_CACHED_LINK_EVIDENCE_SOURCE_DPCD (1U << 1)
+#define IMAC5K_CACHED_LINK_EVIDENCE_4F1         (1U << 2)
+#define IMAC5K_CACHED_LINK_EVIDENCE_ROUTE       (1U << 3)
+#define IMAC5K_CACHED_LINK_EVIDENCE_TWO_STREAMS (1U << 4)
+#define IMAC5K_CACHED_LINK_EVIDENCE_DPCD_TRAINED (1U << 5)
+#define IMAC5K_DPCD_LANE_COUNT_MASK             0x1f
 #define IMAC5K_HPD_CHECK_INTERVAL_MS 10
 #define IMAC5K_HPD_READY_TIMEOUT_MS 300
 #define IMAC5K_POST_HPD_READY_DELAY_MS 30
@@ -3675,6 +3682,27 @@ static const char *amdgpu_dm_imac5k_state_name(enum amdgpu_dm_imac5k_state state
 		return "secondary-stream-installed";
 	case AMDGPU_DM_IMAC5K_STATE_FIRST_TWO_STREAM_COMMIT:
 		return "first-two-stream-commit";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *amdgpu_dm_imac5k_stream_enable_state_name(
+		enum dc_imac5k_stream_enable_state state)
+{
+	switch (state) {
+	case DC_IMAC5K_STREAM_ENABLE_STATE_OFF:
+		return "0:inactive-off";
+	case DC_IMAC5K_STREAM_ENABLE_STATE_ALREADY_LINK_CONFIGURED:
+		return "1:already-link-configured-pending-stream-enable";
+	case DC_IMAC5K_STREAM_ENABLE_STATE_NORMAL_ENABLED:
+		return "2:normal-enabled-completed";
+	case DC_IMAC5K_STREAM_ENABLE_STATE_STATE1_ENABLED:
+		return "3:state1-enabled-completed";
+	case DC_IMAC5K_STREAM_ENABLE_STATE_BLANK_QUIESCE:
+		return "4:blank-quiesce-transition";
+	case DC_IMAC5K_STREAM_ENABLE_STATE_QUIESCED:
+		return "5:quiesced-off-ish";
 	default:
 		return "unknown";
 	}
@@ -5244,12 +5272,20 @@ amdgpu_dm_imac5k_log_secondary_stream_dpcd_state(
 	enum dc_status status_32f = DC_ERROR_UNEXPECTED;
 	enum dc_status status_4f1 = DC_ERROR_UNEXPECTED;
 	enum dc_status status_205 = DC_ERROR_UNEXPECTED;
+	enum dc_status status_100_101 = DC_ERROR_UNEXPECTED;
+	enum dc_status status_003 = DC_ERROR_UNEXPECTED;
+	enum dc_status status_202_203 = DC_ERROR_UNEXPECTED;
+	u8 dpcd_100_101[2] = {0};
+	u8 dpcd_202_203[2] = {0};
 	u8 dpcd_10a = 0;
 	u8 dpcd_111 = 0;
 	u8 dpcd_316 = 0;
 	u8 dpcd_32f = 0;
 	u8 dpcd_4f1 = 0;
 	u8 dpcd_205 = 0;
+	u8 dpcd_003 = 0;
+	u8 lane_count = 0;
+	bool trained = false;
 
 	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
 		return;
@@ -5288,6 +5324,21 @@ amdgpu_dm_imac5k_log_secondary_stream_dpcd_state(
 					&dpcd_4f1, sizeof(dpcd_4f1));
 	status_205 = core_link_read_dpcd(link, DP_SINK_STATUS,
 					&dpcd_205, sizeof(dpcd_205));
+	status_100_101 = core_link_read_dpcd(link, DP_LINK_BW_SET,
+					     dpcd_100_101,
+					     sizeof(dpcd_100_101));
+	status_003 = core_link_read_dpcd(link, DP_MAX_DOWNSPREAD,
+					&dpcd_003, sizeof(dpcd_003));
+	status_202_203 = core_link_read_dpcd(link, DP_LANE0_1_STATUS,
+					     dpcd_202_203,
+					     sizeof(dpcd_202_203));
+	lane_count = dpcd_100_101[1] & IMAC5K_DPCD_LANE_COUNT_MASK;
+	trained = status_100_101 == DC_OK && status_003 == DC_OK &&
+		  status_202_203 == DC_OK &&
+		  dpcd_100_101[0] != LINK_RATE_UNKNOWN &&
+		  amdgpu_dm_imac5k_lane_status_trained(dpcd_202_203[0],
+						       dpcd_202_203[1],
+						       lane_count);
 
 	if (status_10a == DC_OK &&
 	    (dpcd_10a & DP_ALTERNATE_SCRAMBLER_RESET_ENABLE))
@@ -5296,16 +5347,21 @@ amdgpu_dm_imac5k_log_secondary_stream_dpcd_state(
 		aconnector->imac5k_dpcd_316_observed = true;
 
 	drm_info(dev,
-		 "IMAC5K: %s secondary DPCD snapshot stage=%s connector=%s link=%u raw_obj=0x%x live_sink=%u link_active=%u link_state_valid=%u hpd=%u/%u 0x10A=0x%02x status10a=%d assr=%u 0x111=0x%02x status111=%d 0x316=0x%02x status316=%d 0x32F=0x%02x status32f=%d 0x4F1=0x%02x status4f1=%d 0x205=0x%02x status205=%d\n",
+		 "IMAC5K: %s secondary DPCD snapshot stage=%s connector=%s link=%u raw_obj=0x%x stream_state=%s live_sink=%u link_active=%u link_state_valid=%u hpd=%u/%u 0x10A=0x%02x status10a=%d assr=%u 0x111=0x%02x status111=%d 0x316=0x%02x status316=%d 0x32F=0x%02x status32f=%d 0x4F1=0x%02x status4f1=%d 0x205=0x%02x status205=%d 0x100=0x%02x 0x101=0x%02x status100_101=%d 0x003=0x%02x status003=%d 0x202=0x%02x 0x203=0x%02x status202_203=%d active_link_trained=%u active_lanes=%u\n",
 		 tag, stage ? stage : "<none>", aconnector->base.name,
 		 link->link_index, amdgpu_dm_imac5k_raw_object_id(link->link_id),
+		 amdgpu_dm_imac5k_stream_enable_state_name(
+			 link->imac5k_stream_enable_state),
 		 !!link->local_sink, link->link_status.link_active,
 		 link->link_state_valid, link->hpd_status,
 		 link->dc && link->dc->link_srv ? dc_link_get_hpd_state(link) : 0,
 		 dpcd_10a, status_10a,
 		 !!(dpcd_10a & DP_ALTERNATE_SCRAMBLER_RESET_ENABLE),
 		 dpcd_111, status_111, dpcd_316, status_316, dpcd_32f,
-		 status_32f, dpcd_4f1, status_4f1, dpcd_205, status_205);
+		 status_32f, dpcd_4f1, status_4f1, dpcd_205, status_205,
+		 dpcd_100_101[0], dpcd_100_101[1], status_100_101,
+		 dpcd_003, status_003, dpcd_202_203[0], dpcd_202_203[1],
+		 status_202_203, trained, lane_count);
 }
 
 static bool
@@ -5761,6 +5817,464 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd_for_streams(
 							       tag, false,
 							       true);
 	}
+}
+
+static bool amdgpu_dm_imac5k_link_settings_known(
+		const struct dc_link_settings *settings)
+{
+	return settings &&
+	       settings->link_rate != LINK_RATE_UNKNOWN &&
+	       settings->lane_count != LANE_COUNT_UNKNOWN;
+}
+
+static bool amdgpu_dm_imac5k_link_settings_rate_lane_match(
+		const struct dc_link_settings *a,
+		const struct dc_link_settings *b)
+{
+	return amdgpu_dm_imac5k_link_settings_known(a) &&
+	       amdgpu_dm_imac5k_link_settings_known(b) &&
+	       a->link_rate == b->link_rate &&
+	       a->lane_count == b->lane_count;
+}
+
+static bool amdgpu_dm_imac5k_lane_status_trained(u8 lane01, u8 lane23,
+						 unsigned int lane_count)
+{
+	const u8 trained_mask = DP_CHANNEL_EQ_BITS;
+
+	switch (lane_count) {
+	case 1:
+		return (lane01 & trained_mask) == trained_mask;
+	case 2:
+		return (lane01 & trained_mask) == trained_mask &&
+		       (((lane01 >> 4) & trained_mask) == trained_mask);
+	case 4:
+		return (lane01 & trained_mask) == trained_mask &&
+		       (((lane01 >> 4) & trained_mask) == trained_mask) &&
+		       (lane23 & trained_mask) == trained_mask &&
+		       (((lane23 >> 4) & trained_mask) == trained_mask);
+	default:
+		return false;
+	}
+}
+
+static void amdgpu_dm_imac5k_set_link_stream_enable_state(
+		struct drm_device *dev,
+		struct dc_link *link,
+		enum dc_imac5k_stream_enable_state state,
+		const char *tag,
+		const char *reason)
+{
+	enum dc_imac5k_stream_enable_state old_state;
+
+	if (!dev || !link)
+		return;
+
+	old_state = link->imac5k_stream_enable_state;
+	if (old_state == state)
+		return;
+
+	link->imac5k_stream_enable_state = state;
+	drm_info(dev,
+		 "IMAC5K: %s stream-enable-state link=%u %s -> %s reason=%s active=%u link_state_valid=%u live_sink=%u hpd=%u/%u dpcd_proof=%u dpcd100=0x%02x dpcd101=0x%02x dpcd003=0x%02x dpcd202=0x%02x dpcd203=0x%02x proof_rate=%d proof_lanes=%d proof_spread=%d cached_rate=%d cached_lanes=%d evidence=0x%x\n",
+		 tag ? tag : "<none>", link->link_index,
+		 amdgpu_dm_imac5k_stream_enable_state_name(old_state),
+		 amdgpu_dm_imac5k_stream_enable_state_name(state),
+		 reason ? reason : "<none>",
+		 link->link_status.link_active, link->link_state_valid,
+		 !!link->local_sink, link->hpd_status,
+		 link->dc && link->dc->link_srv ? dc_link_get_hpd_state(link) : 0,
+		 link->imac5k_stream_state_dpcd_valid,
+		 link->imac5k_stream_state_dpcd_100,
+		 link->imac5k_stream_state_dpcd_101,
+		 link->imac5k_stream_state_dpcd_003,
+		 link->imac5k_stream_state_dpcd_202,
+		 link->imac5k_stream_state_dpcd_203,
+		 link->imac5k_stream_state_dpcd_settings.link_rate,
+		 link->imac5k_stream_state_dpcd_settings.lane_count,
+		 link->imac5k_stream_state_dpcd_settings.link_spread,
+		 link->imac5k_cached_link_settings.link_rate,
+		 link->imac5k_cached_link_settings.lane_count,
+		 link->imac5k_cached_link_aux_evidence);
+}
+
+static bool amdgpu_dm_imac5k_recover_active_link_settings_from_dpcd(
+		struct drm_device *dev,
+		struct amdgpu_dm_connector *aconnector,
+		const struct dc_link_settings *requested,
+		const char *tag,
+		struct dc_link_settings *recovered)
+{
+	struct dc_link_settings settings = {0};
+	struct dc_link *link;
+	enum dc_status status_cfg;
+	enum dc_status status_spread;
+	enum dc_status status_lane;
+	enum dc_lane_count lane_count = LANE_COUNT_UNKNOWN;
+	u8 link_cfg[2] = {0};
+	u8 spread = 0;
+	u8 lane_status[2] = {0};
+	unsigned int raw_lane_count;
+	bool dpcd_reads_ok;
+	bool trained;
+
+	if (recovered)
+		memset(recovered, 0, sizeof(*recovered));
+
+	if (!dev || !aconnector || !aconnector->dc_link)
+		return false;
+
+	link = aconnector->dc_link;
+	link->imac5k_stream_state_dpcd_valid = false;
+	memset(&link->imac5k_stream_state_dpcd_settings, 0,
+	       sizeof(link->imac5k_stream_state_dpcd_settings));
+	link->imac5k_stream_state_dpcd_003 = 0;
+	link->imac5k_stream_state_dpcd_100 = 0;
+	link->imac5k_stream_state_dpcd_101 = 0;
+	link->imac5k_stream_state_dpcd_202 = 0;
+	link->imac5k_stream_state_dpcd_203 = 0;
+
+	status_cfg = core_link_read_dpcd(link, DP_LINK_BW_SET, link_cfg,
+					sizeof(link_cfg));
+	status_spread = core_link_read_dpcd(link, DP_MAX_DOWNSPREAD,
+					   &spread, sizeof(spread));
+	status_lane = core_link_read_dpcd(link, DP_LANE0_1_STATUS,
+					 lane_status, sizeof(lane_status));
+
+	link->imac5k_stream_state_dpcd_100 = link_cfg[0];
+	link->imac5k_stream_state_dpcd_101 = link_cfg[1];
+	link->imac5k_stream_state_dpcd_003 = spread;
+	link->imac5k_stream_state_dpcd_202 = lane_status[0];
+	link->imac5k_stream_state_dpcd_203 = lane_status[1];
+
+	raw_lane_count = link_cfg[1] & IMAC5K_DPCD_LANE_COUNT_MASK;
+	switch (raw_lane_count) {
+	case 1:
+		lane_count = LANE_COUNT_ONE;
+		break;
+	case 2:
+		lane_count = LANE_COUNT_TWO;
+		break;
+	case 4:
+		lane_count = LANE_COUNT_FOUR;
+		break;
+	default:
+		lane_count = LANE_COUNT_UNKNOWN;
+		break;
+	}
+
+	dpcd_reads_ok = status_cfg == DC_OK && status_spread == DC_OK &&
+			status_lane == DC_OK;
+	trained = dpcd_reads_ok && link_cfg[0] != LINK_RATE_UNKNOWN &&
+		  lane_count != LANE_COUNT_UNKNOWN &&
+		  amdgpu_dm_imac5k_lane_status_trained(lane_status[0],
+						       lane_status[1],
+						       raw_lane_count);
+
+	if (trained) {
+		settings.lane_count = lane_count;
+		settings.link_rate = link_cfg[0];
+		settings.link_spread =
+			(spread & DP_MAX_DOWNSPREAD_0_5) ?
+			LINK_SPREAD_05_DOWNSPREAD_30KHZ :
+			LINK_SPREAD_DISABLED;
+		settings.use_link_rate_set = false;
+		settings.link_rate_set = 0;
+		link->imac5k_stream_state_dpcd_valid = true;
+		link->imac5k_stream_state_dpcd_settings = settings;
+		if (recovered)
+			*recovered = settings;
+	}
+
+	drm_info(dev,
+		 "IMAC5K: %s Windows-state1 DPCD recovery connector=%s link=%u trained=%u reads_ok=%u status100_101=%d status003=%d status202_203=%d raw100=0x%02x raw101=0x%02x raw003=0x%02x raw202=0x%02x raw203=0x%02x raw_lanes=%u proof_rate=%d proof_lanes=%d proof_spread=%d cur_rate=%d cur_lanes=%d req_rate=%d req_lanes=%d proof_matches_current=%u proof_matches_requested=%u active=%u state_valid=%u live_sink=%u hpd=%u/%u\n",
+		 tag ? tag : "<none>", aconnector->base.name,
+		 link->link_index, trained, dpcd_reads_ok, status_cfg,
+		 status_spread, status_lane, link_cfg[0], link_cfg[1],
+		 spread, lane_status[0], lane_status[1], raw_lane_count,
+		 settings.link_rate, settings.lane_count, settings.link_spread,
+		 link->cur_link_settings.link_rate,
+		 link->cur_link_settings.lane_count,
+		 requested ? requested->link_rate : LINK_RATE_UNKNOWN,
+		 requested ? requested->lane_count : LANE_COUNT_UNKNOWN,
+		 trained && amdgpu_dm_imac5k_link_settings_rate_lane_match(
+				&settings, &link->cur_link_settings),
+		 trained && amdgpu_dm_imac5k_link_settings_rate_lane_match(
+				&settings, requested),
+		 link->link_status.link_active, link->link_state_valid,
+		 !!link->local_sink, link->hpd_status,
+		 link->dc && link->dc->link_srv ? dc_link_get_hpd_state(link) : 0);
+
+	return trained;
+}
+
+static void amdgpu_dm_imac5k_clear_cached_link_handoff(struct dc_link *link)
+{
+	if (!link)
+		return;
+
+	link->imac5k_cached_link_handoff_allowed = false;
+	link->imac5k_cached_link_handoff_consumed = false;
+	memset(&link->imac5k_cached_link_settings, 0,
+	       sizeof(link->imac5k_cached_link_settings));
+	link->imac5k_cached_link_aux_evidence = 0;
+}
+
+static void amdgpu_dm_imac5k_clear_cached_link_handoffs(struct dc *dc)
+{
+	u32 i;
+
+	if (!dc)
+		return;
+
+	for (i = 0; i < dc->link_count; i++)
+		amdgpu_dm_imac5k_clear_cached_link_handoff(dc->links[i]);
+}
+
+static const struct pipe_ctx *
+amdgpu_dm_imac5k_find_stream_master_pipe(const struct dc_state *dc_state,
+					 const struct dc_stream_state *stream)
+{
+	const struct pipe_ctx *fallback = NULL;
+	u32 i;
+
+	if (!dc_state || !stream)
+		return NULL;
+
+	for (i = 0; i < MAX_PIPES; i++) {
+		const struct pipe_ctx *pipe = &dc_state->res_ctx.pipe_ctx[i];
+
+		if (pipe->stream != stream)
+			continue;
+
+		if (!fallback)
+			fallback = pipe;
+
+		if (!pipe->top_pipe && !pipe->prev_odm_pipe)
+			return pipe;
+	}
+
+	return fallback;
+}
+
+static u32 amdgpu_dm_imac5k_cached_link_evidence(
+		const struct amdgpu_dm_connector *aconnector,
+		bool route_ok,
+		bool two_streams)
+{
+	u32 evidence = 0;
+
+	if (!aconnector)
+		return evidence;
+
+	if (aconnector->imac5k_dpcd_10a_asserted)
+		evidence |= IMAC5K_CACHED_LINK_EVIDENCE_10A;
+	if (aconnector->imac5k_source_dpcd_programmed)
+		evidence |= IMAC5K_CACHED_LINK_EVIDENCE_SOURCE_DPCD;
+	if (aconnector->imac5k_dpcd_4f1_asserted)
+		evidence |= IMAC5K_CACHED_LINK_EVIDENCE_4F1;
+	if (route_ok)
+		evidence |= IMAC5K_CACHED_LINK_EVIDENCE_ROUTE;
+	if (two_streams)
+		evidence |= IMAC5K_CACHED_LINK_EVIDENCE_TWO_STREAMS;
+
+	return evidence;
+}
+
+static void
+amdgpu_dm_imac5k_prepare_cached_link_handoff_for_streams(
+		struct drm_device *dev,
+		struct dc_state *dc_state,
+		const char *tag)
+{
+	struct amdgpu_display_manager *dm;
+	u32 tile_streams;
+	u32 primary_tile_streams;
+	u32 secondary_tile_streams;
+	u32 unknown_tile_streams;
+	bool two_real_tile_streams;
+	bool found_secondary = false;
+	u32 i;
+
+	if (!dev || !dc_state)
+		return;
+
+	dm = &drm_to_adev(dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm))
+		return;
+
+	amdgpu_dm_imac5k_clear_cached_link_handoffs(dm->dc);
+
+	amdgpu_dm_imac5k_count_tile_stream_roles(dc_state, &tile_streams,
+						 &primary_tile_streams,
+						 &secondary_tile_streams,
+						 &unknown_tile_streams);
+	two_real_tile_streams = primary_tile_streams > 0 &&
+				secondary_tile_streams > 0;
+	if (!two_real_tile_streams) {
+		drm_info(dev,
+			 "IMAC5K: %s cached-link-handoff not armed: missing two real tile streams stream_count=%u tile_streams=%u primary=%u secondary=%u unknown=%u pair_ready=%u\n",
+			 tag ? tag : "<none>", dc_state->stream_count,
+			 tile_streams, primary_tile_streams,
+			 secondary_tile_streams, unknown_tile_streams,
+			 dm->imac5k_pair_ready);
+		return;
+	}
+
+	for (i = 0; i < dc_state->stream_count; i++) {
+		struct dc_stream_state *stream = dc_state->streams[i];
+		struct amdgpu_dm_connector *aconnector;
+		const struct pipe_ctx *pipe;
+		const struct dc_link_settings *requested;
+		struct dc_link_settings dpcd_settings = {0};
+		struct dc_link *link;
+		const char *reason = NULL;
+		bool route_ok;
+		bool aux_armed;
+		bool dpcd_trained = false;
+		u32 evidence;
+
+		if (!amdgpu_dm_imac5k_is_tile_stream(stream))
+			continue;
+
+		aconnector = (struct amdgpu_dm_connector *)stream->dm_stream_context;
+		if (!aconnector || !aconnector->imac5k_secondary_head)
+			continue;
+
+		found_secondary = true;
+		link = stream->link;
+		pipe = amdgpu_dm_imac5k_find_stream_master_pipe(dc_state,
+								stream);
+		requested = pipe ? &pipe->link_config.dp_link_settings : NULL;
+		route_ok = amdgpu_dm_imac5k_verify_windows_route(dev, link,
+				tag, aconnector->base.name, true,
+				"cached-link-handoff");
+		aux_armed = amdgpu_dm_imac5k_secondary_aux_armed(aconnector);
+		if (link && pipe && requested && route_ok && aux_armed)
+			dpcd_trained =
+				amdgpu_dm_imac5k_recover_active_link_settings_from_dpcd(
+						dev, aconnector, requested, tag,
+						&dpcd_settings);
+		evidence = amdgpu_dm_imac5k_cached_link_evidence(
+				aconnector, route_ok, two_real_tile_streams);
+		if (dpcd_trained)
+			evidence |= IMAC5K_CACHED_LINK_EVIDENCE_DPCD_TRAINED;
+
+		if (!link)
+			reason = "no-link";
+		else if (!pipe)
+			reason = "no-pipe";
+		else if (!route_ok)
+			reason = "route-mismatch";
+		else if (!aux_armed)
+			reason = "aux-not-armed";
+		else if (!link->link_state_valid)
+			reason = "link-state-invalid";
+		else if (!amdgpu_dm_imac5k_link_settings_known(
+				&link->cur_link_settings))
+			reason = "no-current-settings";
+		else if (!amdgpu_dm_imac5k_link_settings_known(requested))
+			reason = "no-requested-settings";
+		else if (!dpcd_trained)
+			reason = "dpcd-trained-proof-missing";
+		else if (!amdgpu_dm_imac5k_link_settings_rate_lane_match(
+				&dpcd_settings, requested))
+			reason = "requested-dpcd-mismatch";
+		else if (!amdgpu_dm_imac5k_link_settings_rate_lane_match(
+				&dpcd_settings, &link->cur_link_settings))
+			reason = "current-dpcd-mismatch";
+		else if (!amdgpu_dm_imac5k_link_settings_rate_lane_match(
+				&link->cur_link_settings, requested))
+			reason = "requested-current-mismatch";
+
+		if (reason) {
+			if (link)
+				amdgpu_dm_imac5k_set_link_stream_enable_state(
+						dev, link,
+						DC_IMAC5K_STREAM_ENABLE_STATE_OFF,
+						tag, reason);
+			drm_info(dev,
+				 "IMAC5K: %s cached-link-handoff not armed on %s reason=%s pipe=%d link=%u evidence=0x%x stream_state=%s dpcd_proof=%u dpcd_rate=%d dpcd_lanes=%d dpcd_spread=%d dpcd100=0x%02x dpcd101=0x%02x dpcd003=0x%02x dpcd202=0x%02x dpcd203=0x%02x live_sink=%u link_active=%u link_state_valid=%u hpd=%u/%u cur_rate=%d cur_lanes=%d req_rate=%d req_lanes=%d source_dpcd=%u dpcd10a=%u dpcd4f1=%u two_real_streams=%u\n",
+				 tag ? tag : "<none>", aconnector->base.name,
+				 reason, pipe ? pipe->pipe_idx : -1,
+				 link ? link->link_index : 0xffffffffu,
+				 evidence,
+				 link ? amdgpu_dm_imac5k_stream_enable_state_name(
+					 link->imac5k_stream_enable_state) :
+				 "no-link",
+				 link ? link->imac5k_stream_state_dpcd_valid : 0,
+				 link ? link->imac5k_stream_state_dpcd_settings.link_rate :
+				 LINK_RATE_UNKNOWN,
+				 link ? link->imac5k_stream_state_dpcd_settings.lane_count :
+				 LANE_COUNT_UNKNOWN,
+				 link ? link->imac5k_stream_state_dpcd_settings.link_spread :
+				 LINK_SPREAD_DISABLED,
+				 link ? link->imac5k_stream_state_dpcd_100 : 0,
+				 link ? link->imac5k_stream_state_dpcd_101 : 0,
+				 link ? link->imac5k_stream_state_dpcd_003 : 0,
+				 link ? link->imac5k_stream_state_dpcd_202 : 0,
+				 link ? link->imac5k_stream_state_dpcd_203 : 0,
+				 link ? !!link->local_sink : 0,
+				 link ? link->link_status.link_active : 0,
+				 link ? link->link_state_valid : 0,
+				 link ? link->hpd_status : 0,
+				 link && link->dc && link->dc->link_srv ?
+				 dc_link_get_hpd_state(link) : 0,
+				 link ? link->cur_link_settings.link_rate :
+				 LINK_RATE_UNKNOWN,
+				 link ? link->cur_link_settings.lane_count :
+				 LANE_COUNT_UNKNOWN,
+				 requested ? requested->link_rate :
+				 LINK_RATE_UNKNOWN,
+				 requested ? requested->lane_count :
+				 LANE_COUNT_UNKNOWN,
+				 aconnector->imac5k_source_dpcd_programmed,
+				 aconnector->imac5k_dpcd_10a_asserted,
+				 aconnector->imac5k_dpcd_4f1_asserted,
+				 two_real_tile_streams);
+			return;
+		}
+
+		link->imac5k_cached_link_handoff_allowed = true;
+		link->imac5k_cached_link_handoff_consumed = false;
+		link->imac5k_cached_link_settings = dpcd_settings;
+		link->imac5k_cached_link_aux_evidence = evidence;
+		amdgpu_dm_imac5k_set_link_stream_enable_state(dev, link,
+			DC_IMAC5K_STREAM_ENABLE_STATE_ALREADY_LINK_CONFIGURED,
+			tag, "dpcd-trained-link-proof");
+
+		drm_info(dev,
+			 "IMAC5K: %s cached-link-handoff armed on %s pipe=%d link=%u evidence=0x%x stream_state=%s live_sink=%u link_active=%u link_state_valid=%u hpd=%u/%u dpcd_rate=%d dpcd_lanes=%d dpcd_spread=%d cur_rate=%d cur_lanes=%d cur_spread=%d req_rate=%d req_lanes=%d req_spread=%d source_dpcd=%u dpcd10a=%u dpcd4f1=%u\n",
+			 tag ? tag : "<none>", aconnector->base.name,
+			 pipe ? pipe->pipe_idx : -1, link->link_index,
+			 evidence,
+			 amdgpu_dm_imac5k_stream_enable_state_name(
+				 link->imac5k_stream_enable_state),
+			 !!link->local_sink,
+			 link->link_status.link_active, link->link_state_valid,
+			 link->hpd_status,
+			 link->dc && link->dc->link_srv ?
+			 dc_link_get_hpd_state(link) : 0,
+			 dpcd_settings.link_rate,
+			 dpcd_settings.lane_count,
+			 dpcd_settings.link_spread,
+			 link->cur_link_settings.link_rate,
+			 link->cur_link_settings.lane_count,
+			 link->cur_link_settings.link_spread,
+			 requested->link_rate, requested->lane_count,
+			 requested->link_spread,
+			 aconnector->imac5k_source_dpcd_programmed,
+			 aconnector->imac5k_dpcd_10a_asserted,
+			 aconnector->imac5k_dpcd_4f1_asserted);
+		return;
+	}
+
+	if (!found_secondary)
+		drm_info(dev,
+			 "IMAC5K: %s cached-link-handoff not armed: no secondary tile stream target stream_count=%u tile_streams=%u primary=%u secondary=%u unknown=%u\n",
+			 tag ? tag : "<none>", dc_state->stream_count,
+			 tile_streams, primary_tile_streams,
+			 secondary_tile_streams, unknown_tile_streams);
 }
 
 static void amdgpu_dm_imac5k_note_two_stream_state(struct drm_device *dev,
@@ -13628,6 +14142,8 @@ static bool amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 	mutex_lock(&dm->dc_lock);
 	dc_exit_ips_for_hw_access(dm->dc);
 	amdgpu_dm_imac5k_program_secondary_source_dpcd_for_streams(
+			dev, dc_state, "commit_streams_pretrain");
+	amdgpu_dm_imac5k_prepare_cached_link_handoff_for_streams(
 			dev, dc_state, "commit_streams_pretrain");
 	WARN_ON(!dc_commit_streams(dm->dc, &params));
 
