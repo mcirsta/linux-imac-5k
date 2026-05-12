@@ -69,6 +69,12 @@
 
 #include "dcn10/dcn10_hwseq.h"
 
+/* iMac 5K AUX-death diagnostic helpers; defined in dc/link/protocols/link_dp_phy.c */
+extern void dp_imac5k_log_phy_event(struct dc_link *link, const char *func,
+				    const char *checkpoint);
+extern void dp_imac5k_probe_peer_aux(struct dc_link *acting_link,
+				     const char *func, const char *checkpoint);
+
 #define GAMMA_HW_POINTS_NUM 256
 
 /*
@@ -1721,12 +1727,27 @@ static void power_down_encoders(struct dc *dc)
 		struct link_encoder *link_enc = link->link_enc;
 		enum signal_type signal = link->connector_signal;
 
+		dp_imac5k_log_phy_event(link, "power_down_encoders",
+					"iter-entry");
+		dp_imac5k_probe_peer_aux(link, "power_down_encoders",
+					 "iter-entry");
+
 		dc->link_srv->blank_dp_stream(link, false);
 		if (signal != SIGNAL_TYPE_EDP)
 			signal = SIGNAL_TYPE_NONE;
 
+		dp_imac5k_log_phy_event(link, "power_down_encoders",
+					"before-link-enc-disable-output");
+		dp_imac5k_probe_peer_aux(link, "power_down_encoders",
+					 "before-link-enc-disable-output");
+
 		if (link->ep_type == DISPLAY_ENDPOINT_PHY)
 			link_enc->funcs->disable_output(link_enc, signal);
+
+		dp_imac5k_log_phy_event(link, "power_down_encoders",
+					"after-link-enc-disable-output");
+		dp_imac5k_probe_peer_aux(link, "power_down_encoders",
+					 "after-link-enc-disable-output");
 
 		if (link->fec_state == dc_link_fec_enabled) {
 			link_enc->funcs->fec_set_enable(link_enc, false);
@@ -1736,6 +1757,9 @@ static void power_down_encoders(struct dc *dc)
 
 		link->link_status.link_active = false;
 		memset(&link->cur_link_settings, 0, sizeof(link->cur_link_settings));
+
+		dp_imac5k_log_phy_event(link, "power_down_encoders",
+					"iter-exit-after-cur-link-cleared");
 	}
 }
 
@@ -3286,6 +3310,9 @@ void dce110_enable_dp_link_output(
 	const struct link_hwss *link_hwss = get_link_hwss(link, link_res);
 	unsigned int i;
 
+	dp_imac5k_log_phy_event(link, "dce110_enable_dp_link_output", "entry");
+	dp_imac5k_probe_peer_aux(link, "dce110_enable_dp_link_output", "entry");
+
 	/*
 	 * Add the logic to extract BOTH power up and power down sequences
 	 * from enable/disable link output and only call edp panel control
@@ -3294,6 +3321,11 @@ void dce110_enable_dp_link_output(
 	if (link->connector_signal == SIGNAL_TYPE_EDP) {
 		link->dc->hwss.edp_wait_for_hpd_ready(link, true);
 	}
+
+	dp_imac5k_log_phy_event(link, "dce110_enable_dp_link_output",
+				"after-edp-hpd-wait");
+	dp_imac5k_probe_peer_aux(link, "dce110_enable_dp_link_output",
+				 "after-edp-hpd-wait");
 
 	/* If the current pixel clock source is not DTO(happens after
 	 * switching from HDMI passive dongle to DP on the same connector),
@@ -3322,6 +3354,11 @@ void dce110_enable_dp_link_output(
 			dc->clk_mgr->funcs->notify_link_rate_change(dc->clk_mgr, link);
 	}
 
+	dp_imac5k_log_phy_event(link, "dce110_enable_dp_link_output",
+				"after-clk-mgr-notify");
+	dp_imac5k_probe_peer_aux(link, "dce110_enable_dp_link_output",
+				 "after-clk-mgr-notify");
+
 	if (dmcu != NULL && dmcu->funcs->lock_phy)
 		dmcu->funcs->lock_phy(dmcu);
 
@@ -3335,6 +3372,9 @@ void dce110_enable_dp_link_output(
 		dmcu->funcs->unlock_phy(dmcu);
 
 	dc->link_srv->dp_trace_source_sequence(link, DPCD_SOURCE_SEQ_AFTER_ENABLE_LINK_PHY);
+
+	dp_imac5k_log_phy_event(link, "dce110_enable_dp_link_output", "exit");
+	dp_imac5k_probe_peer_aux(link, "dce110_enable_dp_link_output", "exit");
 }
 
 void dce110_disable_link_output(struct dc_link *link,
@@ -3345,6 +3385,9 @@ void dce110_disable_link_output(struct dc_link *link,
 	const struct link_hwss *link_hwss = get_link_hwss(link, link_res);
 	struct dmcu *dmcu = dc->res_pool->dmcu;
 
+	dp_imac5k_log_phy_event(link, "dce110_disable_link_output", "entry");
+	dp_imac5k_probe_peer_aux(link, "dce110_disable_link_output", "entry");
+
 	if (signal == SIGNAL_TYPE_EDP &&
 			link->dc->hwss.edp_backlight_control &&
 			!link->skip_implict_edp_power_control)
@@ -3352,8 +3395,18 @@ void dce110_disable_link_output(struct dc_link *link,
 	else if (dmcu != NULL && dmcu->funcs->lock_phy)
 		dmcu->funcs->lock_phy(dmcu);
 
+	dp_imac5k_log_phy_event(link, "dce110_disable_link_output",
+				"before-link-hwss-disable");
+	dp_imac5k_probe_peer_aux(link, "dce110_disable_link_output",
+				 "before-link-hwss-disable");
+
 	link_hwss->disable_link_output(link, link_res, signal);
 	link->phy_state.symclk_state = SYMCLK_OFF_TX_OFF;
+
+	dp_imac5k_log_phy_event(link, "dce110_disable_link_output",
+				"after-link-hwss-disable");
+	dp_imac5k_probe_peer_aux(link, "dce110_disable_link_output",
+				 "after-link-hwss-disable");
 	/*
 	 * Add the logic to extract BOTH power up and power down sequences
 	 * from enable/disable link output and only call edp panel control
@@ -3362,6 +3415,9 @@ void dce110_disable_link_output(struct dc_link *link,
 	if (dmcu != NULL && dmcu->funcs->unlock_phy)
 		dmcu->funcs->unlock_phy(dmcu);
 	dc->link_srv->dp_trace_source_sequence(link, DPCD_SOURCE_SEQ_AFTER_DISABLE_LINK_PHY);
+
+	dp_imac5k_log_phy_event(link, "dce110_disable_link_output", "exit");
+	dp_imac5k_probe_peer_aux(link, "dce110_disable_link_output", "exit");
 }
 
 static const struct hw_sequencer_funcs dce110_funcs = {

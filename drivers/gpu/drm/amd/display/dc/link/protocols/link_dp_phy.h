@@ -57,4 +57,16 @@ void dp_set_fec_enable(struct dc_link *link,
 
 void dpcd_write_rx_power_ctrl(struct dc_link *link, bool on);
 
+/*
+ * iMac 5K diagnostic helpers. These are no-ops on non-iMac routes and only
+ * emit logs when the calling link (or its peer tile) matches the Windows
+ * primary 0x3114 / DDC4 / UNIPHY_C or secondary 0x3113 / DDC3 / UNIPHY_D
+ * route identity. They are intended for tracing when the secondary AUX path
+ * dies between commit_streams_pretrain and the lower stream-enable.
+ */
+void dp_imac5k_log_phy_event(struct dc_link *link, const char *func,
+			     const char *checkpoint);
+void dp_imac5k_probe_peer_aux(struct dc_link *acting_link, const char *func,
+			      const char *checkpoint);
+
 #endif /* __DC_LINK_DP_PHY_H__ */

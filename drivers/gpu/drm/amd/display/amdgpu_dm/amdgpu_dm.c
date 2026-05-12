@@ -4995,6 +4995,62 @@ static const char *amdgpu_dm_imac5k_stream_role_name(
 	return "unknown-tile";
 }
 
+static void amdgpu_dm_imac5k_prewrite_secondary_msa_ignore(
+		struct drm_device *dev,
+		struct dc_stream_state *stream,
+		struct amdgpu_dm_connector *aconnector,
+		const char *tag)
+{
+	struct dc_link *link;
+	enum dc_status read_status;
+	enum dc_status write_status = DC_ERROR_UNEXPECTED;
+	enum dc_status verify_status = DC_ERROR_UNEXPECTED;
+	u8 old_downspread = 0;
+	u8 new_downspread;
+	u8 verify_downspread = 0;
+	bool changed = false;
+
+	if (!dev || !stream || !aconnector || !aconnector->imac5k_secondary_head)
+		return;
+
+	link = stream->link;
+	if (!amdgpu_dm_imac5k_link_matches_windows_role(link, true))
+		return;
+
+	read_status = core_link_read_dpcd(link, DP_DOWNSPREAD_CTRL,
+					 &old_downspread,
+					 sizeof(old_downspread));
+	new_downspread = old_downspread | DP_MSA_TIMING_PAR_IGNORE_EN;
+	changed = read_status == DC_OK && new_downspread != old_downspread;
+
+	if (read_status == DC_OK && !changed)
+		write_status = DC_OK;
+	else if (changed)
+		write_status = core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
+						    &new_downspread,
+						    sizeof(new_downspread));
+
+	if (read_status == DC_OK && (write_status == DC_OK || !changed))
+		verify_status = core_link_read_dpcd(link, DP_DOWNSPREAD_CTRL,
+						    &verify_downspread,
+						    sizeof(verify_downspread));
+
+	drm_info(dev,
+		 "IMAC5K: %s prewriting secondary non-converter MSA-ignore DPCD 0x107 connector=%s link=%u read_status=%d write_status=%d verify_status=%d old=0x%02x new=0x%02x verify=0x%02x changed=%u stream_state=%s evidence=0x%x dpcd_proof=%u hpd=%u/%u live_sink=%u\n",
+		 tag ? tag : "<none>", aconnector->base.name,
+		 link ? link->link_index : 0xffffffffu,
+		 read_status, write_status, verify_status,
+		 old_downspread, new_downspread, verify_downspread, changed,
+		 link ? amdgpu_dm_imac5k_stream_enable_state_name(
+			 link->imac5k_stream_enable_state) : "no-link",
+		 link ? link->imac5k_cached_link_aux_evidence : 0,
+		 link ? link->imac5k_stream_state_dpcd_valid : 0,
+		 link ? link->hpd_status : 0,
+		 link && link->dc && link->dc->link_srv ?
+		 dc_link_get_hpd_state(link) : 0,
+		 link ? !!link->local_sink : 0);
+}
+
 static void amdgpu_dm_imac5k_apply_msa_ignore_for_streams(
 		struct drm_device *dev,
 		struct dc_state *dc_state,
@@ -5073,6 +5129,10 @@ static void amdgpu_dm_imac5k_apply_msa_ignore_for_streams(
 				 link->imac5k_stream_enable_state) : "no-link",
 			 link ? link->imac5k_cached_link_aux_evidence : 0,
 			 link ? link->imac5k_stream_state_dpcd_valid : 0);
+
+		if (secondary)
+			amdgpu_dm_imac5k_prewrite_secondary_msa_ignore(
+					dev, stream, aconnector, tag);
 	}
 }
 

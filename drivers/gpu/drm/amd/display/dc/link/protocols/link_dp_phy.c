@@ -44,6 +44,8 @@
 
 #define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
 #define IMAC5K_WIN_SECONDARY_DDC_HW_INST 2
+#define IMAC5K_WIN_PRIMARY_OBJECT_ID 0x3114
+#define IMAC5K_WIN_PRIMARY_DDC_HW_INST 3
 
 static bool link_is_imac5k_secondary_power_route(const struct dc_link *link)
 {
@@ -62,6 +64,157 @@ static bool link_is_imac5k_secondary_power_route(const struct dc_link *link)
 		return false;
 
 	return true;
+}
+
+static bool link_is_imac5k_primary_power_route(const struct dc_link *link)
+{
+	if (!link || link->connector_signal != SIGNAL_TYPE_EDP)
+		return false;
+
+	if (dal_graphics_object_id_to_uint(link->link_id) !=
+	    IMAC5K_WIN_PRIMARY_OBJECT_ID)
+		return false;
+
+	if (link->ddc_hw_inst != IMAC5K_WIN_PRIMARY_DDC_HW_INST)
+		return false;
+
+	if (!link->link_enc ||
+	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_C)
+		return false;
+
+	return true;
+}
+
+static const char *link_imac5k_role(const struct dc_link *link)
+{
+	if (link_is_imac5k_primary_power_route(link))
+		return "primary";
+	if (link_is_imac5k_secondary_power_route(link))
+		return "secondary";
+	return NULL;
+}
+
+static struct dc_link *link_imac5k_find_peer(const struct dc_link *self)
+{
+	const struct dc *dc;
+	bool self_is_primary;
+	bool self_is_secondary;
+	unsigned int i;
+
+	if (!self || !self->dc)
+		return NULL;
+
+	self_is_primary = link_is_imac5k_primary_power_route(self);
+	self_is_secondary = link_is_imac5k_secondary_power_route(self);
+	if (!self_is_primary && !self_is_secondary)
+		return NULL;
+
+	dc = self->dc;
+	for (i = 0; i < dc->link_count; i++) {
+		struct dc_link *other = dc->links[i];
+
+		if (!other || other == self)
+			continue;
+		if (self_is_primary &&
+		    link_is_imac5k_secondary_power_route(other))
+			return other;
+		if (self_is_secondary &&
+		    link_is_imac5k_primary_power_route(other))
+			return other;
+	}
+	return NULL;
+}
+
+static const char *link_imac5k_symclk_state_name(enum symclk_state state)
+{
+	switch (state) {
+	case SYMCLK_OFF_TX_OFF: return "off/off";
+	case SYMCLK_ON_TX_ON:   return "on/on";
+	case SYMCLK_ON_TX_OFF:  return "on/off";
+	default:                return "unknown";
+	}
+}
+
+void dp_imac5k_log_phy_event(struct dc_link *link, const char *func,
+			     const char *checkpoint)
+{
+	const char *role = link_imac5k_role(link);
+	bool hw_hpd;
+
+	if (!role)
+		return;
+
+	hw_hpd = link->dc && link->dc->link_srv ?
+		dc_link_get_hpd_state(link) : false;
+
+	DC_LOG_WARNING("IMAC5K: phy_trace func=%s checkpoint=%s role=%s link=%u signal=%d tx=%d ddc_hw=%u rate=%d lanes=%d link_active=%u link_state_valid=%u hpd_cached=%u hpd_hw=%u symclk_state=%s preserve_trained=%u skip_d3=%u handoff_allowed=%u handoff_consumed=%u stream_state=%d evidence=0x%x dpcd_proof=%u proof202=0x%02x proof203=0x%02x\n",
+		       func ? func : "<none>",
+		       checkpoint ? checkpoint : "<none>",
+		       role, link->link_index, link->connector_signal,
+		       link->link_enc ? link->link_enc->transmitter : -1,
+		       link->ddc_hw_inst,
+		       link->cur_link_settings.link_rate,
+		       link->cur_link_settings.lane_count,
+		       link->link_status.link_active, link->link_state_valid,
+		       link->hpd_status, hw_hpd,
+		       link_imac5k_symclk_state_name(link->phy_state.symclk_state),
+		       link->imac5k_trained_link_preserved,
+		       link->imac5k_skip_d3_after_trained,
+		       link->imac5k_cached_link_handoff_allowed ? 1 : 0,
+		       link->imac5k_cached_link_handoff_consumed ? 1 : 0,
+		       link->imac5k_stream_enable_state,
+		       link->imac5k_cached_link_aux_evidence,
+		       link->imac5k_stream_state_dpcd_valid,
+		       link->imac5k_stream_state_dpcd_202,
+		       link->imac5k_stream_state_dpcd_203);
+}
+
+void dp_imac5k_probe_peer_aux(struct dc_link *acting_link,
+			      const char *func, const char *checkpoint)
+{
+	struct dc_link *peer = link_imac5k_find_peer(acting_link);
+	/* DC_LOGGER macro expects a variable named "link" in scope. */
+	struct dc_link *link = acting_link;
+	const char *self_role;
+	const char *peer_role;
+	u8 dpcd_rev = 0xff;
+	enum dc_status status;
+	bool peer_hw_hpd;
+
+	if (!peer)
+		return;
+
+	self_role = link_imac5k_role(acting_link);
+	peer_role = link_imac5k_role(peer);
+	peer_hw_hpd = peer->dc && peer->dc->link_srv ?
+		dc_link_get_hpd_state(peer) : false;
+
+	status = core_link_read_dpcd(peer, DP_DPCD_REV, &dpcd_rev,
+				     sizeof(dpcd_rev));
+
+	DC_LOG_WARNING("IMAC5K: aux_probe func=%s checkpoint=%s self_role=%s self_link=%u peer_role=%s peer_link=%u dpcd_rev=0x%02x status=%d peer_hpd_cached=%u peer_hpd_hw=%u peer_link_active=%u peer_link_state_valid=%u peer_rate=%d peer_lanes=%d peer_symclk_state=%s peer_preserve_trained=%u peer_skip_d3=%u peer_handoff_allowed=%u peer_handoff_consumed=%u peer_stream_state=%d peer_evidence=0x%x peer_dpcd_proof=%u peer_proof202=0x%02x peer_proof203=0x%02x\n",
+		       func ? func : "<none>",
+		       checkpoint ? checkpoint : "<none>",
+		       self_role ? self_role : "n/a",
+		       acting_link->link_index,
+		       peer_role ? peer_role : "n/a",
+		       peer->link_index,
+		       dpcd_rev, status,
+		       peer->hpd_status, peer_hw_hpd,
+		       peer->link_status.link_active,
+		       peer->link_state_valid,
+		       peer->cur_link_settings.link_rate,
+		       peer->cur_link_settings.lane_count,
+		       link_imac5k_symclk_state_name(peer->phy_state.symclk_state),
+		       peer->imac5k_trained_link_preserved,
+		       peer->imac5k_skip_d3_after_trained,
+		       peer->imac5k_cached_link_handoff_allowed ? 1 : 0,
+		       peer->imac5k_cached_link_handoff_consumed ? 1 : 0,
+		       peer->imac5k_stream_enable_state,
+		       peer->imac5k_cached_link_aux_evidence,
+		       peer->imac5k_stream_state_dpcd_valid,
+		       peer->imac5k_stream_state_dpcd_202,
+		       peer->imac5k_stream_state_dpcd_203);
 }
 
 static bool link_should_preserve_imac5k_secondary_source_output(
@@ -121,6 +274,13 @@ void dpcd_write_rx_power_ctrl(struct dc_link *link, bool on)
 		return;
 	}
 
+	if (link_imac5k_role(link)) {
+		dp_imac5k_log_phy_event(link, "dpcd_write_rx_power_ctrl",
+					"pre-write");
+		dp_imac5k_probe_peer_aux(link, "dpcd_write_rx_power_ctrl",
+					 "pre-write");
+	}
+
 	status = core_link_write_dpcd(link, DP_SET_POWER, &state,
 				     sizeof(state));
 	if (link_is_imac5k_secondary_power_route(link))
@@ -133,6 +293,12 @@ void dpcd_write_rx_power_ctrl(struct dc_link *link, bool on)
 			       link->link_status.link_active,
 			       link->link_state_valid);
 
+	if (link_imac5k_role(link)) {
+		dp_imac5k_log_phy_event(link, "dpcd_write_rx_power_ctrl",
+					"post-write");
+		dp_imac5k_probe_peer_aux(link, "dpcd_write_rx_power_ctrl",
+					 "post-write");
+	}
 }
 
 void dp_enable_link_phy(
@@ -142,10 +308,22 @@ void dp_enable_link_phy(
 	enum clock_source_id clock_source,
 	const struct dc_link_settings *link_settings)
 {
+	dp_imac5k_log_phy_event(link, "dp_enable_link_phy", "entry");
+	dp_imac5k_probe_peer_aux(link, "dp_enable_link_phy", "entry");
+
 	link->cur_link_settings = *link_settings;
 	link->dc->hwss.enable_dp_link_output(link, link_res, signal,
 			clock_source, link_settings);
+
+	dp_imac5k_log_phy_event(link, "dp_enable_link_phy",
+				"after-enable-dp-link-output");
+	dp_imac5k_probe_peer_aux(link, "dp_enable_link_phy",
+				 "after-enable-dp-link-output");
+
 	dpcd_write_rx_power_ctrl(link, true);
+
+	dp_imac5k_log_phy_event(link, "dp_enable_link_phy", "exit");
+	dp_imac5k_probe_peer_aux(link, "dp_enable_link_phy", "exit");
 }
 
 void dp_disable_link_phy(struct dc_link *link,
@@ -153,6 +331,9 @@ void dp_disable_link_phy(struct dc_link *link,
 		enum signal_type signal)
 {
 	struct dc  *dc = link->ctx->dc;
+
+	dp_imac5k_log_phy_event(link, "dp_disable_link_phy", "entry");
+	dp_imac5k_probe_peer_aux(link, "dp_disable_link_phy", "entry");
 
 	if (!link->wa_flags.dp_keep_receiver_powered &&
 			!link->skip_implict_edp_power_control &&
@@ -173,16 +354,33 @@ void dp_disable_link_phy(struct dc_link *link,
 			       link->imac5k_stream_enable_state,
 			       link->imac5k_cached_link_handoff_allowed ? 1 : 0,
 			       link->imac5k_cached_link_handoff_consumed ? 1 : 0);
+		dp_imac5k_log_phy_event(link, "dp_disable_link_phy",
+					"exit-preserved");
+		dp_imac5k_probe_peer_aux(link, "dp_disable_link_phy",
+					 "exit-preserved");
 		return;
 	}
+
+	dp_imac5k_log_phy_event(link, "dp_disable_link_phy",
+				"before-hwss-disable");
+	dp_imac5k_probe_peer_aux(link, "dp_disable_link_phy",
+				 "before-hwss-disable");
 
 	dc->hwss.disable_link_output(link, link_res, signal);
 	/* Clear current link setting.*/
 	memset(&link->cur_link_settings, 0,
 			sizeof(link->cur_link_settings));
 
+	dp_imac5k_log_phy_event(link, "dp_disable_link_phy",
+				"after-hwss-disable");
+	dp_imac5k_probe_peer_aux(link, "dp_disable_link_phy",
+				 "after-hwss-disable");
+
 	if (dc->clk_mgr->funcs->notify_link_rate_change)
 		dc->clk_mgr->funcs->notify_link_rate_change(dc->clk_mgr, link);
+
+	dp_imac5k_log_phy_event(link, "dp_disable_link_phy", "exit");
+	dp_imac5k_probe_peer_aux(link, "dp_disable_link_phy", "exit");
 }
 
 static inline bool is_immediate_downstream(struct dc_link *link, uint32_t offset)
