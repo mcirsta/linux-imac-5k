@@ -74,6 +74,11 @@
 #define MAX_MTP_SLOT_COUNT 64
 #define LINK_TRAINING_ATTEMPTS 4
 #define PEAK_FACTOR_X1000 1006
+#define IMAC5K_TILE_HDISPLAY 2560
+#define IMAC5K_TILE_VDISPLAY 2880
+
+static const char *imac5k_stream_enable_state_name(
+		enum dc_imac5k_stream_enable_state state);
 
 void link_blank_all_dp_displays(struct dc *dc)
 {
@@ -1055,12 +1060,17 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx)
 
 	if (pipe_ctx->stream->signal != SIGNAL_TYPE_DISPLAY_PORT_MST) {
 		struct dc_link *link = stream->link;
+		struct dal_logger *dc_logger = link && link->ctx ? link->ctx->logger : NULL;
 		union down_spread_ctrl old_downspread;
 		union down_spread_ctrl new_downspread;
+		enum dc_status read_status;
+		enum dc_status write_status = DC_OK;
+		bool imac5k_tile_stream;
+		bool dpcd_changed;
 
 		memset(&old_downspread, 0, sizeof(old_downspread));
 
-		core_link_read_dpcd(link, DP_DOWNSPREAD_CTRL,
+		read_status = core_link_read_dpcd(link, DP_DOWNSPREAD_CTRL,
 				&old_downspread.raw, sizeof(old_downspread));
 
 		new_downspread.raw = old_downspread.raw;
@@ -1068,9 +1078,43 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx)
 		new_downspread.bits.IGNORE_MSA_TIMING_PARAM =
 				(stream->ignore_msa_timing_param) ? 1 : 0;
 
+		dpcd_changed = new_downspread.raw != old_downspread.raw;
 		if (new_downspread.raw != old_downspread.raw) {
-			core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
+			write_status = core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
 				&new_downspread.raw, sizeof(new_downspread));
+		}
+
+		imac5k_tile_stream =
+			stream->timing.h_addressable == IMAC5K_TILE_HDISPLAY &&
+			stream->timing.v_addressable == IMAC5K_TILE_VDISPLAY;
+		if (dc_logger && imac5k_tile_stream &&
+		    (stream->ignore_msa_timing_param ||
+		     link->imac5k_cached_link_aux_evidence ||
+		     link->imac5k_stream_state_dpcd_valid ||
+		     dpcd_changed ||
+		     read_status != DC_OK ||
+		     write_status != DC_OK)) {
+			DC_LOG_WARNING("IMAC5K: stream-features DPCD 0x107 link=%u signal=%d ignore_msa=%u read_status=%d write_status=%d old=0x%02x new=0x%02x changed=%u timing=%ux%u src=%dx%d+%d+%d dst=%dx%d+%d+%d stream_state=%s evidence=0x%x dpcd_proof=%u dpcd100=0x%02x dpcd101=0x%02x dpcd003=0x%02x dpcd202=0x%02x dpcd203=0x%02x\n",
+				link->link_index, link->connector_signal,
+				stream->ignore_msa_timing_param,
+				read_status, write_status,
+				old_downspread.raw, new_downspread.raw,
+				dpcd_changed,
+				stream->timing.h_addressable,
+				stream->timing.v_addressable,
+				stream->src.width, stream->src.height,
+				stream->src.x, stream->src.y,
+				stream->dst.width, stream->dst.height,
+				stream->dst.x, stream->dst.y,
+				imac5k_stream_enable_state_name(
+					link->imac5k_stream_enable_state),
+				link->imac5k_cached_link_aux_evidence,
+				link->imac5k_stream_state_dpcd_valid,
+				link->imac5k_stream_state_dpcd_100,
+				link->imac5k_stream_state_dpcd_101,
+				link->imac5k_stream_state_dpcd_003,
+				link->imac5k_stream_state_dpcd_202,
+				link->imac5k_stream_state_dpcd_203);
 		}
 
 	} else {
@@ -2075,7 +2119,7 @@ static const char *imac5k_cached_link_handoff_blocker(
 		return "stream-state-not-1";
 	if (!link->imac5k_stream_state_dpcd_valid)
 		return "dpcd-trained-proof-missing";
-	if (!link->link_state_valid)
+	if (!link->link_state_valid && !link->imac5k_trained_link_preserved)
 		return "link-state-invalid";
 	if (!imac5k_link_settings_known(&link->cur_link_settings))
 		return "no-current-settings";

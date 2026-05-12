@@ -64,6 +64,15 @@ static bool link_is_imac5k_secondary_power_route(const struct dc_link *link)
 	return true;
 }
 
+static bool link_should_preserve_imac5k_secondary_source_output(
+	const struct dc_link *link)
+{
+	return link_is_imac5k_secondary_power_route(link) &&
+	       link->imac5k_trained_link_preserved &&
+	       link->imac5k_skip_d3_after_trained &&
+	       !link->imac5k_cached_link_handoff_consumed;
+}
+
 void dpcd_write_rx_power_ctrl(struct dc_link *link, bool on)
 {
 	uint8_t state;
@@ -149,6 +158,23 @@ void dp_disable_link_phy(struct dc_link *link,
 			!link->skip_implict_edp_power_control &&
 			link->type != dc_connection_none)
 		dpcd_write_rx_power_ctrl(link, false);
+
+	if (link_should_preserve_imac5k_secondary_source_output(link)) {
+		DC_LOG_WARNING("IMAC5K: secondary 0x3113 source-output disable skipped link=%u reason=trained-link-preserve cur_rate=%d cur_lanes=%d proof_rate=%d proof_lanes=%d proof202=0x%02x proof203=0x%02x link_active=%u link_state_valid=%u stream_state=%d handoff_allowed=%u handoff_consumed=%u\n",
+			       link->link_index,
+			       link->cur_link_settings.link_rate,
+			       link->cur_link_settings.lane_count,
+			       link->imac5k_stream_state_dpcd_settings.link_rate,
+			       link->imac5k_stream_state_dpcd_settings.lane_count,
+			       link->imac5k_stream_state_dpcd_202,
+			       link->imac5k_stream_state_dpcd_203,
+			       link->link_status.link_active,
+			       link->link_state_valid,
+			       link->imac5k_stream_enable_state,
+			       link->imac5k_cached_link_handoff_allowed ? 1 : 0,
+			       link->imac5k_cached_link_handoff_consumed ? 1 : 0);
+		return;
+	}
 
 	dc->hwss.disable_link_output(link, link_res, signal);
 	/* Clear current link setting.*/
