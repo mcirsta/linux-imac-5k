@@ -30,6 +30,8 @@
  * ensure the integrity of our overall training procedure across different types
  * of link encoding and back end hardware.
  */
+#include <linux/string.h>
+
 #include "link_dp_training.h"
 #include "link_dp_training_8b_10b.h"
 #include "link_dp_training_128b_132b.h"
@@ -989,6 +991,93 @@ enum dc_status dp_get_lane_status_and_lane_adjust(
 	}
 
 	ln_align->raw = dpcd_buf[2];
+
+	if (link_is_imac5k_secondary_windows_route(link) &&
+	    link_training_setting &&
+	    dp_is_cr_done(link_training_setting->link_settings.lane_count,
+			  ln_status) &&
+	    dp_is_ch_eq_done(link_training_setting->link_settings.lane_count,
+			     ln_status) &&
+	    dp_is_symbol_locked(link_training_setting->link_settings.lane_count,
+				ln_status) &&
+	    dp_is_interlane_aligned(*ln_align)) {
+		union lane_count_set lane_count_set = {0};
+		uint8_t dpcd_005 = 0;
+		uint8_t dpcd_080 = 0;
+		uint8_t dpcd_600 = 0;
+		uint8_t branch_500_508[9] = {0};
+		enum dc_status status_005;
+		enum dc_status status_080;
+		enum dc_status status_500;
+		enum dc_status status_600;
+		bool first_preserve =
+			!link->imac5k_trained_link_preserved;
+
+		lane_count_set.bits.LANE_COUNT_SET =
+			link_training_setting->link_settings.lane_count;
+		lane_count_set.bits.ENHANCED_FRAMING =
+			link_training_setting->enhanced_framing;
+		lane_count_set.bits.POST_LT_ADJ_REQ_GRANTED = 0;
+
+		link->imac5k_trained_link_preserved = true;
+		link->imac5k_skip_d3_after_trained = true;
+		link->imac5k_stream_state_dpcd_valid = true;
+		link->imac5k_stream_state_dpcd_settings =
+			link_training_setting->link_settings;
+		link->imac5k_stream_state_dpcd_003 =
+			link_training_setting->link_settings.link_spread ==
+			LINK_SPREAD_05_DOWNSPREAD_30KHZ ?
+			DP_MAX_DOWNSPREAD_0_5 : 0;
+		link->imac5k_stream_state_dpcd_100 =
+			get_dpcd_link_rate(
+				&link_training_setting->link_settings);
+		link->imac5k_stream_state_dpcd_101 = lane_count_set.raw;
+		link->imac5k_stream_state_dpcd_202 = dpcd_buf[0];
+		link->imac5k_stream_state_dpcd_203 = dpcd_buf[1];
+
+		status_005 = core_link_read_dpcd(link,
+						 DP_DOWNSTREAMPORT_PRESENT,
+						 &dpcd_005,
+						 sizeof(dpcd_005));
+		status_080 = core_link_read_dpcd(link, DP_DOWNSTREAM_PORT_0,
+						 &dpcd_080,
+						 sizeof(dpcd_080));
+		status_500 = core_link_read_dpcd(link, DP_BRANCH_OUI,
+						 branch_500_508,
+						 sizeof(branch_500_508));
+		status_600 = core_link_read_dpcd(link, DP_SET_POWER,
+						 &dpcd_600,
+						 sizeof(dpcd_600));
+
+		if (status_005 == DC_OK)
+			link->imac5k_trained_link_dpcd_005 = dpcd_005;
+		if (status_080 == DC_OK)
+			link->imac5k_trained_link_dpcd_080 = dpcd_080;
+		if (status_600 == DC_OK)
+			link->imac5k_trained_link_dpcd_600 = dpcd_600;
+		if (status_500 == DC_OK)
+			memcpy(link->imac5k_trained_link_branch_500_508,
+			       branch_500_508,
+			       sizeof(link->imac5k_trained_link_branch_500_508));
+
+		DC_LOG_WARNING("IMAC5K: secondary 0x3113 trained-link-preserve %s link=%u raw202=0x%02x raw203=0x%02x align=0x%02x req_rate=%d req_lanes=%d dpcd100=0x%02x dpcd101=0x%02x dpcd003=0x%02x dpcd005=0x%02x status005=%d dpcd080=0x%02x status080=%d branch500_508=%02x %02x %02x %02x %02x %02x %02x %02x %02x status500=%d dpcd600=0x%02x status600=%d skip_d3=1 stream_state=%d evidence=0x%x\n",
+			       first_preserve ? "armed" : "refresh",
+			       link->link_index, dpcd_buf[0], dpcd_buf[1],
+			       dpcd_buf[2],
+			       link_training_setting->link_settings.link_rate,
+			       link_training_setting->link_settings.lane_count,
+			       link->imac5k_stream_state_dpcd_100,
+			       link->imac5k_stream_state_dpcd_101,
+			       link->imac5k_stream_state_dpcd_003,
+			       dpcd_005, status_005, dpcd_080, status_080,
+			       branch_500_508[0], branch_500_508[1],
+			       branch_500_508[2], branch_500_508[3],
+			       branch_500_508[4], branch_500_508[5],
+			       branch_500_508[6], branch_500_508[7],
+			       branch_500_508[8], status_500, dpcd_600,
+			       status_600, link->imac5k_stream_enable_state,
+			       link->imac5k_cached_link_aux_evidence);
+	}
 
 	if (is_repeater(link_training_setting, offset)) {
 		DC_LOG_HW_LINK_TRAINING("%s:\n LTTPR Repeater ID: %d\n"

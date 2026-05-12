@@ -1651,6 +1651,12 @@ enum dc_imac5k_stream_enable_state {
 	uint8_t imac5k_stream_state_dpcd_101;
 	uint8_t imac5k_stream_state_dpcd_202;
 	uint8_t imac5k_stream_state_dpcd_203;
+	bool imac5k_trained_link_preserved;
+	bool imac5k_skip_d3_after_trained;
+	uint8_t imac5k_trained_link_dpcd_005;
+	uint8_t imac5k_trained_link_dpcd_080;
+	uint8_t imac5k_trained_link_dpcd_600;
+	uint8_t imac5k_trained_link_branch_500_508[9];
 	struct dc_lane_settings cur_lane_setting[LANE_COUNT_DP_MAX];
 	struct dc_link_settings preferred_link_setting;
 	/* preferred_training_settings are override values that

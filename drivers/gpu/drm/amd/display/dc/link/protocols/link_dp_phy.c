@@ -80,13 +80,47 @@ void dpcd_write_rx_power_ctrl(struct dc_link *link, bool on)
 		return;
 	}
 
+	if (!on && link_is_imac5k_secondary_power_route(link) &&
+	    link->imac5k_skip_d3_after_trained &&
+	    link->imac5k_trained_link_preserved) {
+		DC_LOG_WARNING("IMAC5K: secondary 0x3113 DP_SET_POWER skipped link=%u requested=0x%02x reason=trained-link-preserve cur_rate=%d cur_lanes=%d proof_rate=%d proof_lanes=%d proof202=0x%02x proof203=0x%02x dpcd005=0x%02x dpcd080=0x%02x dpcd600=0x%02x branch500_508=%02x %02x %02x %02x %02x %02x %02x %02x %02x evidence=0x%x stream_state=%d handoff_allowed=%u handoff_consumed=%u link_active=%u link_state_valid=%u\n",
+			       link->link_index, state,
+			       link->cur_link_settings.link_rate,
+			       link->cur_link_settings.lane_count,
+			       link->imac5k_stream_state_dpcd_settings.link_rate,
+			       link->imac5k_stream_state_dpcd_settings.lane_count,
+			       link->imac5k_stream_state_dpcd_202,
+			       link->imac5k_stream_state_dpcd_203,
+			       link->imac5k_trained_link_dpcd_005,
+			       link->imac5k_trained_link_dpcd_080,
+			       link->imac5k_trained_link_dpcd_600,
+			       link->imac5k_trained_link_branch_500_508[0],
+			       link->imac5k_trained_link_branch_500_508[1],
+			       link->imac5k_trained_link_branch_500_508[2],
+			       link->imac5k_trained_link_branch_500_508[3],
+			       link->imac5k_trained_link_branch_500_508[4],
+			       link->imac5k_trained_link_branch_500_508[5],
+			       link->imac5k_trained_link_branch_500_508[6],
+			       link->imac5k_trained_link_branch_500_508[7],
+			       link->imac5k_trained_link_branch_500_508[8],
+			       link->imac5k_cached_link_aux_evidence,
+			       link->imac5k_stream_enable_state,
+			       link->imac5k_cached_link_handoff_allowed ? 1 : 0,
+			       link->imac5k_cached_link_handoff_consumed ? 1 : 0,
+			       link->link_status.link_active,
+			       link->link_state_valid);
+		return;
+	}
+
 	status = core_link_write_dpcd(link, DP_SET_POWER, &state,
 				     sizeof(state));
 	if (link_is_imac5k_secondary_power_route(link))
-		DC_LOG_WARNING("IMAC5K: secondary 0x3113 DP_SET_POWER write link=%u on=%u value=0x%02x status=%d cur_rate=%d cur_lanes=%d link_active=%u link_state_valid=%u\n",
+		DC_LOG_WARNING("IMAC5K: secondary 0x3113 DP_SET_POWER write link=%u on=%u value=0x%02x status=%d cur_rate=%d cur_lanes=%d proof_preserved=%u skip_d3=%u link_active=%u link_state_valid=%u\n",
 			       link->link_index, on, state, status,
 			       link->cur_link_settings.link_rate,
 			       link->cur_link_settings.lane_count,
+			       link->imac5k_trained_link_preserved,
+			       link->imac5k_skip_d3_after_trained,
 			       link->link_status.link_active,
 			       link->link_state_valid);
 

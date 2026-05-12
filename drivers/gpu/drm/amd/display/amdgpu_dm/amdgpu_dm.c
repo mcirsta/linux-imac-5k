@@ -5560,6 +5560,8 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd(
 	u8 table_revision[3] = { 0 };
 	u8 expected_table_revision[3];
 	u8 mst_ctrl = 0;
+	bool lower_write_evidence;
+	bool readback_ok;
 	bool was_programmed;
 
 	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
@@ -5654,34 +5656,40 @@ amdgpu_dm_imac5k_program_secondary_source_dpcd(
 
 	status = core_link_read_dpcd(link, DP_SOURCE_TABLE_REVISION,
 				     table_revision, sizeof(table_revision));
-	aconnector->imac5k_source_dpcd_programmed = false;
-	if (status == DC_OK &&
-	    table_revision[0] == expected_table_revision[0] &&
-	    table_revision[1] == expected_table_revision[1] &&
-	    table_revision[2] == expected_table_revision[2])
-		aconnector->imac5k_source_dpcd_programmed = true;
-	else
+	lower_write_evidence =
+		!!(link->imac5k_cached_link_aux_evidence &
+		   IMAC5K_CACHED_LINK_EVIDENCE_SOURCE_DPCD);
+	readback_ok = status == DC_OK &&
+		      table_revision[0] == expected_table_revision[0] &&
+		      table_revision[1] == expected_table_revision[1] &&
+		      table_revision[2] == expected_table_revision[2];
+	aconnector->imac5k_source_dpcd_programmed =
+		readback_ok || lower_write_evidence;
+	if (!readback_ok)
 		drm_info(dev,
-			 "IMAC5K: %s secondary source-DPCD lower-owner verify failed after Windows-route ok on %s link=%u status=%d 0x310=%02x %02x %02x expected=%02x %02x %02x\n",
+			 "IMAC5K: %s secondary source-DPCD lower-owner verify did not echo after Windows-route ok on %s link=%u status=%d 0x310=%02x %02x %02x expected=%02x %02x %02x lower_write_evidence=%u treating_programmed=%u\n",
 			 tag, aconnector->base.name, link->link_index, status,
 			 table_revision[0], table_revision[1], table_revision[2],
 			 expected_table_revision[0], expected_table_revision[1],
-			 expected_table_revision[2]);
+			 expected_table_revision[2], lower_write_evidence,
+			 aconnector->imac5k_source_dpcd_programmed);
 
 	drm_info(dev,
-		 "IMAC5K: %s secondary source-DPCD verify %s link=%u dce=%d live_sink=%u force=%u previously_programmed=%u dpcd10a_attempted=%u dpcd10a_asserted=%u dpcd111_seen=%u 0x111=%02x status_111=%d 0x310=%02x %02x %02x status=%d programmed=%u\n",
+		 "IMAC5K: %s secondary source-DPCD verify %s link=%u dce=%d live_sink=%u force=%u previously_programmed=%u dpcd10a_attempted=%u dpcd10a_asserted=%u dpcd111_seen=%u 0x111=%02x status_111=%d 0x310=%02x %02x %02x status=%d readback_ok=%u lower_write_evidence=%u programmed=%u\n",
 		 tag, aconnector->base.name, link->link_index,
 		 link->ctx->dce_version, !!link->local_sink, force,
 		 was_programmed, aconnector->imac5k_dpcd_10a_attempted,
 		 aconnector->imac5k_dpcd_10a_asserted,
 		 aconnector->imac5k_dpcd_111_asserted, mst_ctrl, mst_status,
 		 table_revision[0], table_revision[1], table_revision[2],
-		 status, aconnector->imac5k_source_dpcd_programmed);
+		 status, readback_ok, lower_write_evidence,
+		 aconnector->imac5k_source_dpcd_programmed);
 
 	amdgpu_dm_imac5k_log_secondary_stream_dpcd_state(aconnector, tag,
 							 "after-source-dpcd");
 
-	if (status == DC_OK && require_live_sink && !force)
+	if (aconnector->imac5k_source_dpcd_programmed &&
+	    require_live_sink && !force)
 		amdgpu_dm_imac5k_write_secondary_4f1_latch(aconnector, tag,
 							   IMAC5K_4F1_REQUIRE_LIVE_SINK |
 							   IMAC5K_4F1_SETTLE_AFTER_ATTEMPT);
