@@ -1852,29 +1852,29 @@ static void power_down_all_hw_blocks(struct dc *dc)
 	power_down_encoders(dc);
 	imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks", "after-encoders");
 
-	power_down_controllers(dc);
+	/*
+	 * iMac 5K: obs_21 proved the AtomBIOS enable_crtc(false) issued by
+	 * power_down_controllers (disable_crtc on the controller driving the
+	 * secondary tile) kills the secondary 0x3113 AUX. obs_20 proved the
+	 * clock-source teardown is also fatal. Skip both while the secondary
+	 * route is armed. The main path is the seamless-boot-equivalent skip
+	 * in dce110_enable_accelerated_mode; these inner skips are
+	 * defense-in-depth for the other caller (dce110_power_down). The
+	 * subsequent commit re-programs controllers and clock sources.
+	 */
+	if (preserve_imac5k)
+		imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks",
+				"controllers-skipped-imac5k-preserve");
+	else
+		power_down_controllers(dc);
 	imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks",
 				"after-controllers");
 
-	/*
-	 * iMac 5K: powering down the clock sources kills the preserved
-	 * secondary 0x3113 PHY clock (and with it AUX). obs_20 proved the
-	 * secondary survives power_down_encoders but is dead by the end of
-	 * this function; power_down_controllers only disables CRTCs, which
-	 * AUX does not depend on, so the clock-source teardown is the prime
-	 * suspect. Skip it while the secondary route is armed for
-	 * preservation; the subsequent commit re-programs clock sources.
-	 * power_down_controllers is left running but is per-TG instrumented
-	 * above so the next run still proves whether it was innocent.
-	 */
-	if (preserve_imac5k) {
-		dm_output_to_console(
-			"IMAC5K: power_down_all_hw_blocks skipping power_down_clock_sources (secondary preserve armed)\n");
+	if (preserve_imac5k)
 		imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks",
 				"clock-sources-skipped-imac5k-preserve");
-	} else {
+	else
 		power_down_clock_sources(dc);
-	}
 	imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks",
 				"after-clock-sources");
 
@@ -1897,6 +1897,17 @@ static void disable_vga_and_power_gate_all_controllers(
 	if (dc->caps.ips_support) {
 		imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate",
 					"exit-ips-support");
+		return;
+	}
+
+	/*
+	 * iMac 5K: defense-in-depth for the dce110_power_down caller. The
+	 * main enable_accelerated_mode path already skips this whole step
+	 * when the secondary route is armed; this guards the other caller.
+	 */
+	if (dp_imac5k_any_link_preserves_secondary_output(dc)) {
+		imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate",
+					"exit-imac5k-preserve");
 		return;
 	}
 
@@ -2038,6 +2049,7 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 	bool can_apply_seamless_boot = false;
 	bool keep_edp_vdd_on = false;
 	bool should_clean_dsc_block = true;
+	bool preserve_imac5k = dp_imac5k_any_link_preserves_secondary_output(dc);
 	struct dc_bios *dcb = dc->ctx->dc_bios;
 	DC_LOGGER_INIT();
 
@@ -2124,11 +2136,26 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 	keep_edp_vdd_on |= dc->is_switch_in_progress_dest;
 
 	dm_output_to_console(
-		"IMAC5K: enable_accelerated_mode can_apply_edp_fast_boot=%d can_apply_seamless_boot=%d keep_edp_vdd_on=%d edp_with_sink_num=%d\n",
+		"IMAC5K: enable_accelerated_mode can_apply_edp_fast_boot=%d can_apply_seamless_boot=%d keep_edp_vdd_on=%d edp_with_sink_num=%d preserve_imac5k=%d\n",
 		can_apply_edp_fast_boot, can_apply_seamless_boot,
-		keep_edp_vdd_on, edp_with_sink_num);
+		keep_edp_vdd_on, edp_with_sink_num, preserve_imac5k);
 
-	if (!can_apply_edp_fast_boot && !can_apply_seamless_boot) {
+	/*
+	 * iMac 5K: when the trained secondary 0x3113 route is armed for
+	 * preservation, take the seamless-boot-equivalent path and skip the
+	 * full destructive teardown entirely. obs_19/20/21 proved the
+	 * secondary does not survive any sub-step of it: power_down_encoders
+	 * (UNIPHY_D disable_output), power_down_controllers (AtomBIOS
+	 * enable_crtc(false) on the controller driving the secondary), and
+	 * the clock-source teardown. Guarding each sub-step individually is
+	 * whack-a-mole; the DC seamless-boot path already proves the whole
+	 * block can be skipped and the subsequent commit re-programs the
+	 * hardware. The per-sub-step guards added earlier are kept as
+	 * defense-in-depth for the other power_down_all_hw_blocks caller
+	 * (dce110_power_down).
+	 */
+	if (!can_apply_edp_fast_boot && !can_apply_seamless_boot &&
+	    !preserve_imac5k) {
 		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
 					"full-teardown-path-entry");
 
@@ -2175,6 +2202,10 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 
 		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
 					"full-teardown-path-exit");
+	} else if (preserve_imac5k &&
+		   !can_apply_edp_fast_boot && !can_apply_seamless_boot) {
+		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
+				"full-teardown-skipped-imac5k-preserve");
 	}
 	bios_set_scratch_acc_mode_change(dc->ctx->dc_bios, 1);
 
