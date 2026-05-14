@@ -236,6 +236,26 @@ bool dp_imac5k_link_preserves_secondary_output(const struct dc_link *link)
 	return link_should_preserve_imac5k_secondary_source_output(link);
 }
 
+/*
+ * True if any link in this dc currently needs the iMac 5K secondary 0x3113
+ * route preserved. Used by dc-wide teardown steps (clock sources, etc.) that
+ * cannot make a per-link decision.
+ */
+bool dp_imac5k_any_link_preserves_secondary_output(const struct dc *dc)
+{
+	unsigned int i;
+
+	if (!dc)
+		return false;
+
+	for (i = 0; i < dc->link_count; i++) {
+		if (link_should_preserve_imac5k_secondary_source_output(
+				dc->links[i]))
+			return true;
+	}
+	return false;
+}
+
 void dpcd_write_rx_power_ctrl(struct dc_link *link, bool on)
 {
 	uint8_t state;

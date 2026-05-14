@@ -76,4 +76,7 @@ void dp_imac5k_probe_peer_aux(struct dc_link *acting_link, const char *func,
  */
 bool dp_imac5k_link_preserves_secondary_output(const struct dc_link *link);
 
+/* dc-wide variant: true if any link needs the iMac 5K secondary preserved. */
+bool dp_imac5k_any_link_preserves_secondary_output(const struct dc *dc);
+
 #endif /* __DC_LINK_DP_PHY_H__ */

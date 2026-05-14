@@ -76,6 +76,8 @@ extern void dp_imac5k_probe_peer_aux(struct dc_link *acting_link,
 				     const char *func, const char *checkpoint);
 extern bool dp_imac5k_link_preserves_secondary_output(
 				     const struct dc_link *link);
+extern bool dp_imac5k_any_link_preserves_secondary_output(
+				     const struct dc *dc);
 
 #define GAMMA_HW_POINTS_NUM 256
 
@@ -1780,13 +1782,37 @@ static void power_down_encoders(struct dc *dc)
 	}
 }
 
+/*
+ * iMac 5K: probe every link at a named (func, checkpoint) pair so the next
+ * dmesg pins exactly which sub-step of the early teardown kills the
+ * preserved secondary 0x3113 route. No-op on non-iMac links.
+ */
+static void imac5k_hwseq_checkpoint(struct dc *dc, const char *func,
+				    const char *checkpoint)
+{
+	unsigned int i;
+
+	for (i = 0; i < dc->link_count; i++) {
+		dp_imac5k_log_phy_event(dc->links[i], func, checkpoint);
+		dp_imac5k_probe_peer_aux(dc->links[i], func, checkpoint);
+	}
+}
+
 static void power_down_controllers(struct dc *dc)
 {
 	int i;
 
 	for (i = 0; i < dc->res_pool->timing_generator_count; i++) {
+		char cp[48];
+
+		snprintf(cp, sizeof(cp), "before-disable-crtc-tg%d", i);
+		imac5k_hwseq_checkpoint(dc, "power_down_controllers", cp);
+
 		dc->res_pool->timing_generators[i]->funcs->disable_crtc(
 				dc->res_pool->timing_generators[i]);
+
+		snprintf(cp, sizeof(cp), "after-disable-crtc-tg%d", i);
+		imac5k_hwseq_checkpoint(dc, "power_down_controllers", cp);
 	}
 }
 
@@ -1794,41 +1820,69 @@ static void power_down_clock_sources(struct dc *dc)
 {
 	int i;
 
+	imac5k_hwseq_checkpoint(dc, "power_down_clock_sources",
+				"before-dp-clock-source");
 	if (dc->res_pool->dp_clock_source->funcs->cs_power_down(
 		dc->res_pool->dp_clock_source) == false)
 		dm_error("Failed to power down pll! (dp clk src)\n");
+	imac5k_hwseq_checkpoint(dc, "power_down_clock_sources",
+				"after-dp-clock-source");
 
 	for (i = 0; i < dc->res_pool->clk_src_count; i++) {
+		char cp[48];
+
+		snprintf(cp, sizeof(cp), "before-clock-source-%d", i);
+		imac5k_hwseq_checkpoint(dc, "power_down_clock_sources", cp);
+
 		if (dc->res_pool->clock_sources[i]->funcs->cs_power_down(
 				dc->res_pool->clock_sources[i]) == false)
 			dm_error("Failed to power down pll! (clk src index=%d)\n", i);
+
+		snprintf(cp, sizeof(cp), "after-clock-source-%d", i);
+		imac5k_hwseq_checkpoint(dc, "power_down_clock_sources", cp);
 	}
 }
 
 static void power_down_all_hw_blocks(struct dc *dc)
 {
-	unsigned int i;
+	bool preserve_imac5k = dp_imac5k_any_link_preserves_secondary_output(dc);
+
+	imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks", "entry");
 
 	power_down_encoders(dc);
+	imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks", "after-encoders");
 
 	power_down_controllers(dc);
+	imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks",
+				"after-controllers");
 
-	power_down_clock_sources(dc);
+	/*
+	 * iMac 5K: powering down the clock sources kills the preserved
+	 * secondary 0x3113 PHY clock (and with it AUX). obs_20 proved the
+	 * secondary survives power_down_encoders but is dead by the end of
+	 * this function; power_down_controllers only disables CRTCs, which
+	 * AUX does not depend on, so the clock-source teardown is the prime
+	 * suspect. Skip it while the secondary route is armed for
+	 * preservation; the subsequent commit re-programs clock sources.
+	 * power_down_controllers is left running but is per-TG instrumented
+	 * above so the next run still proves whether it was innocent.
+	 */
+	if (preserve_imac5k) {
+		dm_output_to_console(
+			"IMAC5K: power_down_all_hw_blocks skipping power_down_clock_sources (secondary preserve armed)\n");
+		imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks",
+				"clock-sources-skipped-imac5k-preserve");
+	} else {
+		power_down_clock_sources(dc);
+	}
+	imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks",
+				"after-clock-sources");
 
 	if (dc->fbc_compressor)
 		dc->fbc_compressor->funcs->disable_fbc(dc->fbc_compressor);
 
-	/*
-	 * iMac 5K: confirm the secondary 0x3113 route survived the full
-	 * power-down sequence (encoders + controllers + clock sources).
-	 * If it is alive here but dies later, the killer is downstream.
-	 */
-	for (i = 0; i < dc->link_count; i++) {
-		dp_imac5k_log_phy_event(dc->links[i], "power_down_all_hw_blocks",
-					"sequence-complete");
-		dp_imac5k_probe_peer_aux(dc->links[i], "power_down_all_hw_blocks",
-					 "sequence-complete");
-	}
+	imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks",
+				"sequence-complete");
 }
 
 static void disable_vga_and_power_gate_all_controllers(
@@ -1838,25 +1892,45 @@ static void disable_vga_and_power_gate_all_controllers(
 	struct timing_generator *tg;
 	struct dc_context *ctx = dc->ctx;
 
-	if (dc->caps.ips_support)
+	imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate", "entry");
+
+	if (dc->caps.ips_support) {
+		imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate",
+					"exit-ips-support");
 		return;
+	}
 
 	for (i = 0; i < dc->res_pool->timing_generator_count; i++) {
+		char cp[48];
+
 		tg = dc->res_pool->timing_generators[i];
 
 		if (tg->funcs->disable_vga)
 			tg->funcs->disable_vga(tg);
+
+		snprintf(cp, sizeof(cp), "after-disable-vga-tg%d", i);
+		imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate", cp);
 	}
 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+		char cp[48];
+
 		/* Enable CLOCK gating for each pipe BEFORE controller
 		 * powergating. */
 		enable_display_pipe_clock_gating(ctx,
 				true);
 
+		snprintf(cp, sizeof(cp), "before-disable-plane-pipe%d", i);
+		imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate", cp);
+
 		dc->current_state->res_ctx.pipe_ctx[i].pipe_idx = i;
 		dc->hwss.disable_plane(dc, dc->current_state,
 			&dc->current_state->res_ctx.pipe_ctx[i]);
+
+		snprintf(cp, sizeof(cp), "after-disable-plane-pipe%d", i);
+		imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate", cp);
 	}
+
+	imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate", "exit");
 }
 
 
@@ -1968,11 +2042,16 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 	DC_LOGGER_INIT();
 
 
+	imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode", "entry");
+
 	get_edp_links_with_sink(dc, edp_links_with_sink, &edp_with_sink_num);
 	dc_get_edp_links(dc, edp_links, &edp_num);
 
 	if (hws->funcs.init_pipes)
 		hws->funcs.init_pipes(dc, context);
+
+	imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
+				"after-init-pipes");
 
 	get_edp_streams(context, edp_streams, &edp_stream_num);
 
@@ -2044,7 +2123,15 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 	// the link via a DPCD SET_POWER write causes a brief flash
 	keep_edp_vdd_on |= dc->is_switch_in_progress_dest;
 
+	dm_output_to_console(
+		"IMAC5K: enable_accelerated_mode can_apply_edp_fast_boot=%d can_apply_seamless_boot=%d keep_edp_vdd_on=%d edp_with_sink_num=%d\n",
+		can_apply_edp_fast_boot, can_apply_seamless_boot,
+		keep_edp_vdd_on, edp_with_sink_num);
+
 	if (!can_apply_edp_fast_boot && !can_apply_seamless_boot) {
+		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
+					"full-teardown-path-entry");
+
 		if (edp_link_with_sink && !keep_edp_vdd_on) {
 			/*turn off backlight before DP_blank and encoder powered down*/
 			hws->funcs.edp_backlight_control(edp_link_with_sink, false);
@@ -2053,7 +2140,13 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 		if (dcb && dcb->funcs && !dcb->funcs->is_accelerated_mode(dcb))
 			clk_mgr_exit_optimized_pwr_state(dc, dc->clk_mgr);
 
+		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
+					"before-power-down-all-hw-blocks");
+
 		power_down_all_hw_blocks(dc);
+
+		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
+					"after-power-down-all-hw-blocks");
 
 		/* DSC could be enabled on eDP during VBIOS post.
 		 * To clean up dsc blocks if all eDP dpms_off is true.
@@ -2067,13 +2160,25 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 		if (should_clean_dsc_block)
 			clean_up_dsc_blocks(dc);
 
+		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
+					"after-clean-up-dsc-blocks");
+
 		disable_vga_and_power_gate_all_controllers(dc);
+
+		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
+					"after-disable-vga-and-power-gate");
+
 		if (edp_link_with_sink && !keep_edp_vdd_on)
 			dc->hwss.edp_power_control(edp_link_with_sink, false);
 		if (dcb && dcb->funcs && !dcb->funcs->is_accelerated_mode(dcb))
 			clk_mgr_optimize_pwr_state(dc, dc->clk_mgr);
+
+		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
+					"full-teardown-path-exit");
 	}
 	bios_set_scratch_acc_mode_change(dc->ctx->dc_bios, 1);
+
+	imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode", "exit");
 }
 
 static uint32_t compute_pstate_blackout_duration(
