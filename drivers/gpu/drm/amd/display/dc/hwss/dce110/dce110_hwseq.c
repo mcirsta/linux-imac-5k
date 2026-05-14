@@ -74,6 +74,8 @@ extern void dp_imac5k_log_phy_event(struct dc_link *link, const char *func,
 				    const char *checkpoint);
 extern void dp_imac5k_probe_peer_aux(struct dc_link *acting_link,
 				     const char *func, const char *checkpoint);
+extern bool dp_imac5k_link_preserves_secondary_output(
+				     const struct dc_link *link);
 
 #define GAMMA_HW_POINTS_NUM 256
 
@@ -1732,6 +1734,21 @@ static void power_down_encoders(struct dc *dc)
 		dp_imac5k_probe_peer_aux(link, "power_down_encoders",
 					 "iter-entry");
 
+		/*
+		 * iMac 5K: the trained secondary 0x3113 route must survive
+		 * accelerated-mode entry. This loop bypasses
+		 * dp_disable_link_phy() and would otherwise power down
+		 * UNIPHY_D (killing AUX) and clear cur_link_settings, even
+		 * though the preservation conditions are armed.
+		 */
+		if (dp_imac5k_link_preserves_secondary_output(link)) {
+			dp_imac5k_log_phy_event(link, "power_down_encoders",
+						"iter-skip-preserved");
+			dp_imac5k_probe_peer_aux(link, "power_down_encoders",
+						 "iter-skip-preserved");
+			continue;
+		}
+
 		dc->link_srv->blank_dp_stream(link, false);
 		if (signal != SIGNAL_TYPE_EDP)
 			signal = SIGNAL_TYPE_NONE;
@@ -1790,6 +1807,8 @@ static void power_down_clock_sources(struct dc *dc)
 
 static void power_down_all_hw_blocks(struct dc *dc)
 {
+	unsigned int i;
+
 	power_down_encoders(dc);
 
 	power_down_controllers(dc);
@@ -1798,6 +1817,18 @@ static void power_down_all_hw_blocks(struct dc *dc)
 
 	if (dc->fbc_compressor)
 		dc->fbc_compressor->funcs->disable_fbc(dc->fbc_compressor);
+
+	/*
+	 * iMac 5K: confirm the secondary 0x3113 route survived the full
+	 * power-down sequence (encoders + controllers + clock sources).
+	 * If it is alive here but dies later, the killer is downstream.
+	 */
+	for (i = 0; i < dc->link_count; i++) {
+		dp_imac5k_log_phy_event(dc->links[i], "power_down_all_hw_blocks",
+					"sequence-complete");
+		dp_imac5k_probe_peer_aux(dc->links[i], "power_down_all_hw_blocks",
+					 "sequence-complete");
+	}
 }
 
 static void disable_vga_and_power_gate_all_controllers(

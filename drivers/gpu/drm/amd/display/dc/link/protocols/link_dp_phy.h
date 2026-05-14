@@ -69,4 +69,11 @@ void dp_imac5k_log_phy_event(struct dc_link *link, const char *func,
 void dp_imac5k_probe_peer_aux(struct dc_link *acting_link, const char *func,
 			      const char *checkpoint);
 
+/*
+ * Returns true when the trained iMac 5K secondary 0x3113 route must be
+ * preserved (transmitter / link state left intact). Used by hw-sequencer
+ * teardown paths that do not route through dp_disable_link_phy().
+ */
+bool dp_imac5k_link_preserves_secondary_output(const struct dc_link *link);
+
 #endif /* __DC_LINK_DP_PHY_H__ */

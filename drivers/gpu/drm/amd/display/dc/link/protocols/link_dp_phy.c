@@ -226,6 +226,16 @@ static bool link_should_preserve_imac5k_secondary_source_output(
 	       !link->imac5k_cached_link_handoff_consumed;
 }
 
+/*
+ * Public wrapper so hw-sequencer paths that bypass dp_disable_link_phy()
+ * (e.g. dce110 power_down_encoders()) can honour the same preservation
+ * decision for the trained iMac 5K secondary 0x3113 route.
+ */
+bool dp_imac5k_link_preserves_secondary_output(const struct dc_link *link)
+{
+	return link_should_preserve_imac5k_secondary_source_output(link);
+}
+
 void dpcd_write_rx_power_ctrl(struct dc_link *link, bool on)
 {
 	uint8_t state;
