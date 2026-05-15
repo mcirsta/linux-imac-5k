@@ -783,6 +783,35 @@ struct amdgpu_display_manager {
 	bool imac5k_plain_boot_candidate_seen;
 
 	/**
+	 * @imac5k_primary_4f1_probe_done:
+	 *
+	 * One-shot latch for the Track-C debug probe that writes sink DPCD 0x4F1
+	 * once on the primary AUX route to test whether it wakes secondary
+	 * 0x3113 AUX/HPD. Stays set for the lifetime of the boot once the probe
+	 * has fired (or has been skipped after passing the gate).
+	 */
+	bool imac5k_primary_4f1_probe_done;
+
+	/**
+	 * @imac5k_primary_4f1_probe_followup:
+	 *
+	 * Delayed-work hook used by the Track-C probe to take a second
+	 * post-write snapshot of the secondary route ~100 ms after the primary
+	 * 0x4F1=1 write. Initialised in amdgpu_dm_init() and cancelled in
+	 * amdgpu_dm_fini().
+	 */
+	struct delayed_work imac5k_primary_4f1_probe_followup;
+
+	/**
+	 * @imac5k_primary_4f1_probe_secondary:
+	 *
+	 * Cached secondary aconnector captured at probe-trigger time so the
+	 * delayed follow-up snapshot can reach the right dc_link without
+	 * walking connectors under a delayed-work context.
+	 */
+	struct amdgpu_dm_connector *imac5k_primary_4f1_probe_secondary;
+
+	/**
 	 * @dpia_aux_lock:
 	 *
 	 * Guards access to DPIA AUX

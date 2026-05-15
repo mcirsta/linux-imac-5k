@@ -169,6 +169,7 @@ MODULE_FIRMWARE(FIRMWARE_DCN_401_DMUB);
 /* basic init/fini API */
 static int amdgpu_dm_init(struct amdgpu_device *adev);
 static void amdgpu_dm_fini(struct amdgpu_device *adev);
+static void amdgpu_dm_imac5k_primary_4f1_probe_followup_work(struct work_struct *work);
 static bool is_freesync_video_mode(const struct drm_display_mode *mode, struct amdgpu_dm_connector *aconnector);
 static void reset_freesync_config_for_crtc(struct dm_crtc_state *new_crtc_state);
 static struct amdgpu_i2c_adapter *
@@ -2010,6 +2011,8 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
 		init_data.num_virtual_links = 1;
 
 	retrieve_dmi_info(&adev->dm);
+	INIT_DELAYED_WORK(&adev->dm.imac5k_primary_4f1_probe_followup,
+			  amdgpu_dm_imac5k_primary_4f1_probe_followup_work);
 	if (adev->dm.edp0_on_dp1_quirk)
 		init_data.flags.support_edp0_on_dp1 = true;
 
@@ -2231,6 +2234,9 @@ static int amdgpu_dm_early_fini(struct amdgpu_ip_block *ip_block)
 static void amdgpu_dm_fini(struct amdgpu_device *adev)
 {
 	int i;
+
+	cancel_delayed_work_sync(&adev->dm.imac5k_primary_4f1_probe_followup);
+	adev->dm.imac5k_primary_4f1_probe_secondary = NULL;
 
 	if (adev->dm.vblank_control_workqueue) {
 		destroy_workqueue(adev->dm.vblank_control_workqueue);
@@ -3459,6 +3465,19 @@ static void apply_delay_after_dpcd_poweroff(struct amdgpu_device *adev,
 #define IMAC5K_PRIMARY_DDC_HW_CHANNEL   IMAC5K_PRIMARY_DDC_LINE
 #define IMAC5K_SECONDARY_TRANSMITTER   TRANSMITTER_UNIPHY_D
 #define IMAC5K_PRIMARY_TRANSMITTER     TRANSMITTER_UNIPHY_C
+
+/* Track-C primary-0x4F1 probe timings (firmware: CoreEG2 stalls 10 ms after
+ * the root-side 0x4F1=1 send; we mirror that, then take a late snapshot to
+ * catch a delayed sibling-AUX wake).
+ */
+#define IMAC5K_PRIMARY_PROBE_POST_WRITE_MS 10
+#define IMAC5K_PRIMARY_PROBE_FOLLOWUP_MS   100
+/* Apple iMac19,1 plain-boot fallback indicator: primary phys size 600x340 mm.
+ * RE_5K_iMac19_1_CURRENT.md "Magic Number Registry" / cold-boot plan entry
+ * conditions.
+ */
+#define IMAC5K_FALLBACK_PHYS_WIDTH_MM  600
+#define IMAC5K_FALLBACK_PHYS_HEIGHT_MM 340
 
 static unsigned int amdgpu_dm_imac5k_raw_object_id(struct graphics_object_id id)
 {
@@ -4716,6 +4735,268 @@ static void amdgpu_dm_imac5k_mark_secondary_head(struct amdgpu_dm_connector *aco
 	amdgpu_dm_imac5k_apply_secondary_tile_property(aconnector);
 }
 
+/*
+ * Track-C primary-0x4F1 probe: cold-boot plan stage "Immediate Experiment:
+ * primary_4f1_probe" (RE_5K_cold_boot_enable_plan.md lines 319-411). One-shot
+ * per boot, fires unconditionally on iMac19,1 plain-boot fallback once the
+ * iMac scaffold quirk is armed and no OCLP-style secondary was detected. The
+ * probe reproduces CoreEg2ComplexDisplayInit's root-side opcode 1265 / DPCD
+ * 0x4F1 pulse on the primary route and re-snapshots the secondary 0x3113
+ * dc_link state at +10ms and +100ms to see whether sibling AUX/HPD wakes.
+ */
+
+static void amdgpu_dm_imac5k_primary_4f1_probe_log_secondary(
+		struct drm_device *dev,
+		struct amdgpu_dm_connector *secondary,
+		const char *label)
+{
+	struct dc_link *link;
+	enum dc_status status_4f1 = DC_ERROR_UNEXPECTED;
+	enum dc_status status_000 = DC_ERROR_UNEXPECTED;
+	u8 dpcd_4f1 = 0xff;
+	u8 dpcd_000 = 0xff;
+	bool hpd_hw = false;
+
+	if (!dev || !secondary || !secondary->dc_link) {
+		drm_info(dev ? dev : NULL,
+			 "IMAC5K: primary_4f1_probe %s secondary unavailable connector=%s\n",
+			 label, secondary ? secondary->base.name : "<none>");
+		return;
+	}
+
+	link = secondary->dc_link;
+	if (link->dc && link->dc->link_srv)
+		hpd_hw = dc_link_get_hpd_state(link);
+
+	status_4f1 = core_link_read_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+					 &dpcd_4f1, sizeof(dpcd_4f1));
+	status_000 = core_link_read_dpcd(link, DP_DPCD_REV,
+					 &dpcd_000, sizeof(dpcd_000));
+
+	drm_info(dev,
+		 "IMAC5K: primary_4f1_probe %s secondary connector=%s link=%u aux_mode=%u hpd_status=%u hpd_hw=%u local_sink=%p sink_edid_len=%u dpcd000=%02x status000=%d dpcd4f1=%02x status4f1=%d\n",
+		 label, secondary->base.name, link->link_index, link->aux_mode,
+		 link->hpd_status, hpd_hw, link->local_sink,
+		 link->local_sink ? link->local_sink->dc_edid.length : 0,
+		 dpcd_000, status_000, dpcd_4f1, status_4f1);
+}
+
+static void amdgpu_dm_imac5k_primary_4f1_probe_followup_work(struct work_struct *work)
+{
+	struct amdgpu_display_manager *dm = container_of(to_delayed_work(work),
+			struct amdgpu_display_manager,
+			imac5k_primary_4f1_probe_followup);
+	struct amdgpu_dm_connector *secondary;
+	struct drm_device *dev;
+
+	secondary = dm->imac5k_primary_4f1_probe_secondary;
+	if (!secondary || !secondary->base.dev)
+		return;
+
+	dev = secondary->base.dev;
+	amdgpu_dm_imac5k_primary_4f1_probe_log_secondary(dev, secondary,
+							 "after100");
+
+	/*
+	 * If the post-write snapshot shows secondary AUX has come alive
+	 * (sink populated, or DPCD read returns DC_OK), schedule the normal
+	 * Linux re-detect so the connector flips to Connected without us
+	 * having to call dc_link_detect from this work directly. The HPD
+	 * helper handles the proper locking.
+	 */
+	if (secondary->dc_link && secondary->dc_link->aux_mode) {
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe redetect secondary connector=%s aux_mode=%u local_sink=%p; deferring to normal Linux detect path\n",
+			 secondary->base.name,
+			 secondary->dc_link->aux_mode,
+			 secondary->dc_link->local_sink);
+	}
+}
+
+static bool amdgpu_dm_imac5k_primary_fallback_detected(
+		struct amdgpu_dm_connector *primary,
+		struct amdgpu_dm_connector *secondary)
+{
+	const struct drm_connector *connector;
+	bool size_indicator = false;
+	bool no_secondary_sink;
+
+	if (!primary)
+		return false;
+
+	connector = &primary->base;
+	if (connector->display_info.width_mm == IMAC5K_FALLBACK_PHYS_WIDTH_MM &&
+	    connector->display_info.height_mm == IMAC5K_FALLBACK_PHYS_HEIGHT_MM)
+		size_indicator = true;
+
+	no_secondary_sink = !secondary || !secondary->dc_link ||
+			    !secondary->dc_link->local_sink;
+
+	return size_indicator || no_secondary_sink;
+}
+
+static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *aconnector)
+{
+	struct amdgpu_display_manager *dm;
+	struct amdgpu_dm_connector *secondary;
+	struct drm_device *dev;
+	struct dc_link *link;
+	enum dc_status status;
+	enum dc_status retry_status = DC_ERROR_UNEXPECTED;
+	enum dc_status before_status;
+	enum dc_status after_status;
+	u8 dpcd_4f1_before = 0xff;
+	u8 dpcd_4f1_after = 0xff;
+	u8 payload = 1;
+	bool retried = false;
+	bool fallback;
+	bool route_ok;
+
+	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
+		return;
+
+	dm = &drm_to_adev(aconnector->base.dev)->dm;
+	dev = aconnector->base.dev;
+	link = aconnector->dc_link;
+
+	if (!dm->imac5k_plain_boot_route_probe_quirk) {
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe gate connector=%s reason=scaffold-not-armed\n",
+			 aconnector->base.name);
+		return;
+	}
+
+	if (dm->imac5k_secondary_head_detected) {
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe gate connector=%s reason=oclp-style-secondary-already-detected\n",
+			 aconnector->base.name);
+		return;
+	}
+
+	if (dm->imac5k_primary_4f1_probe_done) {
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe gate connector=%s reason=already-fired-this-boot\n",
+			 aconnector->base.name);
+		return;
+	}
+
+	if (!amdgpu_dm_imac5k_is_primary_head(aconnector)) {
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe gate connector=%s reason=not-primary-head\n",
+			 aconnector->base.name);
+		return;
+	}
+
+	secondary = amdgpu_dm_imac5k_find_secondary_head(dev);
+	fallback = amdgpu_dm_imac5k_primary_fallback_detected(aconnector, secondary);
+	if (!fallback) {
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe gate connector=%s reason=no-fallback-indicator phys=%ux%u secondary_sink=%p\n",
+			 aconnector->base.name,
+			 aconnector->base.display_info.width_mm,
+			 aconnector->base.display_info.height_mm,
+			 secondary && secondary->dc_link ?
+				secondary->dc_link->local_sink : NULL);
+		return;
+	}
+
+	route_ok = amdgpu_dm_imac5k_verify_windows_route(dev, link,
+			"primary_4f1_probe", aconnector->base.name, false,
+			"primary-0x4F1");
+	if (!route_ok) {
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe gate connector=%s reason=primary-route-mismatch\n",
+			 aconnector->base.name);
+		return;
+	}
+
+	if (!link->ctx) {
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe gate connector=%s reason=missing-dc-ctx\n",
+			 aconnector->base.name);
+		return;
+	}
+
+	/* All gates passed; latch immediately so we never retry within one boot
+	 * even if the writes below fail.
+	 */
+	dm->imac5k_primary_4f1_probe_done = true;
+	dm->imac5k_primary_4f1_probe_secondary = secondary;
+
+	drm_info(dev,
+		 "IMAC5K: primary_4f1_probe gate connector=%s pass; phys=%ux%u secondary=%s secondary_sink=%p\n",
+		 aconnector->base.name,
+		 aconnector->base.display_info.width_mm,
+		 aconnector->base.display_info.height_mm,
+		 secondary ? secondary->base.name : "<none>",
+		 secondary && secondary->dc_link ?
+			secondary->dc_link->local_sink : NULL);
+
+	amdgpu_dm_log_link_route(dev, link, "primary_4f1_probe",
+				 aconnector->base.name, link->link_index, true);
+	drm_info(dev,
+		 "IMAC5K: primary_4f1_probe before primary connector=%s link=%u aux_mode=%u hpd_status=%u local_sink=%p sink_edid_len=%u\n",
+		 aconnector->base.name, link->link_index, link->aux_mode,
+		 link->hpd_status, link->local_sink,
+		 link->local_sink ? link->local_sink->dc_edid.length : 0);
+
+	if (secondary)
+		amdgpu_dm_imac5k_primary_4f1_probe_log_secondary(dev, secondary,
+								 "before");
+	else
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe before secondary connector=<absent>\n");
+
+	before_status = core_link_read_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+					    &dpcd_4f1_before, sizeof(dpcd_4f1_before));
+	drm_info(dev,
+		 "IMAC5K: primary_4f1_probe read 0x4f1 primary connector=%s link=%u value=%02x status=%d\n",
+		 aconnector->base.name, link->link_index, dpcd_4f1_before,
+		 before_status);
+
+	status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+				      &payload, sizeof(payload));
+	drm_info(dev,
+		 "IMAC5K: primary_4f1_probe write 0x4f1 primary connector=%s link=%u payload=%u status=%d\n",
+		 aconnector->base.name, link->link_index, payload, status);
+
+	if (status != DC_OK) {
+		msleep(IMAC5K_DPCD_WRITE_RETRY_MS);
+		retry_status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+						    &payload, sizeof(payload));
+		retried = true;
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe retry 0x4f1 primary connector=%s link=%u payload=%u status=%d\n",
+			 aconnector->base.name, link->link_index, payload,
+			 retry_status);
+		if (retry_status == DC_OK)
+			status = DC_OK;
+	}
+
+	msleep(IMAC5K_PRIMARY_PROBE_POST_WRITE_MS);
+
+	after_status = core_link_read_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+					   &dpcd_4f1_after, sizeof(dpcd_4f1_after));
+	drm_info(dev,
+		 "IMAC5K: primary_4f1_probe read 0x4f1 primary connector=%s link=%u value=%02x status=%d after_write\n",
+		 aconnector->base.name, link->link_index, dpcd_4f1_after,
+		 after_status);
+
+	if (secondary)
+		amdgpu_dm_imac5k_primary_4f1_probe_log_secondary(dev, secondary,
+								 "after10");
+
+	if (secondary)
+		schedule_delayed_work(&dm->imac5k_primary_4f1_probe_followup,
+				      msecs_to_jiffies(IMAC5K_PRIMARY_PROBE_FOLLOWUP_MS));
+
+	drm_info(dev,
+		 "IMAC5K: primary_4f1_probe result connector=%s link=%u write_status=%d retried=%u dpcd4f1_before=%02x dpcd4f1_after=%02x secondary_present=%u followup_ms=%u\n",
+		 aconnector->base.name, link->link_index, status, retried,
+		 dpcd_4f1_before, dpcd_4f1_after, !!secondary,
+		 secondary ? IMAC5K_PRIMARY_PROBE_FOLLOWUP_MS : 0);
+}
+
 static void amdgpu_dm_imac5k_note_plain_boot_candidate(struct amdgpu_dm_connector *aconnector)
 {
 	struct amdgpu_display_manager *dm;
@@ -4740,6 +5021,9 @@ static void amdgpu_dm_imac5k_note_plain_boot_candidate(struct amdgpu_dm_connecto
 	drm_info(dev,
 		 "IMAC5K: Stage2 real-route candidate observed on %s; primary internal tile is present without a preserved secondary 0x3113 head\n",
 		 aconnector->base.name);
+
+	/* Track-C: optionally fire the one-shot primary-0x4F1 probe. */
+	amdgpu_dm_imac5k_primary_4f1_probe_once(aconnector);
 }
 
 static bool amdgpu_dm_imac5k_should_suppress_secondary_false_disconnect(

@@ -190,6 +190,8 @@ void retrieve_dmi_info(struct amdgpu_display_manager *dm)
 	dm->imac5k_stream_drop_attempts = 0;
 	dm->imac5k_primary_only_deferrals = 0;
 	dm->imac5k_plain_boot_candidate_seen = false;
+	dm->imac5k_primary_4f1_probe_done = false;
+	dm->imac5k_primary_4f1_probe_secondary = NULL;
 
 	dmi_id = dmi_check_system(dmi_quirk_table);
 
