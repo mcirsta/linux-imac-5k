@@ -3472,13 +3472,6 @@ static void apply_delay_after_dpcd_poweroff(struct amdgpu_device *adev,
  */
 #define IMAC5K_PRIMARY_PROBE_POST_WRITE_MS 10
 #define IMAC5K_PRIMARY_PROBE_FOLLOWUP_MS   100
-/* Apple iMac19,1 plain-boot fallback indicator: primary phys size 600x340 mm.
- * RE_5K_iMac19_1_CURRENT.md "Magic Number Registry" / cold-boot plan entry
- * conditions.
- */
-#define IMAC5K_FALLBACK_PHYS_WIDTH_MM  600
-#define IMAC5K_FALLBACK_PHYS_HEIGHT_MM 340
-
 static unsigned int amdgpu_dm_imac5k_raw_object_id(struct graphics_object_id id)
 {
 	return dal_graphics_object_id_to_uint(id);
@@ -4006,6 +3999,90 @@ static bool amdgpu_dm_imac5k_is_primary_head(const struct amdgpu_dm_connector *a
 		amdgpu_dm_imac5k_panel_geometry_match(aconnector)) &&
 	       aconnector->base.connector_type == DRM_MODE_CONNECTOR_eDP &&
 	       aconnector->dc_link->connector_signal == SIGNAL_TYPE_EDP;
+}
+
+/*
+ * Track-C helper: structural-only primary-route identity. Unlike
+ * is_primary_head() (which requires either tiled state or per-tile geometry),
+ * this matches the iMac 0x3114 / eDP route in any state — including the
+ * plain-boot 4K fallback where the panel reports as a single 600x340 mm
+ * display and has no tile metadata.
+ */
+static bool amdgpu_dm_imac5k_is_primary_route(const struct amdgpu_dm_connector *aconnector)
+{
+	unsigned int raw_obj;
+
+	if (!aconnector || !aconnector->dc_link)
+		return false;
+	if (aconnector->base.connector_type != DRM_MODE_CONNECTOR_eDP)
+		return false;
+	if (aconnector->dc_link->connector_signal != SIGNAL_TYPE_EDP)
+		return false;
+
+	raw_obj = amdgpu_dm_imac5k_raw_object_id(aconnector->dc_link->link_id);
+	return raw_obj == IMAC5K_WIN_PRIMARY_OBJECT_ID;
+}
+
+static struct amdgpu_dm_connector *
+amdgpu_dm_imac5k_find_primary_route(struct drm_device *dev)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	struct amdgpu_dm_connector *primary = NULL;
+	unsigned int visited = 0;
+
+	if (!dev)
+		return NULL;
+
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		struct amdgpu_dm_connector *candidate;
+		struct dc_link *link;
+		unsigned int raw_obj = 0;
+		int signal = 0;
+		bool type_ok;
+		bool signal_ok;
+		bool obj_ok;
+		bool match;
+
+		visited++;
+
+		if (connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK) {
+			drm_info(dev,
+				 "IMAC5K: primary_4f1_probe find_primary_route iter connector=%s type=%d skipped=writeback\n",
+				 connector->name, connector->connector_type);
+			continue;
+		}
+
+		candidate = to_amdgpu_dm_connector(connector);
+		link = candidate ? candidate->dc_link : NULL;
+		if (link) {
+			signal = link->connector_signal;
+			raw_obj = amdgpu_dm_imac5k_raw_object_id(link->link_id);
+		}
+
+		type_ok = connector->connector_type == DRM_MODE_CONNECTOR_eDP;
+		signal_ok = link && signal == SIGNAL_TYPE_EDP;
+		obj_ok = link && raw_obj == IMAC5K_WIN_PRIMARY_OBJECT_ID;
+		match = amdgpu_dm_imac5k_is_primary_route(candidate);
+
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe find_primary_route iter connector=%s type=%d dc_link=%p signal=%d raw_obj=0x%x type_ok=%u signal_ok=%u obj_ok=%u match=%u\n",
+			 connector->name, connector->connector_type, link,
+			 signal, raw_obj, type_ok, signal_ok, obj_ok, match);
+
+		if (match) {
+			primary = candidate;
+			break;
+		}
+	}
+	drm_connector_list_iter_end(&iter);
+
+	drm_info(dev,
+		 "IMAC5K: primary_4f1_probe find_primary_route result connector=%s visited=%u\n",
+		 primary ? primary->base.name : "<none>", visited);
+
+	return primary;
 }
 
 static bool amdgpu_dm_imac5k_is_secondary_head(const struct amdgpu_dm_connector *aconnector)
@@ -4813,28 +4890,6 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_followup_work(struct work_struct 
 	}
 }
 
-static bool amdgpu_dm_imac5k_primary_fallback_detected(
-		struct amdgpu_dm_connector *primary,
-		struct amdgpu_dm_connector *secondary)
-{
-	const struct drm_connector *connector;
-	bool size_indicator = false;
-	bool no_secondary_sink;
-
-	if (!primary)
-		return false;
-
-	connector = &primary->base;
-	if (connector->display_info.width_mm == IMAC5K_FALLBACK_PHYS_WIDTH_MM &&
-	    connector->display_info.height_mm == IMAC5K_FALLBACK_PHYS_HEIGHT_MM)
-		size_indicator = true;
-
-	no_secondary_sink = !secondary || !secondary->dc_link ||
-			    !secondary->dc_link->local_sink;
-
-	return size_indicator || no_secondary_sink;
-}
-
 static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *aconnector)
 {
 	struct amdgpu_display_manager *dm;
@@ -4849,8 +4904,6 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 	u8 dpcd_4f1_after = 0xff;
 	u8 payload = 1;
 	bool retried = false;
-	bool fallback;
-	bool route_ok;
 
 	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
 		return;
@@ -4859,16 +4912,19 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 	dev = aconnector->base.dev;
 	link = aconnector->dc_link;
 
+	/*
+	 * Minimal-gate Track-C probe. Only the gates below are correctness
+	 * requirements; everything else (fallback indicators, OCLP-vs-plain
+	 * detection, route match) is dropped so the probe fires on every
+	 * iMac19,1 boot where the primary AUX is reachable. The 0x4F1=1 byte
+	 * (= "arm" per the firmware decode) is the same byte Apple firmware
+	 * and Windows write routinely; re-asserting it on an already-armed
+	 * state is a no-op on this panel.
+	 */
+
 	if (!dm->imac5k_plain_boot_route_probe_quirk) {
 		drm_info(dev,
 			 "IMAC5K: primary_4f1_probe gate connector=%s reason=scaffold-not-armed\n",
-			 aconnector->base.name);
-		return;
-	}
-
-	if (dm->imac5k_secondary_head_detected) {
-		drm_info(dev,
-			 "IMAC5K: primary_4f1_probe gate connector=%s reason=oclp-style-secondary-already-detected\n",
 			 aconnector->base.name);
 		return;
 	}
@@ -4880,32 +4936,9 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 		return;
 	}
 
-	if (!amdgpu_dm_imac5k_is_primary_head(aconnector)) {
+	if (!amdgpu_dm_imac5k_is_primary_route(aconnector)) {
 		drm_info(dev,
-			 "IMAC5K: primary_4f1_probe gate connector=%s reason=not-primary-head\n",
-			 aconnector->base.name);
-		return;
-	}
-
-	secondary = amdgpu_dm_imac5k_find_secondary_head(dev);
-	fallback = amdgpu_dm_imac5k_primary_fallback_detected(aconnector, secondary);
-	if (!fallback) {
-		drm_info(dev,
-			 "IMAC5K: primary_4f1_probe gate connector=%s reason=no-fallback-indicator phys=%ux%u secondary_sink=%p\n",
-			 aconnector->base.name,
-			 aconnector->base.display_info.width_mm,
-			 aconnector->base.display_info.height_mm,
-			 secondary && secondary->dc_link ?
-				secondary->dc_link->local_sink : NULL);
-		return;
-	}
-
-	route_ok = amdgpu_dm_imac5k_verify_windows_route(dev, link,
-			"primary_4f1_probe", aconnector->base.name, false,
-			"primary-0x4F1");
-	if (!route_ok) {
-		drm_info(dev,
-			 "IMAC5K: primary_4f1_probe gate connector=%s reason=primary-route-mismatch\n",
+			 "IMAC5K: primary_4f1_probe gate connector=%s reason=not-primary-route\n",
 			 aconnector->base.name);
 		return;
 	}
@@ -4917,8 +4950,25 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 		return;
 	}
 
-	/* All gates passed; latch immediately so we never retry within one boot
-	 * even if the writes below fail.
+	if (!link->aux_mode) {
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe gate connector=%s reason=primary-aux-not-live aux_mode=%u hpd_hw=%u local_sink=%p\n",
+			 aconnector->base.name, link->aux_mode, link->hpd_status,
+			 link->local_sink);
+		return;
+	}
+
+	/* Diagnostic only — no longer a gate. The full route bytes appear in
+	 * dmesg even when we ignore the boolean return.
+	 */
+	(void)amdgpu_dm_imac5k_verify_windows_route(dev, link,
+			"primary_4f1_probe", aconnector->base.name, false,
+			"primary-0x4F1");
+
+	secondary = amdgpu_dm_imac5k_find_secondary_head(dev);
+
+	/* All correctness gates passed; latch immediately so we never retry
+	 * within one boot even if the writes below fail.
 	 */
 	dm->imac5k_primary_4f1_probe_done = true;
 	dm->imac5k_primary_4f1_probe_secondary = secondary;
@@ -4995,6 +5045,36 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 		 aconnector->base.name, link->link_index, status, retried,
 		 dpcd_4f1_before, dpcd_4f1_after, !!secondary,
 		 secondary ? IMAC5K_PRIMARY_PROBE_FOLLOWUP_MS : 0);
+}
+
+/*
+ * Track-C top-level entry: called from the end of boot_detect when all
+ * connectors have been enumerated. Uses is_primary_route (structural only,
+ * not requiring tile state) so it works in the plain-boot 4K fallback where
+ * the primary panel reports as a single 600x340 mm display with no tile
+ * metadata. The internal gates in primary_4f1_probe_once handle OCLP-vs-plain
+ * via the fallback indicator (no secondary live sink).
+ */
+static void amdgpu_dm_imac5k_maybe_probe_primary_4f1(struct amdgpu_device *adev)
+{
+	struct amdgpu_display_manager *dm = &adev->dm;
+	struct drm_device *dev = adev_to_drm(adev);
+	struct amdgpu_dm_connector *primary;
+
+	if (!dm->imac5k_plain_boot_route_probe_quirk)
+		return;
+
+	if (dm->imac5k_primary_4f1_probe_done)
+		return;
+
+	primary = amdgpu_dm_imac5k_find_primary_route(dev);
+	if (!primary) {
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe gate reason=primary-route-not-found\n");
+		return;
+	}
+
+	amdgpu_dm_imac5k_primary_4f1_probe_once(primary);
 }
 
 static void amdgpu_dm_imac5k_note_plain_boot_candidate(struct amdgpu_dm_connector *aconnector)
@@ -9694,6 +9774,11 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 	amdgpu_dm_dump_links_and_sinks(adev, "boot_post_detect");
 	amdgpu_dm_imac5k_update_pair_readiness(adev_to_drm(adev),
 					       "boot_post_detect");
+
+	/* Track-C: fire the primary-0x4F1 probe once all connectors are
+	 * enumerated. Self-gated; runs only on iMac19,1 plain-boot fallback.
+	 */
+	amdgpu_dm_imac5k_maybe_probe_primary_4f1(adev);
 
 	/* Software is initialized. Now we can register interrupt handlers. */
 	switch (adev->asic_type) {
