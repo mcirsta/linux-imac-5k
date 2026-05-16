@@ -170,6 +170,8 @@ MODULE_FIRMWARE(FIRMWARE_DCN_401_DMUB);
 static int amdgpu_dm_init(struct amdgpu_device *adev);
 static void amdgpu_dm_fini(struct amdgpu_device *adev);
 static void amdgpu_dm_imac5k_primary_4f1_probe_followup_work(struct work_struct *work);
+static void amdgpu_dm_imac5k_drm_hotplug_event(struct drm_device *dev,
+					       const char *tag);
 static bool is_freesync_video_mode(const struct drm_display_mode *mode, struct amdgpu_dm_connector *aconnector);
 static void reset_freesync_config_for_crtc(struct dm_crtc_state *new_crtc_state);
 static struct amdgpu_i2c_adapter *
@@ -2237,6 +2239,7 @@ static void amdgpu_dm_fini(struct amdgpu_device *adev)
 
 	cancel_delayed_work_sync(&adev->dm.imac5k_primary_4f1_probe_followup);
 	adev->dm.imac5k_primary_4f1_probe_secondary = NULL;
+	adev->dm.imac5k_primary_4f1_probe_primary = NULL;
 
 	if (adev->dm.vblank_control_workqueue) {
 		destroy_workqueue(adev->dm.vblank_control_workqueue);
@@ -4858,36 +4861,136 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_log_secondary(
 		 dpcd_000, status_000, dpcd_4f1, status_4f1);
 }
 
+/*
+ * Re-detect one iMac5K connector after the primary-0x4F1 probe has woken the
+ * panel into paired-tile mode. This mirrors the HDMI debounce work flow:
+ * dc_link_detect under dc_lock, then update_connector_after_detect, then
+ * restore connector state under modeset lock. The hotplug uevent is fired
+ * once at the end of the parent function so userspace re-reads both
+ * connectors as a unit.
+ */
+static bool amdgpu_dm_imac5k_post_probe_redetect_one(
+		struct amdgpu_dm_connector *aconnector,
+		const char *role)
+{
+	struct drm_connector *connector;
+	struct drm_device *dev;
+	struct amdgpu_device *adev;
+	struct dc *dc;
+	struct dc_link *link;
+	void *prev_sink = NULL;
+	void *new_sink = NULL;
+	bool prev_local_sink_present;
+	bool new_local_sink_present;
+	bool reallow_idle = false;
+	bool ret = false;
+
+	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
+		return false;
+
+	connector = &aconnector->base;
+	dev = connector->dev;
+	adev = drm_to_adev(dev);
+	link = aconnector->dc_link;
+	dc = link->ctx ? link->ctx->dc : NULL;
+	prev_sink = link->local_sink;
+	prev_local_sink_present = !!link->local_sink;
+
+	drm_info(dev,
+		 "IMAC5K: primary_4f1_probe post_probe_redetect %s begin connector=%s link=%u aux_mode=%u hpd_status=%u local_sink=%p\n",
+		 role, connector->name, link->link_index, link->aux_mode,
+		 link->hpd_status, link->local_sink);
+
+	guard(mutex)(&aconnector->hpd_lock);
+
+	scoped_guard(mutex, &adev->dm.dc_lock) {
+		if (dc && dc->caps.ips_support &&
+		    dc->ctx->dmub_srv->idle_allowed) {
+			dc_allow_idle_optimizations(dc, false);
+			reallow_idle = true;
+		}
+		dc_exit_ips_for_hw_access(dc);
+		ret = dc_link_detect(link, DETECT_REASON_HPD);
+	}
+
+	if (ret) {
+		amdgpu_dm_update_connector_after_detect(aconnector);
+		drm_modeset_lock_all(dev);
+		dm_restore_drm_connector_state(dev, connector);
+		drm_modeset_unlock_all(dev);
+	}
+
+	scoped_guard(mutex, &adev->dm.dc_lock) {
+		if (reallow_idle && dc && dc->caps.ips_support)
+			dc_allow_idle_optimizations(dc, true);
+	}
+
+	new_sink = link->local_sink;
+	new_local_sink_present = !!link->local_sink;
+
+	drm_info(dev,
+		 "IMAC5K: primary_4f1_probe post_probe_redetect %s end connector=%s link=%u detect_ret=%u aux_mode=%u hpd_status=%u prev_sink=%p new_sink=%p sink_changed=%u prev_local_sink_present=%u new_local_sink_present=%u\n",
+		 role, connector->name, link->link_index, ret, link->aux_mode,
+		 link->hpd_status, prev_sink, new_sink,
+		 prev_sink != new_sink, prev_local_sink_present,
+		 new_local_sink_present);
+
+	return ret;
+}
+
 static void amdgpu_dm_imac5k_primary_4f1_probe_followup_work(struct work_struct *work)
 {
 	struct amdgpu_display_manager *dm = container_of(to_delayed_work(work),
 			struct amdgpu_display_manager,
 			imac5k_primary_4f1_probe_followup);
+	struct amdgpu_dm_connector *primary;
 	struct amdgpu_dm_connector *secondary;
-	struct drm_device *dev;
+	struct drm_device *dev = NULL;
+	bool primary_changed = false;
+	bool secondary_changed = false;
 
+	primary = dm->imac5k_primary_4f1_probe_primary;
 	secondary = dm->imac5k_primary_4f1_probe_secondary;
-	if (!secondary || !secondary->base.dev)
+
+	if (primary && primary->base.dev)
+		dev = primary->base.dev;
+	else if (secondary && secondary->base.dev)
+		dev = secondary->base.dev;
+	if (!dev)
 		return;
 
-	dev = secondary->base.dev;
-	amdgpu_dm_imac5k_primary_4f1_probe_log_secondary(dev, secondary,
-							 "after100");
+	if (secondary)
+		amdgpu_dm_imac5k_primary_4f1_probe_log_secondary(dev, secondary,
+								 "after100");
 
 	/*
-	 * If the post-write snapshot shows secondary AUX has come alive
-	 * (sink populated, or DPCD read returns DC_OK), schedule the normal
-	 * Linux re-detect so the connector flips to Connected without us
-	 * having to call dc_link_detect from this work directly. The HPD
-	 * helper handles the proper locking.
+	 * Primary re-detect goes first. The panel only just transitioned into
+	 * paired-tile mode 100 ms ago; the primary EDID Linux cached at
+	 * boot_pre_detect still says "single 3840x2160" and any tile-mode
+	 * atomic commit will fail with -EINVAL until that modelist is refreshed.
 	 */
-	if (secondary->dc_link && secondary->dc_link->aux_mode) {
-		drm_info(dev,
-			 "IMAC5K: primary_4f1_probe redetect secondary connector=%s aux_mode=%u local_sink=%p; deferring to normal Linux detect path\n",
-			 secondary->base.name,
-			 secondary->dc_link->aux_mode,
-			 secondary->dc_link->local_sink);
-	}
+	if (primary)
+		primary_changed = amdgpu_dm_imac5k_post_probe_redetect_one(
+				primary, "primary");
+
+	if (secondary)
+		secondary_changed = amdgpu_dm_imac5k_post_probe_redetect_one(
+				secondary, "secondary");
+
+	drm_info(dev,
+		 "IMAC5K: primary_4f1_probe post_probe_redetect summary primary=%s primary_changed=%u secondary=%s secondary_changed=%u\n",
+		 primary ? primary->base.name : "<none>", primary_changed,
+		 secondary ? secondary->base.name : "<none>",
+		 secondary_changed);
+
+	/*
+	 * Fire one DRM hotplug uevent so userspace (KWin/SDDM/mutter) throws
+	 * out the old modelists for both connectors and re-evaluates with the
+	 * fresh post-probe state. Without this, KWin keeps using the cached
+	 * 4K-single modelist on the primary even after detect updates it.
+	 */
+	amdgpu_dm_imac5k_drm_hotplug_event(dev,
+			"imac5k_primary_4f1_post_probe");
 }
 
 static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *aconnector)
@@ -4972,6 +5075,7 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 	 */
 	dm->imac5k_primary_4f1_probe_done = true;
 	dm->imac5k_primary_4f1_probe_secondary = secondary;
+	dm->imac5k_primary_4f1_probe_primary = aconnector;
 
 	drm_info(dev,
 		 "IMAC5K: primary_4f1_probe gate connector=%s pass; phys=%ux%u secondary=%s secondary_sink=%p\n",

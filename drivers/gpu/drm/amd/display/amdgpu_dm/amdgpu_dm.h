@@ -812,6 +812,17 @@ struct amdgpu_display_manager {
 	struct amdgpu_dm_connector *imac5k_primary_4f1_probe_secondary;
 
 	/**
+	 * @imac5k_primary_4f1_probe_primary:
+	 *
+	 * Cached primary aconnector. The post-probe follow-up triggers a
+	 * re-detect on the primary so its EDID is re-read after the panel
+	 * transitions into paired-tile mode (otherwise its modelist would
+	 * still report the 4K-fallback single-mode shape and any tile-mode
+	 * atomic commit would fail to validate).
+	 */
+	struct amdgpu_dm_connector *imac5k_primary_4f1_probe_primary;
+
+	/**
 	 * @dpia_aux_lock:
 	 *
 	 * Guards access to DPIA AUX
