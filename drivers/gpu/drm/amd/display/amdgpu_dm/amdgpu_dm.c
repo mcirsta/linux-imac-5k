@@ -4782,6 +4782,91 @@ static void amdgpu_dm_imac5k_apply_secondary_tile_property(
 					       "secondary-tile-apply");
 }
 
+/*
+ * Plain-boot mirror of amdgpu_dm_imac5k_apply_secondary_tile_property():
+ * after the primary-0x4F1 probe wakes the secondary panel, the secondary's
+ * own EDID (read naturally via DDC) carries the real tile_group vendor ID
+ * and tile geometry. The primary's EDID still reports the 4K-fallback shape
+ * with no tile extension. This helper copies the secondary's panel-read
+ * tile_group onto the primary using IMAC5K_PRIMARY_TILE_X (= 0), i.e. the
+ * same apply_tile_property() helper the OCLP path uses, just with the
+ * left-tile slot. The tile_group data itself comes from the secondary's
+ * EDID — no construction beyond the geometric "left tile of a 2x1 grid is
+ * at column 0" mapping, which is already implicit in the iMac quirk identity.
+ */
+static void amdgpu_dm_imac5k_apply_primary_tile_property_from_secondary(
+		struct amdgpu_dm_connector *primary,
+		struct amdgpu_dm_connector *secondary)
+{
+	struct amdgpu_display_manager *dm;
+	struct drm_connector *primary_connector;
+	struct drm_connector *secondary_connector;
+
+	if (!primary || !secondary || !primary->base.dev || !secondary->base.dev)
+		return;
+
+	primary_connector = &primary->base;
+	secondary_connector = &secondary->base;
+
+	dm = &drm_to_adev(primary_connector->dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm))
+		return;
+
+	if (!amdgpu_dm_imac5k_is_primary_route(primary)) {
+		drm_info(primary_connector->dev,
+			 "IMAC5K: primary TILE from secondary skipped on %s: not the iMac primary route (raw_obj/eDP mismatch)\n",
+			 primary_connector->name);
+		return;
+	}
+
+	/* OCLP-style boot: primary's own EDID already populated tile data.
+	 * Don't overwrite — this helper is only for the plain-boot path where
+	 * primary EDID lacks tile info.
+	 */
+	if (primary_connector->has_tile && primary_connector->tile_group) {
+		drm_info(primary_connector->dev,
+			 "IMAC5K: primary TILE from secondary skipped on %s: primary already has tile_group=%p (likely OCLP-style boot or earlier apply)\n",
+			 primary_connector->name, primary_connector->tile_group);
+		return;
+	}
+
+	if (!secondary_connector->has_tile || !secondary_connector->tile_group) {
+		drm_info(primary_connector->dev,
+			 "IMAC5K: primary TILE from secondary skipped on %s: secondary %s has_tile=%u tile_group=%p (panel-read tile data not yet available)\n",
+			 primary_connector->name, secondary_connector->name,
+			 secondary_connector->has_tile,
+			 secondary_connector->tile_group);
+		return;
+	}
+
+	drm_info(primary_connector->dev,
+		 "IMAC5K: applying primary TILE on %s from secondary %s only after secondary EDID provided real tile_group=%p; reverse direction of OCLP secondary-from-primary path\n",
+		 primary_connector->name, secondary_connector->name,
+		 secondary_connector->tile_group);
+
+	/* Same helper as apply_secondary_tile_property uses for the OCLP path. */
+	amdgpu_dm_imac5k_apply_tile_property(primary,
+					     secondary_connector->tile_group,
+					     IMAC5K_TILE_SINGLE_MONITOR,
+					     IMAC5K_PRIMARY_TILE_X, "primary");
+
+	dm->imac5k_primary_head_seen = true;
+	amdgpu_dm_imac5k_set_state(primary_connector->dev,
+				   AMDGPU_DM_IMAC5K_STATE_PRIMARY_SEEN,
+				   "primary-tile-from-secondary");
+
+	drm_info(primary_connector->dev,
+		 "IMAC5K: applied primary TILE property on %s from secondary %s loc=%u,%u group=%p single=%u\n",
+		 primary_connector->name, secondary_connector->name,
+		 primary_connector->tile_h_loc,
+		 primary_connector->tile_v_loc,
+		 primary_connector->tile_group,
+		 primary_connector->tile_is_single_monitor);
+
+	amdgpu_dm_imac5k_update_pair_readiness(primary_connector->dev,
+					       "primary-tile-from-secondary");
+}
+
 static void amdgpu_dm_imac5k_mark_secondary_head(struct amdgpu_dm_connector *aconnector)
 {
 	struct amdgpu_display_manager *dm;
@@ -4982,6 +5067,17 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_followup_work(struct work_struct 
 		 primary ? primary->base.name : "<none>", primary_changed,
 		 secondary ? secondary->base.name : "<none>",
 		 secondary_changed);
+
+	/*
+	 * Mirror OCLP's apply_secondary_tile_property in reverse: now that the
+	 * secondary has finished its re-detect and (we hope) parsed real tile
+	 * EDID, copy that tile_group onto the primary so the primary can act
+	 * as the left tile of the same 2x1 group. Skipped if secondary still
+	 * has no tile data, or if primary already has its own tile data.
+	 */
+	if (primary && secondary)
+		amdgpu_dm_imac5k_apply_primary_tile_property_from_secondary(
+				primary, secondary);
 
 	/*
 	 * Fire one DRM hotplug uevent so userspace (KWin/SDDM/mutter) throws
@@ -13121,6 +13217,114 @@ static void amdgpu_dm_connector_add_freesync_modes(struct drm_connector *connect
 			add_fs_modes(amdgpu_dm_connector);
 }
 
+/*
+ * Plain-boot iMac 5K: after the primary-0x4F1 probe + secondary re-detect, the
+ * secondary's panel-read EDID has the real 2560x2880 tile mode in its
+ * probed_modes; the primary's EDID still only carries 4K-fallback modes.
+ * Duplicate the secondary's 2560x2880 mode entry onto the primary's modelist
+ * so userspace can actually pick the tile mode (KWin/mutter validate against
+ * probed_modes). The mode timing values come from the secondary's real EDID —
+ * we are NOT constructing pixel-clock or hsync/vsync. The only Linux-side
+ * decision is mode preference (mark the tile mode as PREFERRED on the primary
+ * so userspace picks it over 4K).
+ *
+ * Returns the number of modes added.
+ */
+static unsigned int amdgpu_dm_imac5k_inject_primary_tile_mode_from_secondary(
+		struct drm_connector *connector,
+		struct amdgpu_dm_connector *aconnector)
+{
+	struct amdgpu_display_manager *dm;
+	struct amdgpu_dm_connector *secondary;
+	struct drm_display_mode *src_mode = NULL;
+	struct drm_display_mode *iter;
+	struct drm_display_mode *new_mode;
+	bool already_present = false;
+
+	if (!aconnector || !connector || !connector->dev)
+		return 0;
+
+	dm = &drm_to_adev(connector->dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm))
+		return 0;
+
+	if (!amdgpu_dm_imac5k_is_primary_route(aconnector))
+		return 0;
+
+	/* Only inject when the tile_group has actually been applied (= secondary
+	 * EDID gave us tile info AND we copied it to primary). Otherwise the
+	 * mode would have no tile context and we'd just be polluting the
+	 * primary's modelist.
+	 */
+	if (!connector->has_tile || !connector->tile_group)
+		return 0;
+
+	/* Skip if a same-sized mode is already in the primary's probed_modes
+	 * (e.g., OCLP-style boot where primary EDID natively had the tile mode).
+	 */
+	list_for_each_entry(iter, &connector->probed_modes, head) {
+		if (iter->hdisplay == IMAC5K_TILE_HDISPLAY &&
+		    iter->vdisplay == IMAC5K_TILE_VDISPLAY) {
+			already_present = true;
+			break;
+		}
+	}
+	if (already_present)
+		return 0;
+
+	secondary = amdgpu_dm_imac5k_find_secondary_head(connector->dev);
+	if (!secondary || !secondary->base.dev) {
+		drm_info(connector->dev,
+			 "IMAC5K: primary tile mode injection skipped on %s: no secondary aconnector found\n",
+			 connector->name);
+		return 0;
+	}
+
+	/* Source: secondary's probed_modes, parsed from its real EDID. */
+	list_for_each_entry(iter, &secondary->base.probed_modes, head) {
+		if (iter->hdisplay == IMAC5K_TILE_HDISPLAY &&
+		    iter->vdisplay == IMAC5K_TILE_VDISPLAY) {
+			src_mode = iter;
+			break;
+		}
+	}
+	if (!src_mode) {
+		drm_info(connector->dev,
+			 "IMAC5K: primary tile mode injection skipped on %s: secondary %s has no %ux%u mode in probed_modes (probed_modes_empty=%d)\n",
+			 connector->name, secondary->base.name,
+			 IMAC5K_TILE_HDISPLAY, IMAC5K_TILE_VDISPLAY,
+			 list_empty(&secondary->base.probed_modes));
+		return 0;
+	}
+
+	new_mode = drm_mode_duplicate(connector->dev, src_mode);
+	if (!new_mode) {
+		drm_info(connector->dev,
+			 "IMAC5K: primary tile mode injection failed on %s: drm_mode_duplicate returned NULL\n",
+			 connector->name);
+		return 0;
+	}
+
+	/* Strip whatever preference flag the source mode had so we set it
+	 * deterministically; mark as PREFERRED + DRIVER so userspace picks it
+	 * over the primary's native 4K-fallback mode.
+	 */
+	new_mode->type &= ~(DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DEFAULT);
+	new_mode->type |= DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER;
+
+	drm_mode_probed_add(connector, new_mode);
+
+	drm_info(connector->dev,
+		 "IMAC5K: primary tile mode injected on %s from secondary %s mode=%ux%u@%uHz clock=%u htotal=%u vtotal=%u flags=0x%x type=0x%x (sourced from secondary EDID)\n",
+		 connector->name, secondary->base.name,
+		 new_mode->hdisplay, new_mode->vdisplay,
+		 drm_mode_vrefresh(new_mode), new_mode->clock,
+		 new_mode->htotal, new_mode->vtotal,
+		 new_mode->flags, new_mode->type);
+
+	return 1;
+}
+
 static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 {
 	struct amdgpu_dm_connector *amdgpu_dm_connector =
@@ -13156,6 +13360,9 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 			amdgpu_dm_connector_add_common_modes(encoder, connector);
 		amdgpu_dm_connector_add_freesync_modes(connector, drm_edid);
 	}
+	amdgpu_dm_connector->num_modes +=
+		amdgpu_dm_imac5k_inject_primary_tile_mode_from_secondary(
+			connector, amdgpu_dm_connector);
 	amdgpu_dm_fbc_init(connector);
 	amdgpu_dm_imac5k_update_pair_readiness(connector->dev, "get_modes");
 	amdgpu_dm_imac5k_log_modes(amdgpu_dm_connector, "get_modes");
