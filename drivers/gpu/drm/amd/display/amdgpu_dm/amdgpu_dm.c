@@ -13251,6 +13251,21 @@ static unsigned int amdgpu_dm_imac5k_inject_primary_tile_mode_from_secondary(
 	if (!amdgpu_dm_imac5k_is_primary_route(aconnector))
 		return 0;
 
+	/* get_modes is called by drm_helper_probe_single_connector_modes(),
+	 * which inside ddc_get_modes() calls drm_edid_connector_add_modes() —
+	 * that helper re-parses the primary's EDID and clears any tile
+	 * property we previously set, because the primary's EDID has no TILE
+	 * extension on plain boot. So before checking has_tile/tile_group
+	 * here, we re-apply the tile property from the secondary's
+	 * panel-read tile_group (the helper early-exits if already applied
+	 * or if secondary lacks tile data, so this is cheap and safe to call
+	 * on every get_modes invocation).
+	 */
+	secondary = amdgpu_dm_imac5k_find_secondary_head(connector->dev);
+	if (secondary)
+		amdgpu_dm_imac5k_apply_primary_tile_property_from_secondary(
+				aconnector, secondary);
+
 	/* Only inject when the tile_group has actually been applied (= secondary
 	 * EDID gave us tile info AND we copied it to primary). Otherwise the
 	 * mode would have no tile context and we'd just be polluting the
@@ -13272,7 +13287,6 @@ static unsigned int amdgpu_dm_imac5k_inject_primary_tile_mode_from_secondary(
 	if (already_present)
 		return 0;
 
-	secondary = amdgpu_dm_imac5k_find_secondary_head(connector->dev);
 	if (!secondary || !secondary->base.dev) {
 		drm_info(connector->dev,
 			 "IMAC5K: primary tile mode injection skipped on %s: no secondary aconnector found\n",
