@@ -4088,6 +4088,84 @@ amdgpu_dm_imac5k_find_primary_route(struct drm_device *dev)
 	return primary;
 }
 
+/*
+ * Diagnostic helper: dump every DRM connector's key state at the moment of
+ * call. Useful at probe entry / followup entry / before-redetect / after-
+ * redetect — anywhere a failure could be due to one connector being in an
+ * unexpected state (missing, not yet registered, HPD dead, wrong dc_link).
+ *
+ * The cold_boot_12 failure was exactly this kind of timing-state mismatch:
+ * the probe fired before DP-1 was enumerated, secondary=<none>, no followup
+ * scheduled. An inventory at probe time would have shown DP-1 absent and a
+ * second inventory 100 ms later would have shown DP-1 present.
+ */
+static void amdgpu_dm_imac5k_log_connector_inventory(struct drm_device *dev,
+						      const char *tag)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	unsigned int counted = 0;
+
+	if (!dev) {
+		pr_info("amdgpu: IMAC5K: connector_inventory %s dev=NULL\n",
+			tag ? tag : "<no-tag>");
+		return;
+	}
+
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		struct amdgpu_dm_connector *aconnector;
+		struct dc_link *link = NULL;
+		unsigned int raw_obj = 0;
+		int signal = 0;
+		int aux_mode = 0;
+		bool hpd_hw = false;
+		bool hpd_cached = false;
+		void *local_sink = NULL;
+		size_t edid_len = 0;
+		bool is_secondary_head_marked = false;
+
+		counted++;
+
+		if (connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK) {
+			drm_info(dev,
+				 "IMAC5K: connector_inventory %s idx=%u connector=%s type=writeback (skipped)\n",
+				 tag, counted, connector->name);
+			continue;
+		}
+
+		aconnector = to_amdgpu_dm_connector(connector);
+		if (aconnector) {
+			link = aconnector->dc_link;
+			is_secondary_head_marked = aconnector->imac5k_secondary_head;
+		}
+		if (link) {
+			signal = link->connector_signal;
+			raw_obj = amdgpu_dm_imac5k_raw_object_id(link->link_id);
+			aux_mode = link->aux_mode;
+			hpd_cached = link->hpd_status;
+			if (link->dc && link->dc->link_srv)
+				hpd_hw = dc_link_get_hpd_state(link);
+			local_sink = link->local_sink;
+			if (link->local_sink)
+				edid_len = link->local_sink->dc_edid.length;
+		}
+
+		drm_info(dev,
+			 "IMAC5K: connector_inventory %s idx=%u connector=%s type=%d status=%d has_tile=%u tile_group=%p signal=%d raw_obj=0x%x dc_link=%p aux_mode=%d hpd_hw=%u hpd_cached=%u local_sink=%p edid_len=%zu secondary_marked=%u\n",
+			 tag, counted, connector->name,
+			 connector->connector_type, connector->status,
+			 connector->has_tile, connector->tile_group, signal,
+			 raw_obj, link, aux_mode, hpd_hw, hpd_cached, local_sink,
+			 edid_len, is_secondary_head_marked);
+	}
+	drm_connector_list_iter_end(&iter);
+
+	drm_info(dev,
+		 "IMAC5K: connector_inventory %s end total_counted=%u\n",
+		 tag, counted);
+}
+
 static bool amdgpu_dm_imac5k_is_secondary_head(const struct amdgpu_dm_connector *aconnector)
 {
 	if (!aconnector || !aconnector->dc_link || aconnector->mst_root)
@@ -5037,12 +5115,48 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_followup_work(struct work_struct 
 	primary = dm->imac5k_primary_4f1_probe_primary;
 	secondary = dm->imac5k_primary_4f1_probe_secondary;
 
+	/* Entry log — unconditional so we know the work fired at all. */
+	pr_info("amdgpu: IMAC5K: primary_4f1_probe followup ENTRY primary_cached=%p secondary_cached=%p\n",
+		primary, secondary);
+
 	if (primary && primary->base.dev)
 		dev = primary->base.dev;
 	else if (secondary && secondary->base.dev)
 		dev = secondary->base.dev;
-	if (!dev)
+	if (!dev) {
+		pr_info("amdgpu: IMAC5K: primary_4f1_probe followup ABORT no dev available (primary=%p secondary=%p)\n",
+			primary, secondary);
 		return;
+	}
+
+	/*
+	 * Snapshot ALL connectors before we do anything. If the failure mode
+	 * is "secondary didn't appear" or "secondary appeared but in wrong
+	 * state", this tells us exactly what was there at +100 ms.
+	 */
+	amdgpu_dm_imac5k_log_connector_inventory(dev, "followup-entry");
+
+	/*
+	 * If the probe fired before the secondary connector was registered
+	 * (typical when the primary EDID firmware override puts is_primary_route
+	 * true earlier than the secondary's drm_connector_init call), the
+	 * cached secondary pointer is NULL. By the time this delayed work runs
+	 * (+100 ms), the secondary connector should be registered — look it
+	 * up freshly and cache it so the rest of this function can do its
+	 * normal redetect + tile-property-apply work on the secondary.
+	 */
+	if (!secondary) {
+		secondary = amdgpu_dm_imac5k_find_secondary_head(dev);
+		if (secondary) {
+			dm->imac5k_primary_4f1_probe_secondary = secondary;
+			drm_info(dev,
+				 "IMAC5K: primary_4f1_probe followup re-looked-up secondary connector=%s (was NULL at probe time; now registered)\n",
+				 secondary->base.name);
+		} else {
+			drm_info(dev,
+				 "IMAC5K: primary_4f1_probe followup could not find secondary connector at +100 ms; redetect will run on primary only\n");
+		}
+	}
 
 	if (secondary)
 		amdgpu_dm_imac5k_primary_4f1_probe_log_secondary(dev, secondary,
@@ -5080,6 +5194,13 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_followup_work(struct work_struct 
 				primary, secondary);
 
 	/*
+	 * Final inventory after all redetect work has completed. Compare
+	 * against probe-entry and followup-entry inventories to see exactly
+	 * which fields flipped during the post-probe sequence.
+	 */
+	amdgpu_dm_imac5k_log_connector_inventory(dev, "followup-exit");
+
+	/*
 	 * Fire one DRM hotplug uevent so userspace (KWin/SDDM/mutter) throws
 	 * out the old modelists for both connectors and re-evaluates with the
 	 * fresh post-probe state. Without this, KWin keeps using the cached
@@ -5087,6 +5208,9 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_followup_work(struct work_struct 
 	 */
 	amdgpu_dm_imac5k_drm_hotplug_event(dev,
 			"imac5k_primary_4f1_post_probe");
+
+	pr_info("amdgpu: IMAC5K: primary_4f1_probe followup EXIT primary_changed=%u secondary_changed=%u\n",
+		primary_changed, secondary_changed);
 }
 
 static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *aconnector)
@@ -5171,6 +5295,15 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 	 */
 	dm->imac5k_primary_4f1_probe_done = true;
 	dm->imac5k_primary_4f1_probe_secondary = secondary;
+
+	/*
+	 * Snapshot the DRM connector list at probe time. This is the moment
+	 * the secondary may or may not be visible (cold_boot_12 showed it was
+	 * NULL here because primary's tile EDID was loaded via the firmware
+	 * override before DP-1's drm_connector_init ran). With this log we can
+	 * see exactly which connectors were enumerated when the probe fired.
+	 */
+	amdgpu_dm_imac5k_log_connector_inventory(dev, "probe-entry");
 	dm->imac5k_primary_4f1_probe_primary = aconnector;
 
 	drm_info(dev,
@@ -5236,15 +5369,29 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 		amdgpu_dm_imac5k_primary_4f1_probe_log_secondary(dev, secondary,
 								 "after10");
 
-	if (secondary)
-		schedule_delayed_work(&dm->imac5k_primary_4f1_probe_followup,
-				      msecs_to_jiffies(IMAC5K_PRIMARY_PROBE_FOLLOWUP_MS));
+	/*
+	 * Always schedule the followup, even if the secondary connector was not
+	 * yet enumerated at probe time. With an EDID firmware override loaded
+	 * for the primary, the primary's tile data is already in place during
+	 * the boot-detect loop, so the probe can fire earlier than the secondary
+	 * connector's drm_connector_init() — find_secondary_head() then returns
+	 * NULL even though DP-1 will appear within milliseconds. The followup
+	 * runs at +100 ms; by that time all connectors are registered and the
+	 * followup re-looks-up the secondary via find_secondary_head() to call
+	 * dc_link_detect on it during the brief post-wake HPD-up window.
+	 *
+	 * Without this, cold_boot_12 showed HPD going up at t=7.004 (the panel
+	 * woke as expected) and back down by t=14.8 because no detect ran
+	 * during the window — the secondary tile EDID was never read.
+	 */
+	schedule_delayed_work(&dm->imac5k_primary_4f1_probe_followup,
+			      msecs_to_jiffies(IMAC5K_PRIMARY_PROBE_FOLLOWUP_MS));
 
 	drm_info(dev,
-		 "IMAC5K: primary_4f1_probe result connector=%s link=%u write_status=%d retried=%u dpcd4f1_before=%02x dpcd4f1_after=%02x secondary_present=%u followup_ms=%u\n",
+		 "IMAC5K: primary_4f1_probe result connector=%s link=%u write_status=%d retried=%u dpcd4f1_before=%02x dpcd4f1_after=%02x secondary_present=%u followup_ms=%u (followup scheduled unconditionally; will re-look-up secondary if it appears later)\n",
 		 aconnector->base.name, link->link_index, status, retried,
 		 dpcd_4f1_before, dpcd_4f1_after, !!secondary,
-		 secondary ? IMAC5K_PRIMARY_PROBE_FOLLOWUP_MS : 0);
+		 IMAC5K_PRIMARY_PROBE_FOLLOWUP_MS);
 }
 
 /*
