@@ -13230,6 +13230,65 @@ static void amdgpu_dm_connector_add_freesync_modes(struct drm_connector *connect
  *
  * Returns the number of modes added.
  */
+/*
+ * Snapshot the secondary's 2560x2880 tile mode into a per-connector cache
+ * the moment it appears in probed_modes during ddc_get_modes. Called from
+ * the secondary's get_modes path AFTER EDID modes have been added but BEFORE
+ * DRM helper validation/filtering can drop or move them. The cache then
+ * survives across all subsequent get_modes rounds, so the primary's inject
+ * can read it regardless of which list (probed_modes/modes) is currently
+ * populated when primary's get_modes happens to run.
+ *
+ * Idempotent: if the same mode is already cached, this is a no-op. Only
+ * captures from a connector that is the iMac secondary route.
+ */
+static void amdgpu_dm_imac5k_capture_secondary_tile_mode(
+		struct drm_connector *connector,
+		struct amdgpu_dm_connector *aconnector)
+{
+	struct amdgpu_display_manager *dm;
+	struct drm_display_mode *iter;
+	struct drm_display_mode *src_mode = NULL;
+
+	if (!aconnector || !connector || !connector->dev)
+		return;
+
+	dm = &drm_to_adev(connector->dev)->dm;
+	if (!amdgpu_dm_imac5k_quirk_enabled(dm))
+		return;
+
+	if (!amdgpu_dm_imac5k_is_secondary_head(aconnector))
+		return;
+
+	list_for_each_entry(iter, &connector->probed_modes, head) {
+		if (iter->hdisplay == IMAC5K_TILE_HDISPLAY &&
+		    iter->vdisplay == IMAC5K_TILE_VDISPLAY) {
+			src_mode = iter;
+			break;
+		}
+	}
+	if (!src_mode)
+		return;
+
+	if (aconnector->imac5k_tile_mode_cached &&
+	    aconnector->imac5k_tile_mode_cache.clock == src_mode->clock &&
+	    aconnector->imac5k_tile_mode_cache.htotal == src_mode->htotal &&
+	    aconnector->imac5k_tile_mode_cache.vtotal == src_mode->vtotal)
+		return;
+
+	/* drm_mode_copy copies all the timing fields cleanly into a stack/
+	 * embedded struct without affecting refcount or list linkage.
+	 */
+	drm_mode_copy(&aconnector->imac5k_tile_mode_cache, src_mode);
+	aconnector->imac5k_tile_mode_cached = true;
+
+	drm_info(connector->dev,
+		 "IMAC5K: secondary tile mode cached on %s mode=%ux%u@%uHz clock=%u htotal=%u vtotal=%u flags=0x%x (sourced from secondary EDID probed_modes; survives across get_modes rounds)\n",
+		 connector->name, src_mode->hdisplay, src_mode->vdisplay,
+		 drm_mode_vrefresh(src_mode), src_mode->clock,
+		 src_mode->htotal, src_mode->vtotal, src_mode->flags);
+}
+
 static unsigned int amdgpu_dm_imac5k_inject_primary_tile_mode_from_secondary(
 		struct drm_connector *connector,
 		struct amdgpu_dm_connector *aconnector)
@@ -13240,6 +13299,7 @@ static unsigned int amdgpu_dm_imac5k_inject_primary_tile_mode_from_secondary(
 	struct drm_display_mode *iter;
 	struct drm_display_mode *new_mode;
 	bool already_present = false;
+	bool src_from_cache = false;
 
 	if (!aconnector || !connector || !connector->dev)
 		return 0;
@@ -13332,13 +13392,18 @@ static unsigned int amdgpu_dm_imac5k_inject_primary_tile_mode_from_secondary(
 			}
 		}
 	}
+	if (!src_mode && secondary->imac5k_tile_mode_cached) {
+		src_mode = &secondary->imac5k_tile_mode_cache;
+		src_from_cache = true;
+	}
 	if (!src_mode) {
 		drm_info(connector->dev,
-			 "IMAC5K: primary tile mode injection skipped on %s: secondary %s has no %ux%u mode in either list (probed_modes_empty=%d modes_empty=%d)\n",
+			 "IMAC5K: primary tile mode injection skipped on %s: secondary %s has no %ux%u mode in any source (probed_modes_empty=%d modes_empty=%d cached=%d)\n",
 			 connector->name, secondary->base.name,
 			 IMAC5K_TILE_HDISPLAY, IMAC5K_TILE_VDISPLAY,
 			 list_empty(&secondary->base.probed_modes),
-			 list_empty(&secondary->base.modes));
+			 list_empty(&secondary->base.modes),
+			 secondary->imac5k_tile_mode_cached);
 		return 0;
 	}
 
@@ -13360,12 +13425,13 @@ static unsigned int amdgpu_dm_imac5k_inject_primary_tile_mode_from_secondary(
 	drm_mode_probed_add(connector, new_mode);
 
 	drm_info(connector->dev,
-		 "IMAC5K: primary tile mode injected on %s from secondary %s mode=%ux%u@%uHz clock=%u htotal=%u vtotal=%u flags=0x%x type=0x%x (sourced from secondary EDID)\n",
+		 "IMAC5K: primary tile mode injected on %s from secondary %s mode=%ux%u@%uHz clock=%u htotal=%u vtotal=%u flags=0x%x type=0x%x source=%s (sourced from secondary EDID)\n",
 		 connector->name, secondary->base.name,
 		 new_mode->hdisplay, new_mode->vdisplay,
 		 drm_mode_vrefresh(new_mode), new_mode->clock,
 		 new_mode->htotal, new_mode->vtotal,
-		 new_mode->flags, new_mode->type);
+		 new_mode->flags, new_mode->type,
+		 src_from_cache ? "cache" : "live-list");
 
 	return 1;
 }
@@ -13405,6 +13471,13 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 			amdgpu_dm_connector_add_common_modes(encoder, connector);
 		amdgpu_dm_connector_add_freesync_modes(connector, drm_edid);
 	}
+	/* Capture secondary's 2560x2880 mode into a cache the moment it
+	 * appears in probed_modes (= this is the secondary's own get_modes
+	 * call). The capture is a no-op for any other connector and for
+	 * already-cached state.
+	 */
+	amdgpu_dm_imac5k_capture_secondary_tile_mode(connector,
+						     amdgpu_dm_connector);
 	amdgpu_dm_connector->num_modes +=
 		amdgpu_dm_imac5k_inject_primary_tile_mode_from_secondary(
 			connector, amdgpu_dm_connector);

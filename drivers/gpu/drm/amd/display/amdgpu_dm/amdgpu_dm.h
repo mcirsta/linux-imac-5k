@@ -1016,6 +1016,18 @@ struct amdgpu_dm_connector {
 	unsigned int imac5k_preserved_tile_h_size;
 	unsigned int imac5k_preserved_tile_v_size;
 
+	/*
+	 * iMac 5K secondary's 2560x2880 mode captured from the secondary's
+	 * panel-read EDID during its get_modes call, before DRM's helper
+	 * validation/filtering can churn it. The primary's get_modes uses this
+	 * cache to inject the same timing onto its modelist, because by the
+	 * time primary's get_modes runs the secondary's probed_modes/modes
+	 * lists are in unpredictable states (probed_modes was just cleared,
+	 * modes hasn't been re-populated yet, or holds only smaller modes).
+	 */
+	bool imac5k_tile_mode_cached;
+	struct drm_display_mode imac5k_tile_mode_cache;
+
 	/* Adaptive Sync */
 	bool pack_sdp_v1_3;
 	enum adaptive_sync_type as_type;
