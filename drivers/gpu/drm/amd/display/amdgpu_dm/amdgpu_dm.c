@@ -13433,6 +13433,87 @@ static unsigned int amdgpu_dm_imac5k_inject_primary_tile_mode_from_secondary(
 		 new_mode->flags, new_mode->type,
 		 src_from_cache ? "cache" : "live-list");
 
+	/*
+	 * Resolve the modelist conflict between our injected 2560x2880 tile
+	 * mode and the primary EDID's larger 4K-fallback timing.
+	 *
+	 * Preferred path: REMOVE the oversized mode entirely. Once the panel
+	 * is paired (we wrote 0x4F1=1 and the secondary panel responded),
+	 * driving a single 3840x2160 stream on one tile of a paired panel
+	 * isn't a valid configuration — the other tile has nothing to show.
+	 * OCLP-boot primary EDIDs natively contain only the tile mode for the
+	 * same reason. cold_boot_8 confirmed that demoting PREFERRED alone is
+	 * not sufficient: KWin still picks the bigger mode if it remains in
+	 * probed_modes.
+	 *
+	 * Fallback path: if the mode is flagged as user-defined (xrandr
+	 * --newmode, debug tooling, future kernel hooks we don't know about)
+	 * we don't own it and shouldn't destroy it. In that case demote its
+	 * PREFERRED flag — that at least removes the tile-mode tie-break and
+	 * keeps the user's intent intact. Both branches log what they did.
+	 *
+	 * Smaller modes (1920x1080, etc.) are kept — they don't outrank the
+	 * tile mode in any selection heuristic and may be useful for
+	 * non-graphical sessions.
+	 */
+	{
+		struct drm_display_mode *tmp;
+		unsigned int removed = 0;
+		unsigned int demoted = 0;
+
+		list_for_each_entry_safe(iter, tmp, &connector->probed_modes,
+					 head) {
+			bool safe_to_remove;
+
+			if (iter == new_mode)
+				continue;
+			if (iter->hdisplay == IMAC5K_TILE_HDISPLAY &&
+			    iter->vdisplay == IMAC5K_TILE_VDISPLAY)
+				continue;
+			if (iter->hdisplay <= IMAC5K_TILE_HDISPLAY)
+				continue;
+
+			safe_to_remove = !(iter->type & DRM_MODE_TYPE_USERDEF);
+
+			if (safe_to_remove) {
+				drm_info(connector->dev,
+					 "IMAC5K: removed oversized non-tile mode %ux%u@%uHz type=0x%x from %s probed_modes (panel paired in tile mode; single-tile timing no longer valid)\n",
+					 iter->hdisplay, iter->vdisplay,
+					 drm_mode_vrefresh(iter), iter->type,
+					 connector->name);
+				list_del(&iter->head);
+				drm_mode_destroy(connector->dev, iter);
+				removed++;
+				continue;
+			}
+
+			if (iter->type & DRM_MODE_TYPE_PREFERRED) {
+				iter->type &= ~DRM_MODE_TYPE_PREFERRED;
+				drm_info(connector->dev,
+					 "IMAC5K: demoted oversized non-tile mode %ux%u@%uHz type=0x%x from PREFERRED on %s (removal skipped: USERDEF; tile mode is now sole preferred entry)\n",
+					 iter->hdisplay, iter->vdisplay,
+					 drm_mode_vrefresh(iter), iter->type,
+					 connector->name);
+				demoted++;
+				continue;
+			}
+
+			drm_info(connector->dev,
+				 "IMAC5K: left oversized non-tile mode %ux%u@%uHz type=0x%x untouched on %s (removal skipped: USERDEF; no PREFERRED flag to demote)\n",
+				 iter->hdisplay, iter->vdisplay,
+				 drm_mode_vrefresh(iter), iter->type,
+				 connector->name);
+		}
+
+		if (removed && aconnector->num_modes >= removed)
+			aconnector->num_modes -= removed;
+
+		if (removed || demoted)
+			drm_info(connector->dev,
+				 "IMAC5K: primary modelist conflict resolution complete on %s removed=%u demoted=%u\n",
+				 connector->name, removed, demoted);
+	}
+
 	return 1;
 }
 
