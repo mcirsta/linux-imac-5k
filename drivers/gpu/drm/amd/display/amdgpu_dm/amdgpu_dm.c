@@ -13294,7 +13294,28 @@ static unsigned int amdgpu_dm_imac5k_inject_primary_tile_mode_from_secondary(
 		return 0;
 	}
 
-	/* Source: secondary's probed_modes, parsed from its real EDID. */
+	/* Source: secondary's probed_modes OR modes, parsed from its real EDID.
+	 *
+	 * DRM's drm_helper_probe_single_connector_modes() runs in phases:
+	 *   1. At the start, list_move_tail() moves connector->modes into
+	 *      connector->probed_modes (so probed_modes briefly contains the
+	 *      old set, modes is empty).
+	 *   2. helper->get_modes() runs (our ddc_get_modes does INIT_LIST_HEAD
+	 *      on probed_modes first, so the old set is dropped, then EDID
+	 *      modes are added back into probed_modes).
+	 *   3. After get_modes, validated modes are moved from probed_modes
+	 *      back into connector->modes; probed_modes ends empty.
+	 *
+	 * Between primary's get_modes and secondary's get_modes, secondary
+	 * could be in any of these states — probed_modes empty with modes
+	 * holding the tile mode (most common after secondary's first probe),
+	 * probed_modes holding the tile mode (mid-probe), or both empty
+	 * (first round after wake before secondary has been queried).
+	 *
+	 * We check probed_modes first, then modes; finding the source mode
+	 * in either is fine because they hold the same timing values parsed
+	 * from the same EDID descriptor.
+	 */
 	list_for_each_entry(iter, &secondary->base.probed_modes, head) {
 		if (iter->hdisplay == IMAC5K_TILE_HDISPLAY &&
 		    iter->vdisplay == IMAC5K_TILE_VDISPLAY) {
@@ -13303,11 +13324,21 @@ static unsigned int amdgpu_dm_imac5k_inject_primary_tile_mode_from_secondary(
 		}
 	}
 	if (!src_mode) {
+		list_for_each_entry(iter, &secondary->base.modes, head) {
+			if (iter->hdisplay == IMAC5K_TILE_HDISPLAY &&
+			    iter->vdisplay == IMAC5K_TILE_VDISPLAY) {
+				src_mode = iter;
+				break;
+			}
+		}
+	}
+	if (!src_mode) {
 		drm_info(connector->dev,
-			 "IMAC5K: primary tile mode injection skipped on %s: secondary %s has no %ux%u mode in probed_modes (probed_modes_empty=%d)\n",
+			 "IMAC5K: primary tile mode injection skipped on %s: secondary %s has no %ux%u mode in either list (probed_modes_empty=%d modes_empty=%d)\n",
 			 connector->name, secondary->base.name,
 			 IMAC5K_TILE_HDISPLAY, IMAC5K_TILE_VDISPLAY,
-			 list_empty(&secondary->base.probed_modes));
+			 list_empty(&secondary->base.probed_modes),
+			 list_empty(&secondary->base.modes));
 		return 0;
 	}
 
