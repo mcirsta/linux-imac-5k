@@ -13514,6 +13514,46 @@ static unsigned int amdgpu_dm_imac5k_inject_primary_tile_mode_from_secondary(
 				 connector->name, removed, demoted);
 	}
 
+	/*
+	 * Refresh the encoder's cached native_mode to point at the tile mode.
+	 *
+	 * amdgpu_dm_get_native_mode() runs inside ddc_get_modes() (= BEFORE
+	 * our inject) and snapshots whichever PREFERRED mode happened to be
+	 * at the head of probed_modes at that moment — on plain-boot eDP-1
+	 * that's the 4K-fallback timing from the panel's own EDID. The cached
+	 * value sticks on the encoder.
+	 *
+	 * Later, dm_encoder_helper_atomic_check() compares the atomic-commit
+	 * mode against that cached native_mode (see
+	 * drm_crtc_helper_mode_valid_fixed). If they don't match it logs
+	 * "mode <WxH> is not native, enabling scaling" and the resulting
+	 * scaling configuration causes DC's validation to reject the commit
+	 * with -EINVAL (cold_boot_9 confirmed this exactly).
+	 *
+	 * We now own the primary's tile timing — it came from secondary's
+	 * panel-read EDID via the cache, marked PREFERRED. Update the
+	 * encoder so atomic_check sees a match and skips scaling. Same struct
+	 * assignment pattern used in amdgpu_dm_get_native_mode() itself.
+	 */
+	{
+		struct drm_encoder *encoder = amdgpu_dm_connector_to_encoder(connector);
+
+		if (encoder) {
+			struct amdgpu_encoder *amdgpu_encoder = to_amdgpu_encoder(encoder);
+
+			amdgpu_encoder->native_mode = *new_mode;
+			drm_info(connector->dev,
+				 "IMAC5K: encoder native_mode refreshed to tile mode %ux%u@%uHz clock=%u on %s (was the 4K-fallback EDID-preferred timing; prevents dm_encoder_helper_atomic_check from enabling the scaling path that DC rejects)\n",
+				 new_mode->hdisplay, new_mode->vdisplay,
+				 drm_mode_vrefresh(new_mode), new_mode->clock,
+				 connector->name);
+		} else {
+			drm_info(connector->dev,
+				 "IMAC5K: encoder native_mode refresh skipped on %s: no encoder bound (tile mode is in modelist but dm_encoder_helper_atomic_check may still scale)\n",
+				 connector->name);
+		}
+	}
+
 	return 1;
 }
 
