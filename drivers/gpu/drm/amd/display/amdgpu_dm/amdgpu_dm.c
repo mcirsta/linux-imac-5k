@@ -5529,17 +5529,20 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 	 * Block here until the secondary tile's HPD comes up — usually ~120 ms
 	 * after the 0x4F1=1 wake we just issued, per cold_boot_13 evidence.
 	 * This is what makes plain-boot match OCLP-boot timing: by blocking
-	 * the boot detect for-loop here (we are called from update_connector_
-	 * after_detect → note_plain_boot_candidate during the primary's i=0
-	 * iteration), the next iteration (i=1, DP-1) will start with the panel
-	 * fully awake and dc_link_detect will return a live sink with EDID,
-	 * which amdgpu_dm_update_connector_after_detect then turns into a
-	 * proper tile property on the DP-1 connector — all before drm_dev_
-	 * register fires the first hotplug to userspace.
+	 * the boot detect for-loop here, the next iteration (i=1, DP-1) will
+	 * start with the panel awake and dc_link_detect will return a live
+	 * sink with EDID. amdgpu_dm_update_connector_after_detect then turns
+	 * that into a proper tile property on DP-1 — all before drm_dev_register
+	 * fires the first hotplug to userspace. Result: Mutter classifies the
+	 * connectors as a tile pair from the first hotplug, exactly like OCLP.
 	 *
-	 * Result we expect in dmesg: DP-1's boot_detect log shows
-	 *   tile=1 size=2560x2880 loc=1,0 group_data=41505013ae8b8ae7
-	 * just like the secondary-preserved log does in OCLP boot.
+	 * cold_boot_14 PROVED this works: the very first Mutter commit was a
+	 * textbook tile pair (fb_size=5120x2880, plane src=0,0 and src=2560,0
+	 * from the same FB). The blank-screen issue in cold_boot_14 was a
+	 * SEPARATE bug in the cached-link-handoff gate that bypassed
+	 * link_state_valid when imac5k_trained_link_preserved was set; that
+	 * is fixed separately in
+	 * amdgpu_dm_imac5k_prepare_cached_link_handoff_for_streams.
 	 */
 	(void)amdgpu_dm_imac5k_wait_secondary_hpd(dev,
 			link->ctx ? link->ctx->dc : NULL,
@@ -7243,9 +7246,30 @@ amdgpu_dm_imac5k_prepare_cached_link_handoff_for_streams(
 			reason = "route-mismatch";
 		else if (!aux_armed)
 			reason = "aux-not-armed";
-		else if (!link->link_state_valid &&
-			 !link->imac5k_trained_link_preserved)
-			reason = "link-state-invalid";
+		/*
+		 * Cold-boot bug found in cold_boot_14: this gate USED to be
+		 *   (!link_state_valid && !imac5k_trained_link_preserved)
+		 * which allowed `preserved=1` (set inside DC's link training
+		 * success path) to bypass `link_state_valid=0`. That worked for
+		 * OCLP boot (where Apple firmware left both link_state_valid=1
+		 * and preserved=1), but on plain boot we hit a state where DC
+		 * had trained the link (so preserved=1) yet link_state_valid=0
+		 * because nothing had actually re-enabled the link after the
+		 * teardown that follows training. The cached-handoff path
+		 * then armed with link_active=0/link_state_valid=0 and SKIPPED
+		 * the normal stream-enable in DC. Result: link electrically
+		 * trained but no stream, blank screen.
+		 *
+		 * Tightened: require BOTH link_state_valid AND DC's link-active
+		 * state to say the link is actually active. If either is false, fall
+		 * through to normal DC training/stream-enable. The 0x4F1 latch
+		 * and source-DPCD finalization still happen later, in
+		 * commit_streams_end after dc_commit_streams has properly
+		 * trained-and-enabled the link.
+		 */
+		else if (!link->link_state_valid ||
+			 !link->link_status.link_active)
+			reason = "link-not-actually-active";
 		else if (!amdgpu_dm_imac5k_link_settings_known(
 				&link->cur_link_settings))
 			reason = "no-current-settings";
