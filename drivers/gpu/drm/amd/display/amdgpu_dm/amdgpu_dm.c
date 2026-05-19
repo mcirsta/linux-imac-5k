@@ -5213,6 +5213,166 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_followup_work(struct work_struct 
 		primary_changed, secondary_changed);
 }
 
+/*
+ * Find the secondary 5K tile's dc_link by raw object id (0x3113) without
+ * needing the secondary's drm_connector to exist yet.
+ *
+ * Why this exists: amdgpu_dm_imac5k_find_secondary_head() iterates the DRM
+ * connector list, but during the boot detect for-loop's i=0 iteration (when
+ * we wake the panel), the secondary connector hasn't been created yet — it
+ * will be created in the next iteration. We therefore have to find the
+ * secondary at the dc_link layer, which is fully populated by DC's earlier
+ * link enumeration in amdgpu_dm_init.
+ */
+static struct dc_link *
+amdgpu_dm_imac5k_find_secondary_link(struct dc *dc)
+{
+	u32 link_cnt;
+	u32 i;
+
+	if (!dc)
+		return NULL;
+
+	link_cnt = dc->link_count;
+	for (i = 0; i < link_cnt; i++) {
+		struct dc_link *link = dc_get_link_at_index(dc, i);
+		unsigned int raw_obj;
+
+		if (!link)
+			continue;
+		raw_obj = amdgpu_dm_imac5k_raw_object_id(link->link_id);
+		if (raw_obj == IMAC5K_WIN_SECONDARY_OBJECT_ID)
+			return link;
+	}
+	return NULL;
+}
+
+/*
+ * Block the caller (the boot detect for-loop, currently at the primary's
+ * i=0 iteration just after the 0x4F1=1 wake) until the secondary tile's
+ * HPD line comes up — meaning the panel's secondary AUX is awake and ready
+ * to answer the next dc_link_detect() that will fire in the i=1 iteration.
+ *
+ * Why we have to do this: cold_boot_13 proved the 0x4F1=1 wake works, but
+ * the panel's secondary side takes ~120 ms to bring HPD up. Without this
+ * wait, the for-loop's dc_link_detect on DP-1 runs at ~10 ms after the
+ * wake — HPD is still down, DC returns no sink, DP-1's connector ends up
+ * empty (no EDID, no tile property), and Mutter's first hotplug sees a
+ * standalone monitor instead of a tile pair. OCLP boot avoids this race
+ * because Apple firmware woke the panel pre-kernel.
+ *
+ * IMAC5K_HPD_READY_TIMEOUT_MS (300 ms) is generous — the observed wake-up
+ * time is ~120 ms, so we have ~180 ms margin.
+ *
+ * On success: returns true; the for-loop's next iteration will then run
+ * dc_link_detect on DP-1 and naturally populate its EDID + tile property
+ * via amdgpu_dm_update_connector_after_detect, exactly like OCLP boot.
+ *
+ * On failure (timeout): returns false; the existing post-probe async
+ * followup serves as a safety net by running the redetect later. We log
+ * the failure mode loudly so the dmesg can pinpoint what didn't behave.
+ */
+static bool amdgpu_dm_imac5k_wait_secondary_hpd(struct drm_device *dev,
+						struct dc *dc,
+						const char *tag)
+{
+	struct dc_link *secondary_link;
+	bool hpd_hw_initial = false;
+	bool hpd_cached_initial = false;
+	bool hpd_ready = false;
+	bool hpd_hw_final = false;
+	bool hpd_cached_final = false;
+	u32 elapsed_ms = 0;
+	u32 iters = 0;
+	u32 post_ready_delay_ms = 0;
+	u8 dpcd_rev = 0;
+	enum dc_status dpcd_rev_status = DC_ERROR_UNEXPECTED;
+	bool aux_dpcd_ready = false;
+
+	if (!dev || !dc) {
+		drm_info(dev,
+			 "IMAC5K: %s wait_secondary_hpd skip reason=missing-dev-or-dc dev=%p dc=%p\n",
+			 tag, dev, dc);
+		return false;
+	}
+
+	secondary_link = amdgpu_dm_imac5k_find_secondary_link(dc);
+	if (!secondary_link) {
+		drm_info(dev,
+			 "IMAC5K: %s wait_secondary_hpd skip reason=secondary-link-not-found dc=%p link_count=%u expected_raw_obj=0x%x\n",
+			 tag, dc, dc->link_count,
+			 IMAC5K_WIN_SECONDARY_OBJECT_ID);
+		return false;
+	}
+
+	hpd_hw_initial = dc_link_get_hpd_state(secondary_link);
+	hpd_cached_initial = secondary_link->hpd_status;
+	hpd_ready = hpd_hw_initial || hpd_cached_initial;
+
+	drm_info(dev,
+		 "IMAC5K: %s wait_secondary_hpd start link_index=%u raw_obj=0x%x signal=%d aux_mode=%u hpd_hw=%u hpd_cached=%u local_sink=%p timeout_ms=%u poll_interval_ms=%u — caller is blocking the boot detect for-loop until HPD comes up\n",
+		 tag, secondary_link->link_index,
+		 amdgpu_dm_imac5k_raw_object_id(secondary_link->link_id),
+		 secondary_link->connector_signal, secondary_link->aux_mode,
+		 hpd_hw_initial, hpd_cached_initial,
+		 secondary_link->local_sink,
+		 IMAC5K_HPD_READY_TIMEOUT_MS,
+		 IMAC5K_HPD_CHECK_INTERVAL_MS);
+
+	while (!hpd_ready && elapsed_ms < IMAC5K_HPD_READY_TIMEOUT_MS) {
+		msleep(IMAC5K_HPD_CHECK_INTERVAL_MS);
+		elapsed_ms += IMAC5K_HPD_CHECK_INTERVAL_MS;
+		iters++;
+		hpd_ready = dc_link_get_hpd_state(secondary_link) ||
+			    secondary_link->hpd_status;
+		/* Log every 5th iteration (~50 ms cadence) to avoid log spam
+		 * but still trace progress. */
+		if ((iters % 5) == 0)
+			drm_info(dev,
+				 "IMAC5K: %s wait_secondary_hpd polling link_index=%u elapsed_ms=%u iters=%u hpd_hw=%u hpd_cached=%u\n",
+				 tag, secondary_link->link_index,
+				 elapsed_ms, iters,
+				 dc_link_get_hpd_state(secondary_link),
+				 secondary_link->hpd_status);
+	}
+
+	hpd_hw_final = dc_link_get_hpd_state(secondary_link);
+	hpd_cached_final = secondary_link->hpd_status;
+	hpd_ready = hpd_hw_final || hpd_cached_final;
+
+	/* Even if HPD never went up, try a DPCD probe to see if the panel is
+	 * actually responsive at the AUX layer (cold_boot_13 showed AUX
+	 * working even with hpd_status=0). This is purely diagnostic — we do
+	 * not promote hpd_ready based on it because the for-loop's
+	 * dc_link_detect uses HPD state as its primary signal.
+	 */
+	dpcd_rev_status = core_link_read_dpcd(secondary_link, DP_DPCD_REV,
+					      &dpcd_rev, sizeof(dpcd_rev));
+	aux_dpcd_ready = dpcd_rev_status == DC_OK && dpcd_rev != 0;
+
+	/* Brief stabilization wait after HPD asserts. Same value the existing
+	 * connector-based helper uses (30 ms). Lets the panel's internal link
+	 * state quiesce before dc_link_detect runs in the next iteration.
+	 */
+	if (hpd_ready) {
+		post_ready_delay_ms = IMAC5K_POST_HPD_READY_DELAY_MS;
+		msleep(post_ready_delay_ms);
+	}
+
+	drm_info(dev,
+		 "IMAC5K: %s wait_secondary_hpd done link_index=%u elapsed_ms=%u iters=%u hpd_hw_initial=%u hpd_hw_final=%u hpd_cached_initial=%u hpd_cached_final=%u hpd_ready=%u aux_dpcd_ready=%u dpcd_rev=0x%02x dpcd_rev_status=%d post_ready_delay_ms=%u local_sink=%p aux_mode=%u — %s\n",
+		 tag, secondary_link->link_index, elapsed_ms, iters,
+		 hpd_hw_initial, hpd_hw_final, hpd_cached_initial,
+		 hpd_cached_final, hpd_ready, aux_dpcd_ready, dpcd_rev,
+		 dpcd_rev_status, post_ready_delay_ms,
+		 secondary_link->local_sink, secondary_link->aux_mode,
+		 hpd_ready ?
+		 "for-loop's next iteration should now find a live sink on DP-1" :
+		 "TIMEOUT — async followup will retry later as safety net");
+
+	return hpd_ready;
+}
+
 static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *aconnector)
 {
 	struct amdgpu_display_manager *dm;
@@ -5365,9 +5525,29 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 		 aconnector->base.name, link->link_index, dpcd_4f1_after,
 		 after_status);
 
+	/*
+	 * Block here until the secondary tile's HPD comes up — usually ~120 ms
+	 * after the 0x4F1=1 wake we just issued, per cold_boot_13 evidence.
+	 * This is what makes plain-boot match OCLP-boot timing: by blocking
+	 * the boot detect for-loop here (we are called from update_connector_
+	 * after_detect → note_plain_boot_candidate during the primary's i=0
+	 * iteration), the next iteration (i=1, DP-1) will start with the panel
+	 * fully awake and dc_link_detect will return a live sink with EDID,
+	 * which amdgpu_dm_update_connector_after_detect then turns into a
+	 * proper tile property on the DP-1 connector — all before drm_dev_
+	 * register fires the first hotplug to userspace.
+	 *
+	 * Result we expect in dmesg: DP-1's boot_detect log shows
+	 *   tile=1 size=2560x2880 loc=1,0 group_data=41505013ae8b8ae7
+	 * just like the secondary-preserved log does in OCLP boot.
+	 */
+	(void)amdgpu_dm_imac5k_wait_secondary_hpd(dev,
+			link->ctx ? link->ctx->dc : NULL,
+			"primary_4f1_probe");
+
 	if (secondary)
 		amdgpu_dm_imac5k_primary_4f1_probe_log_secondary(dev, secondary,
-								 "after10");
+								 "after_settle");
 
 	/*
 	 * Always schedule the followup, even if the secondary connector was not
