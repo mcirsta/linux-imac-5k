@@ -3475,6 +3475,39 @@ static void apply_delay_after_dpcd_poweroff(struct amdgpu_device *adev,
  */
 #define IMAC5K_PRIMARY_PROBE_POST_WRITE_MS 10
 #define IMAC5K_PRIMARY_PROBE_FOLLOWUP_MS   100
+
+static int amdgpu_dm_imac5k_wait_secondary_hpd_param;
+module_param_named(imac5k_wait_secondary_hpd,
+		   amdgpu_dm_imac5k_wait_secondary_hpd_param, int, 0444);
+MODULE_PARM_DESC(imac5k_wait_secondary_hpd,
+		 "iMac 5K experiment: wait for secondary HPD after primary 0x4F1 wake (0=skip fallback path, 1=force early tile-pair path)");
+
+static int amdgpu_dm_imac5k_primary_4f1_payload = 1;
+module_param_named(imac5k_primary_4f1_payload,
+		   amdgpu_dm_imac5k_primary_4f1_payload, int, 0444);
+MODULE_PARM_DESC(imac5k_primary_4f1_payload,
+		 "iMac 5K experiment: payload byte for primary DPCD 0x4F1 wake");
+
+static int amdgpu_dm_imac5k_secondary_4f1_payload = 1;
+module_param_named(imac5k_secondary_4f1_payload,
+		   amdgpu_dm_imac5k_secondary_4f1_payload, int, 0444);
+MODULE_PARM_DESC(imac5k_secondary_4f1_payload,
+		 "iMac 5K experiment: payload byte for secondary DPCD 0x4F1 latch");
+
+static int amdgpu_dm_imac5k_prewrite_primary_msa_ignore;
+module_param_named(imac5k_prewrite_primary_msa_ignore,
+		   amdgpu_dm_imac5k_prewrite_primary_msa_ignore, int, 0444);
+MODULE_PARM_DESC(imac5k_prewrite_primary_msa_ignore,
+		 "iMac 5K experiment: prewrite primary DPCD 0x107 MSA-ignore before primary 0x4F1 wake");
+
+static u8 amdgpu_dm_imac5k_4f1_payload(int payload, u8 fallback)
+{
+	if (payload < 0 || payload > 0xff)
+		return fallback;
+
+	return (u8)payload;
+}
+
 static unsigned int amdgpu_dm_imac5k_raw_object_id(struct graphics_object_id id)
 {
 	return dal_graphics_object_id_to_uint(id);
@@ -5373,6 +5406,76 @@ static bool amdgpu_dm_imac5k_wait_secondary_hpd(struct drm_device *dev,
 	return hpd_ready;
 }
 
+static void
+amdgpu_dm_imac5k_maybe_prewrite_primary_msa_ignore(
+		struct amdgpu_dm_connector *aconnector,
+		const char *tag)
+{
+	struct drm_device *dev;
+	struct dc_link *link;
+	enum dc_status read_status;
+	enum dc_status write_status = DC_ERROR_UNEXPECTED;
+	enum dc_status verify_status = DC_ERROR_UNEXPECTED;
+	u8 old_downspread = 0;
+	u8 new_downspread = 0;
+	u8 verify_downspread = 0;
+	bool changed = false;
+
+	if (!amdgpu_dm_imac5k_prewrite_primary_msa_ignore)
+		return;
+
+	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
+		return;
+
+	dev = aconnector->base.dev;
+	link = aconnector->dc_link;
+
+	if (!link->ctx) {
+		drm_info(dev,
+			 "IMAC5K: %s experiment prewrite primary MSA-ignore skipped connector=%s link=%u reason=missing-dc-ctx\n",
+			 tag ? tag : "<none>", aconnector->base.name,
+			 link->link_index);
+		return;
+	}
+
+	if (!amdgpu_dm_imac5k_link_matches_windows_role(link, false)) {
+		drm_info(dev,
+			 "IMAC5K: %s experiment prewrite primary MSA-ignore skipped connector=%s link=%u reason=not-primary-route\n",
+			 tag ? tag : "<none>", aconnector->base.name,
+			 link->link_index);
+		return;
+	}
+
+	read_status = core_link_read_dpcd(link, DP_DOWNSPREAD_CTRL,
+					 &old_downspread,
+					 sizeof(old_downspread));
+	new_downspread = old_downspread | DP_MSA_TIMING_PAR_IGNORE_EN;
+	changed = read_status == DC_OK && new_downspread != old_downspread;
+
+	if (read_status == DC_OK && !changed)
+		write_status = DC_OK;
+	else if (changed)
+		write_status = core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
+						    &new_downspread,
+						    sizeof(new_downspread));
+
+	if (read_status == DC_OK && (write_status == DC_OK || !changed))
+		verify_status = core_link_read_dpcd(link, DP_DOWNSPREAD_CTRL,
+						    &verify_downspread,
+						    sizeof(verify_downspread));
+
+	drm_info(dev,
+		 "IMAC5K: %s experiment prewrite primary MSA-ignore DPCD 0x107 connector=%s link=%u enabled=%d read_status=%d write_status=%d verify_status=%d old=0x%02x new=0x%02x verify=0x%02x changed=%u hpd=%u/%u live_sink=%u\n",
+		 tag ? tag : "<none>", aconnector->base.name,
+		 link->link_index,
+		 amdgpu_dm_imac5k_prewrite_primary_msa_ignore,
+		 read_status, write_status, verify_status,
+		 old_downspread, new_downspread, verify_downspread, changed,
+		 link->hpd_status,
+		 link->dc && link->dc->link_srv ? dc_link_get_hpd_state(link) : 0,
+		 !!link->local_sink);
+}
+
 static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *aconnector)
 {
 	struct amdgpu_display_manager *dm;
@@ -5385,7 +5488,9 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 	enum dc_status after_status;
 	u8 dpcd_4f1_before = 0xff;
 	u8 dpcd_4f1_after = 0xff;
-	u8 payload = 1;
+	u8 payload;
+	u8 secondary_payload;
+	bool hpd_waited;
 	bool retried = false;
 
 	if (!aconnector || !aconnector->base.dev || !aconnector->dc_link)
@@ -5394,6 +5499,10 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 	dm = &drm_to_adev(aconnector->base.dev)->dm;
 	dev = aconnector->base.dev;
 	link = aconnector->dc_link;
+	payload = amdgpu_dm_imac5k_4f1_payload(
+			amdgpu_dm_imac5k_primary_4f1_payload, 1);
+	secondary_payload = amdgpu_dm_imac5k_4f1_payload(
+			amdgpu_dm_imac5k_secondary_4f1_payload, 1);
 
 	/*
 	 * Minimal-gate Track-C probe. Only the gates below are correctness
@@ -5475,6 +5584,13 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 		 secondary && secondary->dc_link ?
 			secondary->dc_link->local_sink : NULL);
 
+	drm_info(dev,
+		 "IMAC5K: primary_4f1_probe experiment knobs wait_secondary_hpd=%d primary_4f1_payload_req=%d primary_4f1_payload=0x%02x secondary_4f1_payload_req=%d secondary_4f1_payload=0x%02x prewrite_primary_msa_ignore=%d\n",
+		 amdgpu_dm_imac5k_wait_secondary_hpd_param,
+		 amdgpu_dm_imac5k_primary_4f1_payload, payload,
+		 amdgpu_dm_imac5k_secondary_4f1_payload, secondary_payload,
+		 amdgpu_dm_imac5k_prewrite_primary_msa_ignore);
+
 	amdgpu_dm_log_link_route(dev, link, "primary_4f1_probe",
 				 aconnector->base.name, link->link_index, true);
 	drm_info(dev,
@@ -5489,6 +5605,9 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 	else
 		drm_info(dev,
 			 "IMAC5K: primary_4f1_probe before secondary connector=<absent>\n");
+
+	amdgpu_dm_imac5k_maybe_prewrite_primary_msa_ignore(aconnector,
+							   "primary_4f1_probe");
 
 	before_status = core_link_read_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
 					    &dpcd_4f1_before, sizeof(dpcd_4f1_before));
@@ -5526,27 +5645,38 @@ static void amdgpu_dm_imac5k_primary_4f1_probe_once(struct amdgpu_dm_connector *
 		 after_status);
 
 	/*
-	 * Block here until the secondary tile's HPD comes up — usually ~120 ms
-	 * after the 0x4F1=1 wake we just issued, per cold_boot_13 evidence.
-	 * This is what makes plain-boot match OCLP-boot timing: by blocking
-	 * the boot detect for-loop here, the next iteration (i=1, DP-1) will
-	 * start with the panel awake and dc_link_detect will return a live
-	 * sink with EDID. amdgpu_dm_update_connector_after_detect then turns
-	 * that into a proper tile property on DP-1 — all before drm_dev_register
-	 * fires the first hotplug to userspace. Result: Mutter classifies the
-	 * connectors as a tile pair from the first hotplug, exactly like OCLP.
+	 * cold_boot_14 & 15 evidence: when we wait for HPD here, the for-loop's
+	 * DP-1 detect succeeds in time and Mutter classifies the connectors as
+	 * a tile pair from the first hotplug. Mutter then commits proper 5K
+	 * frames (fb_size=5120x2880, plane src=0,0 and 2560,0 from one FB).
+	 * BUT the panel showed BLANK SCREEN in both runs — with both the loose
+	 * (cold_boot_14) and tightened (cold_boot_15) cached-link-handoff
+	 * gates. cold_boot_13, which did NOT wait for HPD, made Mutter fall
+	 * back to extended-desktop mode and the panel DID show content
+	 * (half-stretched).
 	 *
-	 * cold_boot_14 PROVED this works: the very first Mutter commit was a
-	 * textbook tile pair (fb_size=5120x2880, plane src=0,0 and src=2560,0
-	 * from the same FB). The blank-screen issue in cold_boot_14 was a
-	 * SEPARATE bug in the cached-link-handoff gate that bypassed
-	 * link_state_valid when imac5k_trained_link_preserved was set; that
-	 * is fixed separately in
-	 * amdgpu_dm_imac5k_prepare_cached_link_handoff_for_streams.
+	 * Hypothesis: our wake byte (DPCD 0x4F1=1 to the PRIMARY) puts the
+	 * panel into a "single-source" receive mode that accepts ONE incoming
+	 * stream and stretches/scales it across both tiles. OCLP boot inherits
+	 * the panel in tile-pair-receive mode (Apple firmware sets that up
+	 * pre-kernel). With our wake, two-stream tile-pair commits go blank.
+	 *
+	 * Until we find the right wake sequence for tile-pair-receive, keep
+	 * the default on the visible fallback path and make the early
+	 * tile-pair path opt-in via amdgpu.imac5k_wait_secondary_hpd=1.
 	 */
-	(void)amdgpu_dm_imac5k_wait_secondary_hpd(dev,
-			link->ctx ? link->ctx->dc : NULL,
-			"primary_4f1_probe");
+	if (amdgpu_dm_imac5k_wait_secondary_hpd_param) {
+		hpd_waited = amdgpu_dm_imac5k_wait_secondary_hpd(dev,
+				link->ctx ? link->ctx->dc : NULL,
+				"primary_4f1_probe");
+		drm_info(dev,
+			 "IMAC5K: primary_4f1_probe experiment wait_secondary_hpd enabled result=%u; early tile-pair path requested\n",
+			 hpd_waited);
+	} else {
+		drm_info(dev,
+		 "IMAC5K: primary_4f1_probe wait_secondary_hpd SKIPPED — cold_boot_14/15 evidence: tile-pair commits go blank because primary 0x4F1=1 wakes panel into single-source receive mode. Letting Mutter fall back to extended-desktop (cold_boot_13 path) until we find the right tile-pair wake sequence.\n");
+
+	}
 
 	if (secondary)
 		amdgpu_dm_imac5k_primary_4f1_probe_log_secondary(dev, secondary,
@@ -6414,7 +6544,8 @@ amdgpu_dm_imac5k_write_secondary_4f1_latch(
 	enum dc_status sink_status_status = DC_ERROR_UNEXPECTED;
 	enum dc_status status;
 	u8 dpcd_rev = 0;
-	u8 payload = 1;
+	u8 payload = amdgpu_dm_imac5k_4f1_payload(
+			amdgpu_dm_imac5k_secondary_4f1_payload, 1);
 	u8 sink_status = 0;
 	bool allow_cached_link_state;
 	bool aux_evidence;
