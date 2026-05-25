@@ -28,12 +28,13 @@
  * as PSR and ABM and it also manages specs defined eDP panel power sequences.
  */
 
+#include <linux/dmi.h>
+
 #include "link_edp_panel_control.h"
 #include "link_dpcd.h"
 #include "link_dp_capability.h"
 #include "dm_helpers.h"
 #include "dal_asic_id.h"
-#include "grph_object_id.h"
 #include "link_dp_phy.h"
 #include "dce/dmub_psr.h"
 #include "dc/dc_dmub_srv.h"
@@ -41,6 +42,7 @@
 #include "abm.h"
 #include "resource.h"
 #include "link_dp_panel_replay.h"
+#include "grph_object_id.h"
 #define DC_LOGGER \
 	link->ctx->logger
 #define DC_LOGGER_INIT(logger)
@@ -51,6 +53,10 @@
 
 static bool link_is_imac5k_secondary_assr_route(const struct dc_link *link)
 {
+	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
+	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1"))
+		return false;
+
 	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
 		return false;
 

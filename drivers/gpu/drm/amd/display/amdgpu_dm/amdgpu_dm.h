@@ -32,7 +32,6 @@
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_plane.h>
-#include "dc_types.h"
 #include "link_service_types.h"
 #include <drm/drm_writeback.h>
 
@@ -317,17 +316,6 @@ struct hpd_rx_irq_offload_work {
 	 * @adev: amdgpu_device pointer
 	 */
 	struct amdgpu_device *adev;
-};
-
-enum amdgpu_dm_imac5k_state {
-	AMDGPU_DM_IMAC5K_STATE_OFF = 0,
-	AMDGPU_DM_IMAC5K_STATE_PRIMARY_SEEN,
-	AMDGPU_DM_IMAC5K_STATE_SECONDARY_ROUTE_SEEN,
-	AMDGPU_DM_IMAC5K_STATE_SECONDARY_AUX_ARMED,
-	AMDGPU_DM_IMAC5K_STATE_ONE_TILE_DEFERRED,
-	AMDGPU_DM_IMAC5K_STATE_PAIR_READY,
-	AMDGPU_DM_IMAC5K_STATE_SECONDARY_STREAM_INSTALLED,
-	AMDGPU_DM_IMAC5K_STATE_FIRST_TWO_STREAM_COMMIT,
 };
 
 /**
@@ -680,149 +668,6 @@ struct amdgpu_display_manager {
 	bool edp0_on_dp1_quirk;
 
 	/**
-	 * @imac5k_tiled_display_quirk:
-	 *
-	 * Temporary bring-up quirk for Apple iMac19,1-class internal 5K tiled
-	 * panels. Stage 1 preserves the secondary half after probe-style boot.
-	 */
-	bool imac5k_tiled_display_quirk;
-
-	/**
-	 * @imac5k_plain_boot_route_probe_quirk:
-	 *
-	 * Stage 2 route-discovery scaffolding flag. The current patch does not
-	 * synthesize a connector; it records when the real secondary 0x3113
-	 * route is missing on plain boot.
-	 */
-	bool imac5k_plain_boot_route_probe_quirk;
-
-	/**
-	 * @imac5k_secondary_head_detected:
-	 *
-	 * True once the secondary 2560x2880 half has been identified on this
-	 * boot path.
-	 */
-	bool imac5k_secondary_head_detected;
-
-	/**
-	 * @imac5k_primary_head_seen:
-	 *
-	 * True once the primary internal 2560x2880 tile has been identified and
-	 * its TILE property has been normalized.
-	 */
-	bool imac5k_primary_head_seen;
-
-	/**
-	 * @imac5k_pair_ready:
-	 *
-	 * True once both real tile heads have compatible TILE metadata and the
-	 * secondary 0x3113 AUX path has the pre-userspace setup evidence that
-	 * Windows keeps before grouped commit.
-	 */
-	bool imac5k_pair_ready;
-
-	/**
-	 * @imac5k_stream_handoff_ready:
-	 *
-	 * True once a proposed or committed DC state contains both real tile
-	 * streams: the primary 0x3114/eDP half and the secondary 0x3113/DP
-	 * half. RE-15 showed that Windows' grouped path needs the secondary
-	 * live stream installed, not just route/AUX/TILE evidence.
-	 */
-	bool imac5k_stream_handoff_ready;
-
-	/**
-	 * @imac5k_state:
-	 *
-	 * Lightweight bring-up state machine used only for the iMac 5K quirk.
-	 * It records how far the real two-tile path progressed before userspace.
-	 */
-	enum amdgpu_dm_imac5k_state imac5k_state;
-
-	/**
-	 * @imac5k_state_transitions:
-	 *
-	 * Diagnostic counter for state-machine transitions.
-	 */
-	unsigned int imac5k_state_transitions;
-
-	/**
-	 * @imac5k_two_tile_streams_seen:
-	 *
-	 * Armed after DC has accepted a two-stream 2560x2880 tiled iMac5K
-	 * state. Later userspace modesets that propose fewer streams are
-	 * rejected while the current DC state still has both real tile roles,
-	 * matching the Windows behavior found in RE-16: partial modesets carry
-	 * the unmentioned live peer stream forward instead of clearing it.
-	 */
-	bool imac5k_two_tile_streams_seen;
-
-	/**
-	 * @imac5k_stream_drop_attempts:
-	 *
-	 * Diagnostic counter for userspace/DC states rejected because they
-	 * would drop below the armed two-stream iMac5K state.
-	 */
-	unsigned int imac5k_stream_drop_attempts;
-
-	/**
-	 * @imac5k_primary_only_deferrals:
-	 *
-	 * Diagnostic counter for primary-only tiled commits deferred by the
-	 * readiness barrier after the secondary route has already been armed.
-	 */
-	unsigned int imac5k_primary_only_deferrals;
-
-	/**
-	 * @imac5k_plain_boot_candidate_seen:
-	 *
-	 * Set when the primary internal tile is present but the secondary half
-	 * has not been preserved/discovered, which is the Stage 2 real-route
-	 * construction starting point.
-	 */
-	bool imac5k_plain_boot_candidate_seen;
-
-	/**
-	 * @imac5k_primary_4f1_probe_done:
-	 *
-	 * One-shot latch for the Track-C debug probe that writes sink DPCD 0x4F1
-	 * once on the primary AUX route to test whether it wakes secondary
-	 * 0x3113 AUX/HPD. Stays set for the lifetime of the boot once the probe
-	 * has fired (or has been skipped after passing the gate).
-	 */
-	bool imac5k_primary_4f1_probe_done;
-
-	/**
-	 * @imac5k_primary_4f1_probe_followup:
-	 *
-	 * Delayed-work hook used by the Track-C probe to take a second
-	 * post-write snapshot of the secondary route ~100 ms after the primary
-	 * 0x4F1=1 write. Initialised in amdgpu_dm_init() and cancelled in
-	 * amdgpu_dm_fini().
-	 */
-	struct delayed_work imac5k_primary_4f1_probe_followup;
-
-	/**
-	 * @imac5k_primary_4f1_probe_secondary:
-	 *
-	 * Cached secondary aconnector captured at probe-trigger time so the
-	 * delayed follow-up snapshot can reach the right dc_link without
-	 * walking connectors under a delayed-work context.
-	 */
-	struct amdgpu_dm_connector *imac5k_primary_4f1_probe_secondary;
-
-	/**
-	 * @imac5k_primary_4f1_probe_primary:
-	 *
-	 * Cached primary aconnector. The post-probe follow-up triggers a
-	 * re-detect on the primary so its EDID is re-read after the panel
-	 * transitions into paired-tile mode (otherwise its modelist would
-	 * still report the 4K-fallback single-mode shape and any tile-mode
-	 * atomic commit would fail to validate).
-	 */
-	struct amdgpu_dm_connector *imac5k_primary_4f1_probe_primary;
-
-	/**
 	 * @dpia_aux_lock:
 	 *
 	 * Guards access to DPIA AUX
@@ -992,41 +837,6 @@ struct amdgpu_dm_connector {
 	/* Automated testing */
 	bool timing_changed;
 	struct dc_crtc_timing *timing_requested;
-
-	/* Temporary iMac 5K bring-up markers for the real secondary DP half. */
-	bool imac5k_secondary_head;
-	bool imac5k_aux_ready_wait_done;
-	bool imac5k_dpcd_111_attempted;
-	bool imac5k_dpcd_111_asserted;
-	bool imac5k_dpcd_10a_attempted;
-	bool imac5k_dpcd_10a_asserted;
-	bool imac5k_dpcd_316_observed;
-	bool imac5k_source_dpcd_programmed;
-	bool imac5k_dpcd_4f1_asserted;
-	bool imac5k_real_route_seen;
-	bool imac5k_preserved_edid_valid;
-	struct dc_edid imac5k_preserved_edid;
-	bool imac5k_preserved_tile_valid;
-	uint8_t imac5k_preserved_tile_group[8];
-	bool imac5k_preserved_tile_single_monitor;
-	unsigned int imac5k_preserved_num_h_tile;
-	unsigned int imac5k_preserved_num_v_tile;
-	unsigned int imac5k_preserved_tile_h_loc;
-	unsigned int imac5k_preserved_tile_v_loc;
-	unsigned int imac5k_preserved_tile_h_size;
-	unsigned int imac5k_preserved_tile_v_size;
-
-	/*
-	 * iMac 5K secondary's 2560x2880 mode captured from the secondary's
-	 * panel-read EDID during its get_modes call, before DRM's helper
-	 * validation/filtering can churn it. The primary's get_modes uses this
-	 * cache to inject the same timing onto its modelist, because by the
-	 * time primary's get_modes runs the secondary's probed_modes/modes
-	 * lists are in unpredictable states (probed_modes was just cleared,
-	 * modes hasn't been re-populated yet, or holds only smaller modes).
-	 */
-	bool imac5k_tile_mode_cached;
-	struct drm_display_mode imac5k_tile_mode_cache;
 
 	/* Adaptive Sync */
 	bool pack_sdp_v1_3;

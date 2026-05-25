@@ -32,15 +32,11 @@
 struct amdgpu_dm_quirks {
 	bool aux_hpd_discon;
 	bool support_edp0_on_dp1;
-	bool imac5k_tiled_display;
-	bool imac5k_plain_boot_route_probe;
 };
 
 static struct amdgpu_dm_quirks quirk_entries = {
 	.aux_hpd_discon = false,
-	.support_edp0_on_dp1 = false,
-	.imac5k_tiled_display = false,
-	.imac5k_plain_boot_route_probe = false,
+	.support_edp0_on_dp1 = false
 };
 
 static int edp0_on_dp1_callback(const struct dmi_system_id *id)
@@ -52,13 +48,6 @@ static int edp0_on_dp1_callback(const struct dmi_system_id *id)
 static int aux_hpd_discon_callback(const struct dmi_system_id *id)
 {
 	quirk_entries.aux_hpd_discon = true;
-	return 0;
-}
-
-static int imac5k_tiled_display_callback(const struct dmi_system_id *id)
-{
-	quirk_entries.imac5k_tiled_display = true;
-	quirk_entries.imac5k_plain_boot_route_probe = true;
 	return 0;
 }
 
@@ -161,13 +150,6 @@ static const struct dmi_system_id dmi_quirk_table[] = {
 			DMI_MATCH(DMI_PRODUCT_NAME, "HP ProBook 465 16 inch G11 Notebook PC"),
 		},
 	},
-	{
-		.callback = imac5k_tiled_display_callback,
-		.matches = {
-			DMI_MATCH(DMI_SYS_VENDOR, "Apple Inc."),
-			DMI_MATCH(DMI_PRODUCT_NAME, "iMac19,1"),
-		},
-	},
 	{}
 	/* TODO: refactor this from a fixed table to a dynamic option */
 };
@@ -179,20 +161,6 @@ void retrieve_dmi_info(struct amdgpu_display_manager *dm)
 
 	dm->aux_hpd_discon_quirk = false;
 	dm->edp0_on_dp1_quirk = false;
-	dm->imac5k_tiled_display_quirk = false;
-	dm->imac5k_plain_boot_route_probe_quirk = false;
-	dm->imac5k_secondary_head_detected = false;
-	dm->imac5k_primary_head_seen = false;
-	dm->imac5k_pair_ready = false;
-	dm->imac5k_state = AMDGPU_DM_IMAC5K_STATE_OFF;
-	dm->imac5k_state_transitions = 0;
-	dm->imac5k_two_tile_streams_seen = false;
-	dm->imac5k_stream_drop_attempts = 0;
-	dm->imac5k_primary_only_deferrals = 0;
-	dm->imac5k_plain_boot_candidate_seen = false;
-	dm->imac5k_primary_4f1_probe_done = false;
-	dm->imac5k_primary_4f1_probe_secondary = NULL;
-	dm->imac5k_primary_4f1_probe_primary = NULL;
 
 	dmi_id = dmi_check_system(dmi_quirk_table);
 
@@ -206,13 +174,5 @@ void retrieve_dmi_info(struct amdgpu_display_manager *dm)
 	if (quirk_entries.support_edp0_on_dp1) {
 		dm->edp0_on_dp1_quirk = true;
 		drm_info(dev, "support_edp0_on_dp1 attached\n");
-	}
-	if (quirk_entries.imac5k_tiled_display) {
-		dm->imac5k_tiled_display_quirk = true;
-		drm_info(dev, "IMAC5K: tiled-display preservation quirk attached\n");
-	}
-	if (quirk_entries.imac5k_plain_boot_route_probe) {
-		dm->imac5k_plain_boot_route_probe_quirk = true;
-		drm_info(dev, "IMAC5K: plain-boot real-route probe scaffold attached\n");
 	}
 }

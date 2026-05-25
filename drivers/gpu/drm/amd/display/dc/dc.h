@@ -1578,15 +1578,6 @@ struct dc_scratch_space {
 	struct dc_stream_state stream_state;
 };
 
-enum dc_imac5k_stream_enable_state {
-	DC_IMAC5K_STREAM_ENABLE_STATE_OFF = 0,
-	DC_IMAC5K_STREAM_ENABLE_STATE_ALREADY_LINK_CONFIGURED = 1,
-	DC_IMAC5K_STREAM_ENABLE_STATE_NORMAL_ENABLED = 2,
-	DC_IMAC5K_STREAM_ENABLE_STATE_STATE1_ENABLED = 3,
-	DC_IMAC5K_STREAM_ENABLE_STATE_BLANK_QUIESCE = 4,
-	DC_IMAC5K_STREAM_ENABLE_STATE_QUIESCED = 5,
-};
-
 /*
  * A link contains one or more sinks and their connected status.
  * The currently active signal type (HDMI, DP-SST, DP-MST) is also reported.
@@ -1639,24 +1630,6 @@ enum dc_imac5k_stream_enable_state {
 	struct dc_link_settings reported_link_cap;
 	struct dc_link_settings verified_link_cap;
 	struct dc_link_settings cur_link_settings;
-	bool imac5k_cached_link_handoff_allowed;
-	bool imac5k_cached_link_handoff_consumed;
-	struct dc_link_settings imac5k_cached_link_settings;
-	uint32_t imac5k_cached_link_aux_evidence;
-	enum dc_imac5k_stream_enable_state imac5k_stream_enable_state;
-	bool imac5k_stream_state_dpcd_valid;
-	struct dc_link_settings imac5k_stream_state_dpcd_settings;
-	uint8_t imac5k_stream_state_dpcd_003;
-	uint8_t imac5k_stream_state_dpcd_100;
-	uint8_t imac5k_stream_state_dpcd_101;
-	uint8_t imac5k_stream_state_dpcd_202;
-	uint8_t imac5k_stream_state_dpcd_203;
-	bool imac5k_trained_link_preserved;
-	bool imac5k_skip_d3_after_trained;
-	uint8_t imac5k_trained_link_dpcd_005;
-	uint8_t imac5k_trained_link_dpcd_080;
-	uint8_t imac5k_trained_link_dpcd_600;
-	uint8_t imac5k_trained_link_branch_500_508[9];
 	struct dc_lane_settings cur_lane_setting[LANE_COUNT_DP_MAX];
 	struct dc_link_settings preferred_link_setting;
 	/* preferred_training_settings are override values that

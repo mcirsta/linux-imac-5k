@@ -34,6 +34,8 @@
  * structure used to represent link capability instead of function interfaces.
  */
 
+#include <linux/dmi.h>
+
 #include "link_dp_capability.h"
 #include "link_ddc.h"
 #include "link_dpcd.h"
@@ -59,7 +61,6 @@
 
 #define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
 #define IMAC5K_WIN_SECONDARY_DDC_HW_INST 2
-#define IMAC5K_CACHED_LINK_EVIDENCE_SOURCE_DPCD (1U << 1)
 
 #ifndef MAX
 #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
@@ -67,6 +68,58 @@
 #ifndef MIN
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
 #endif
+
+static bool link_is_imac5k_secondary_source_dpcd_route(
+	const struct dc_link *link)
+{
+	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
+	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1"))
+		return false;
+
+	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
+		return false;
+
+	if (dal_graphics_object_id_to_uint(link->link_id) !=
+	    IMAC5K_WIN_SECONDARY_OBJECT_ID)
+		return false;
+
+	if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
+		return false;
+
+	if (!link->link_enc ||
+	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
+		return false;
+
+	return true;
+}
+
+static void dpcd_set_imac5k_secondary_source_table_revision(
+	struct dc_link *link)
+{
+	uint8_t table_revision[3];
+	enum dc_status status;
+
+	if (!link_is_imac5k_secondary_source_dpcd_route(link) ||
+	    !link->ctx || !link->dc)
+		return;
+
+	table_revision[0] = link->ctx->dce_version >= DCE_VERSION_12_0 ?
+			    0x05 : 0x04;
+	table_revision[1] = 0x1d;
+	table_revision[2] = 0x03;
+
+	status = core_link_write_dpcd(link, DP_SOURCE_TABLE_REVISION,
+				      table_revision, sizeof(table_revision));
+
+	DC_LOG_WARNING("IMAC5K: secondary 0x3113 source-DPCD 0x310 link=%u raw_obj=0x%x ddc_hw=%u tx=%d dce=%d status=%d value=%02x %02x %02x\n",
+		       link->link_index,
+		       dal_graphics_object_id_to_uint(link->link_id),
+		       link->ddc_hw_inst,
+		       link->link_enc ? link->link_enc->transmitter : -1,
+		       link->ctx->dce_version, status,
+		       table_revision[0], table_revision[1],
+		       table_revision[2]);
+}
 
 struct dp_lt_fallback_entry {
 	enum dc_lane_count lane_count;
@@ -108,58 +161,6 @@ static const struct dc_link_settings fail_safe_link_settings = {
 		.link_rate = LINK_RATE_LOW,
 		.link_spread = LINK_SPREAD_DISABLED,
 };
-
-static bool link_is_imac5k_secondary_source_dpcd_route(
-	const struct dc_link *link)
-{
-	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
-		return false;
-
-	if (dal_graphics_object_id_to_uint(link->link_id) !=
-	    IMAC5K_WIN_SECONDARY_OBJECT_ID)
-		return false;
-
-	if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
-		return false;
-
-	if (!link->link_enc ||
-	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
-		return false;
-
-	return true;
-}
-
-static void dpcd_set_imac5k_secondary_source_table_revision(
-	struct dc_link *link)
-{
-	uint8_t table_revision[3];
-	enum dc_status status;
-
-	if (!link_is_imac5k_secondary_source_dpcd_route(link) ||
-	    !link->ctx || !link->dc)
-		return;
-
-	table_revision[0] = link->ctx->dce_version >= DCE_VERSION_12_0 ?
-			    0x05 : 0x04;
-	table_revision[1] = 0x1d;
-	table_revision[2] = 0x03;
-
-	status = core_link_write_dpcd(link, DP_SOURCE_TABLE_REVISION,
-				      table_revision, sizeof(table_revision));
-	if (status == DC_OK)
-		link->imac5k_cached_link_aux_evidence |=
-			IMAC5K_CACHED_LINK_EVIDENCE_SOURCE_DPCD;
-
-	DC_LOG_WARNING("IMAC5K: lower source-DPCD table revision link=%u raw_obj=0x%x ddc_hw=%u tx=%d dce=%d status=%d 0x310=%02x %02x %02x evidence=0x%x\n",
-		       link->link_index,
-		       dal_graphics_object_id_to_uint(link->link_id),
-		       link->ddc_hw_inst,
-		       link->link_enc ? link->link_enc->transmitter : -1,
-		       link->ctx->dce_version, status,
-		       table_revision[0], table_revision[1],
-		       table_revision[2],
-		       link->imac5k_cached_link_aux_evidence);
-}
 
 bool is_dp_active_dongle(const struct dc_link *link)
 {
@@ -1542,11 +1543,6 @@ void dpcd_set_source_specific_data(struct dc_link *link)
 				sizeof(link->dc->vendor_signature.data.raw));
 	}
 
-	/*
-	 * Windows publishes the 0x310 source table revision in this same lower
-	 * source-DPCD phase before caps/training. Keep this exact iMac route
-	 * here instead of relying on the higher DM grouped-view path.
-	 */
 	dpcd_set_imac5k_secondary_source_table_revision(link);
 }
 

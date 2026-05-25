@@ -69,16 +69,6 @@
 
 #include "dcn10/dcn10_hwseq.h"
 
-/* iMac 5K AUX-death diagnostic helpers; defined in dc/link/protocols/link_dp_phy.c */
-extern void dp_imac5k_log_phy_event(struct dc_link *link, const char *func,
-				    const char *checkpoint);
-extern void dp_imac5k_probe_peer_aux(struct dc_link *acting_link,
-				     const char *func, const char *checkpoint);
-extern bool dp_imac5k_link_preserves_secondary_output(
-				     const struct dc_link *link);
-extern bool dp_imac5k_any_link_preserves_secondary_output(
-				     const struct dc *dc);
-
 #define GAMMA_HW_POINTS_NUM 256
 
 /*
@@ -1731,42 +1721,12 @@ static void power_down_encoders(struct dc *dc)
 		struct link_encoder *link_enc = link->link_enc;
 		enum signal_type signal = link->connector_signal;
 
-		dp_imac5k_log_phy_event(link, "power_down_encoders",
-					"iter-entry");
-		dp_imac5k_probe_peer_aux(link, "power_down_encoders",
-					 "iter-entry");
-
-		/*
-		 * iMac 5K: the trained secondary 0x3113 route must survive
-		 * accelerated-mode entry. This loop bypasses
-		 * dp_disable_link_phy() and would otherwise power down
-		 * UNIPHY_D (killing AUX) and clear cur_link_settings, even
-		 * though the preservation conditions are armed.
-		 */
-		if (dp_imac5k_link_preserves_secondary_output(link)) {
-			dp_imac5k_log_phy_event(link, "power_down_encoders",
-						"iter-skip-preserved");
-			dp_imac5k_probe_peer_aux(link, "power_down_encoders",
-						 "iter-skip-preserved");
-			continue;
-		}
-
 		dc->link_srv->blank_dp_stream(link, false);
 		if (signal != SIGNAL_TYPE_EDP)
 			signal = SIGNAL_TYPE_NONE;
 
-		dp_imac5k_log_phy_event(link, "power_down_encoders",
-					"before-link-enc-disable-output");
-		dp_imac5k_probe_peer_aux(link, "power_down_encoders",
-					 "before-link-enc-disable-output");
-
 		if (link->ep_type == DISPLAY_ENDPOINT_PHY)
 			link_enc->funcs->disable_output(link_enc, signal);
-
-		dp_imac5k_log_phy_event(link, "power_down_encoders",
-					"after-link-enc-disable-output");
-		dp_imac5k_probe_peer_aux(link, "power_down_encoders",
-					 "after-link-enc-disable-output");
 
 		if (link->fec_state == dc_link_fec_enabled) {
 			link_enc->funcs->fec_set_enable(link_enc, false);
@@ -1776,25 +1736,6 @@ static void power_down_encoders(struct dc *dc)
 
 		link->link_status.link_active = false;
 		memset(&link->cur_link_settings, 0, sizeof(link->cur_link_settings));
-
-		dp_imac5k_log_phy_event(link, "power_down_encoders",
-					"iter-exit-after-cur-link-cleared");
-	}
-}
-
-/*
- * iMac 5K: probe every link at a named (func, checkpoint) pair so the next
- * dmesg pins exactly which sub-step of the early teardown kills the
- * preserved secondary 0x3113 route. No-op on non-iMac links.
- */
-static void imac5k_hwseq_checkpoint(struct dc *dc, const char *func,
-				    const char *checkpoint)
-{
-	unsigned int i;
-
-	for (i = 0; i < dc->link_count; i++) {
-		dp_imac5k_log_phy_event(dc->links[i], func, checkpoint);
-		dp_imac5k_probe_peer_aux(dc->links[i], func, checkpoint);
 	}
 }
 
@@ -1803,16 +1744,8 @@ static void power_down_controllers(struct dc *dc)
 	int i;
 
 	for (i = 0; i < dc->res_pool->timing_generator_count; i++) {
-		char cp[48];
-
-		snprintf(cp, sizeof(cp), "before-disable-crtc-tg%d", i);
-		imac5k_hwseq_checkpoint(dc, "power_down_controllers", cp);
-
 		dc->res_pool->timing_generators[i]->funcs->disable_crtc(
 				dc->res_pool->timing_generators[i]);
-
-		snprintf(cp, sizeof(cp), "after-disable-crtc-tg%d", i);
-		imac5k_hwseq_checkpoint(dc, "power_down_controllers", cp);
 	}
 }
 
@@ -1820,69 +1753,27 @@ static void power_down_clock_sources(struct dc *dc)
 {
 	int i;
 
-	imac5k_hwseq_checkpoint(dc, "power_down_clock_sources",
-				"before-dp-clock-source");
 	if (dc->res_pool->dp_clock_source->funcs->cs_power_down(
 		dc->res_pool->dp_clock_source) == false)
 		dm_error("Failed to power down pll! (dp clk src)\n");
-	imac5k_hwseq_checkpoint(dc, "power_down_clock_sources",
-				"after-dp-clock-source");
 
 	for (i = 0; i < dc->res_pool->clk_src_count; i++) {
-		char cp[48];
-
-		snprintf(cp, sizeof(cp), "before-clock-source-%d", i);
-		imac5k_hwseq_checkpoint(dc, "power_down_clock_sources", cp);
-
 		if (dc->res_pool->clock_sources[i]->funcs->cs_power_down(
 				dc->res_pool->clock_sources[i]) == false)
 			dm_error("Failed to power down pll! (clk src index=%d)\n", i);
-
-		snprintf(cp, sizeof(cp), "after-clock-source-%d", i);
-		imac5k_hwseq_checkpoint(dc, "power_down_clock_sources", cp);
 	}
 }
 
 static void power_down_all_hw_blocks(struct dc *dc)
 {
-	bool preserve_imac5k = dp_imac5k_any_link_preserves_secondary_output(dc);
-
-	imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks", "entry");
-
 	power_down_encoders(dc);
-	imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks", "after-encoders");
 
-	/*
-	 * iMac 5K: obs_21 proved the AtomBIOS enable_crtc(false) issued by
-	 * power_down_controllers (disable_crtc on the controller driving the
-	 * secondary tile) kills the secondary 0x3113 AUX. obs_20 proved the
-	 * clock-source teardown is also fatal. Skip both while the secondary
-	 * route is armed. The main path is the seamless-boot-equivalent skip
-	 * in dce110_enable_accelerated_mode; these inner skips are
-	 * defense-in-depth for the other caller (dce110_power_down). The
-	 * subsequent commit re-programs controllers and clock sources.
-	 */
-	if (preserve_imac5k)
-		imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks",
-				"controllers-skipped-imac5k-preserve");
-	else
-		power_down_controllers(dc);
-	imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks",
-				"after-controllers");
+	power_down_controllers(dc);
 
-	if (preserve_imac5k)
-		imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks",
-				"clock-sources-skipped-imac5k-preserve");
-	else
-		power_down_clock_sources(dc);
-	imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks",
-				"after-clock-sources");
+	power_down_clock_sources(dc);
 
 	if (dc->fbc_compressor)
 		dc->fbc_compressor->funcs->disable_fbc(dc->fbc_compressor);
-
-	imac5k_hwseq_checkpoint(dc, "power_down_all_hw_blocks",
-				"sequence-complete");
 }
 
 static void disable_vga_and_power_gate_all_controllers(
@@ -1892,56 +1783,25 @@ static void disable_vga_and_power_gate_all_controllers(
 	struct timing_generator *tg;
 	struct dc_context *ctx = dc->ctx;
 
-	imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate", "entry");
-
-	if (dc->caps.ips_support) {
-		imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate",
-					"exit-ips-support");
+	if (dc->caps.ips_support)
 		return;
-	}
-
-	/*
-	 * iMac 5K: defense-in-depth for the dce110_power_down caller. The
-	 * main enable_accelerated_mode path already skips this whole step
-	 * when the secondary route is armed; this guards the other caller.
-	 */
-	if (dp_imac5k_any_link_preserves_secondary_output(dc)) {
-		imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate",
-					"exit-imac5k-preserve");
-		return;
-	}
 
 	for (i = 0; i < dc->res_pool->timing_generator_count; i++) {
-		char cp[48];
-
 		tg = dc->res_pool->timing_generators[i];
 
 		if (tg->funcs->disable_vga)
 			tg->funcs->disable_vga(tg);
-
-		snprintf(cp, sizeof(cp), "after-disable-vga-tg%d", i);
-		imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate", cp);
 	}
 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
-		char cp[48];
-
 		/* Enable CLOCK gating for each pipe BEFORE controller
 		 * powergating. */
 		enable_display_pipe_clock_gating(ctx,
 				true);
 
-		snprintf(cp, sizeof(cp), "before-disable-plane-pipe%d", i);
-		imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate", cp);
-
 		dc->current_state->res_ctx.pipe_ctx[i].pipe_idx = i;
 		dc->hwss.disable_plane(dc, dc->current_state,
 			&dc->current_state->res_ctx.pipe_ctx[i]);
-
-		snprintf(cp, sizeof(cp), "after-disable-plane-pipe%d", i);
-		imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate", cp);
 	}
-
-	imac5k_hwseq_checkpoint(dc, "disable_vga_and_power_gate", "exit");
 }
 
 
@@ -2049,21 +1909,15 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 	bool can_apply_seamless_boot = false;
 	bool keep_edp_vdd_on = false;
 	bool should_clean_dsc_block = true;
-	bool preserve_imac5k = dp_imac5k_any_link_preserves_secondary_output(dc);
 	struct dc_bios *dcb = dc->ctx->dc_bios;
 	DC_LOGGER_INIT();
 
-
-	imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode", "entry");
 
 	get_edp_links_with_sink(dc, edp_links_with_sink, &edp_with_sink_num);
 	dc_get_edp_links(dc, edp_links, &edp_num);
 
 	if (hws->funcs.init_pipes)
 		hws->funcs.init_pipes(dc, context);
-
-	imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
-				"after-init-pipes");
 
 	get_edp_streams(context, edp_streams, &edp_stream_num);
 
@@ -2135,30 +1989,7 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 	// the link via a DPCD SET_POWER write causes a brief flash
 	keep_edp_vdd_on |= dc->is_switch_in_progress_dest;
 
-	dm_output_to_console(
-		"IMAC5K: enable_accelerated_mode can_apply_edp_fast_boot=%d can_apply_seamless_boot=%d keep_edp_vdd_on=%d edp_with_sink_num=%d preserve_imac5k=%d\n",
-		can_apply_edp_fast_boot, can_apply_seamless_boot,
-		keep_edp_vdd_on, edp_with_sink_num, preserve_imac5k);
-
-	/*
-	 * iMac 5K: when the trained secondary 0x3113 route is armed for
-	 * preservation, take the seamless-boot-equivalent path and skip the
-	 * full destructive teardown entirely. obs_19/20/21 proved the
-	 * secondary does not survive any sub-step of it: power_down_encoders
-	 * (UNIPHY_D disable_output), power_down_controllers (AtomBIOS
-	 * enable_crtc(false) on the controller driving the secondary), and
-	 * the clock-source teardown. Guarding each sub-step individually is
-	 * whack-a-mole; the DC seamless-boot path already proves the whole
-	 * block can be skipped and the subsequent commit re-programs the
-	 * hardware. The per-sub-step guards added earlier are kept as
-	 * defense-in-depth for the other power_down_all_hw_blocks caller
-	 * (dce110_power_down).
-	 */
-	if (!can_apply_edp_fast_boot && !can_apply_seamless_boot &&
-	    !preserve_imac5k) {
-		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
-					"full-teardown-path-entry");
-
+	if (!can_apply_edp_fast_boot && !can_apply_seamless_boot) {
 		if (edp_link_with_sink && !keep_edp_vdd_on) {
 			/*turn off backlight before DP_blank and encoder powered down*/
 			hws->funcs.edp_backlight_control(edp_link_with_sink, false);
@@ -2167,13 +1998,7 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 		if (dcb && dcb->funcs && !dcb->funcs->is_accelerated_mode(dcb))
 			clk_mgr_exit_optimized_pwr_state(dc, dc->clk_mgr);
 
-		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
-					"before-power-down-all-hw-blocks");
-
 		power_down_all_hw_blocks(dc);
-
-		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
-					"after-power-down-all-hw-blocks");
 
 		/* DSC could be enabled on eDP during VBIOS post.
 		 * To clean up dsc blocks if all eDP dpms_off is true.
@@ -2187,29 +2012,13 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 		if (should_clean_dsc_block)
 			clean_up_dsc_blocks(dc);
 
-		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
-					"after-clean-up-dsc-blocks");
-
 		disable_vga_and_power_gate_all_controllers(dc);
-
-		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
-					"after-disable-vga-and-power-gate");
-
 		if (edp_link_with_sink && !keep_edp_vdd_on)
 			dc->hwss.edp_power_control(edp_link_with_sink, false);
 		if (dcb && dcb->funcs && !dcb->funcs->is_accelerated_mode(dcb))
 			clk_mgr_optimize_pwr_state(dc, dc->clk_mgr);
-
-		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
-					"full-teardown-path-exit");
-	} else if (preserve_imac5k &&
-		   !can_apply_edp_fast_boot && !can_apply_seamless_boot) {
-		imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode",
-				"full-teardown-skipped-imac5k-preserve");
 	}
 	bios_set_scratch_acc_mode_change(dc->ctx->dc_bios, 1);
-
-	imac5k_hwseq_checkpoint(dc, "enable_accelerated_mode", "exit");
 }
 
 static uint32_t compute_pstate_blackout_duration(
@@ -3477,9 +3286,6 @@ void dce110_enable_dp_link_output(
 	const struct link_hwss *link_hwss = get_link_hwss(link, link_res);
 	unsigned int i;
 
-	dp_imac5k_log_phy_event(link, "dce110_enable_dp_link_output", "entry");
-	dp_imac5k_probe_peer_aux(link, "dce110_enable_dp_link_output", "entry");
-
 	/*
 	 * Add the logic to extract BOTH power up and power down sequences
 	 * from enable/disable link output and only call edp panel control
@@ -3488,11 +3294,6 @@ void dce110_enable_dp_link_output(
 	if (link->connector_signal == SIGNAL_TYPE_EDP) {
 		link->dc->hwss.edp_wait_for_hpd_ready(link, true);
 	}
-
-	dp_imac5k_log_phy_event(link, "dce110_enable_dp_link_output",
-				"after-edp-hpd-wait");
-	dp_imac5k_probe_peer_aux(link, "dce110_enable_dp_link_output",
-				 "after-edp-hpd-wait");
 
 	/* If the current pixel clock source is not DTO(happens after
 	 * switching from HDMI passive dongle to DP on the same connector),
@@ -3521,11 +3322,6 @@ void dce110_enable_dp_link_output(
 			dc->clk_mgr->funcs->notify_link_rate_change(dc->clk_mgr, link);
 	}
 
-	dp_imac5k_log_phy_event(link, "dce110_enable_dp_link_output",
-				"after-clk-mgr-notify");
-	dp_imac5k_probe_peer_aux(link, "dce110_enable_dp_link_output",
-				 "after-clk-mgr-notify");
-
 	if (dmcu != NULL && dmcu->funcs->lock_phy)
 		dmcu->funcs->lock_phy(dmcu);
 
@@ -3539,9 +3335,6 @@ void dce110_enable_dp_link_output(
 		dmcu->funcs->unlock_phy(dmcu);
 
 	dc->link_srv->dp_trace_source_sequence(link, DPCD_SOURCE_SEQ_AFTER_ENABLE_LINK_PHY);
-
-	dp_imac5k_log_phy_event(link, "dce110_enable_dp_link_output", "exit");
-	dp_imac5k_probe_peer_aux(link, "dce110_enable_dp_link_output", "exit");
 }
 
 void dce110_disable_link_output(struct dc_link *link,
@@ -3552,9 +3345,6 @@ void dce110_disable_link_output(struct dc_link *link,
 	const struct link_hwss *link_hwss = get_link_hwss(link, link_res);
 	struct dmcu *dmcu = dc->res_pool->dmcu;
 
-	dp_imac5k_log_phy_event(link, "dce110_disable_link_output", "entry");
-	dp_imac5k_probe_peer_aux(link, "dce110_disable_link_output", "entry");
-
 	if (signal == SIGNAL_TYPE_EDP &&
 			link->dc->hwss.edp_backlight_control &&
 			!link->skip_implict_edp_power_control)
@@ -3562,18 +3352,8 @@ void dce110_disable_link_output(struct dc_link *link,
 	else if (dmcu != NULL && dmcu->funcs->lock_phy)
 		dmcu->funcs->lock_phy(dmcu);
 
-	dp_imac5k_log_phy_event(link, "dce110_disable_link_output",
-				"before-link-hwss-disable");
-	dp_imac5k_probe_peer_aux(link, "dce110_disable_link_output",
-				 "before-link-hwss-disable");
-
 	link_hwss->disable_link_output(link, link_res, signal);
 	link->phy_state.symclk_state = SYMCLK_OFF_TX_OFF;
-
-	dp_imac5k_log_phy_event(link, "dce110_disable_link_output",
-				"after-link-hwss-disable");
-	dp_imac5k_probe_peer_aux(link, "dce110_disable_link_output",
-				 "after-link-hwss-disable");
 	/*
 	 * Add the logic to extract BOTH power up and power down sequences
 	 * from enable/disable link output and only call edp panel control
@@ -3582,9 +3362,6 @@ void dce110_disable_link_output(struct dc_link *link,
 	if (dmcu != NULL && dmcu->funcs->unlock_phy)
 		dmcu->funcs->unlock_phy(dmcu);
 	dc->link_srv->dp_trace_source_sequence(link, DPCD_SOURCE_SEQ_AFTER_DISABLE_LINK_PHY);
-
-	dp_imac5k_log_phy_event(link, "dce110_disable_link_output", "exit");
-	dp_imac5k_probe_peer_aux(link, "dce110_disable_link_output", "exit");
 }
 
 static const struct hw_sequencer_funcs dce110_funcs = {

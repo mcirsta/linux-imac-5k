@@ -22,6 +22,8 @@
  * Authors: AMD
  */
 
+#include <linux/dmi.h>
+
 #include "dm_services.h"
 
 #include "amdgpu.h"
@@ -59,6 +61,7 @@
 #include "link_hwss.h"
 #include "link_encoder.h"
 #include "link_enc_cfg.h"
+#include "grph_object_id.h"
 
 #include "link_service.h"
 #include "dm_helpers.h"
@@ -1622,6 +1625,122 @@ static void enable_timing_multisync(
 	}
 }
 
+#define IMAC5K_WIN_PRIMARY_OBJECT_ID 0x3114
+#define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
+#define IMAC5K_TILE_H_ACTIVE 2560
+#define IMAC5K_TILE_V_ACTIVE 2880
+
+static bool imac5k_dmi_match(void)
+{
+	return dmi_match(DMI_SYS_VENDOR, "Apple Inc.") &&
+	       dmi_match(DMI_PRODUCT_NAME, "iMac19,1");
+}
+
+static unsigned int imac5k_stream_object_id(
+		const struct dc_stream_state *stream)
+{
+	if (!stream || !stream->link)
+		return 0;
+
+	return dal_graphics_object_id_to_uint(stream->link->link_id);
+}
+
+static bool imac5k_stream_is_object_half(const struct dc_stream_state *stream)
+{
+	unsigned int obj = imac5k_stream_object_id(stream);
+
+	if (!imac5k_dmi_match() || !stream)
+		return false;
+
+	return obj == IMAC5K_WIN_PRIMARY_OBJECT_ID ||
+	       obj == IMAC5K_WIN_SECONDARY_OBJECT_ID;
+}
+
+static bool imac5k_stream_is_tile_half(const struct dc_stream_state *stream)
+{
+	if (!imac5k_stream_is_object_half(stream))
+		return false;
+
+	return stream->timing.h_addressable == IMAC5K_TILE_H_ACTIVE &&
+	       stream->timing.v_addressable == IMAC5K_TILE_V_ACTIVE;
+}
+
+static bool imac5k_streams_are_tile_pair(
+		const struct dc_stream_state *stream1,
+		const struct dc_stream_state *stream2)
+{
+	unsigned int obj1 = imac5k_stream_object_id(stream1);
+	unsigned int obj2 = imac5k_stream_object_id(stream2);
+
+	if (!imac5k_stream_is_tile_half(stream1) ||
+	    !imac5k_stream_is_tile_half(stream2))
+		return false;
+
+	return (obj1 == IMAC5K_WIN_PRIMARY_OBJECT_ID &&
+		obj2 == IMAC5K_WIN_SECONDARY_OBJECT_ID) ||
+	       (obj1 == IMAC5K_WIN_SECONDARY_OBJECT_ID &&
+		obj2 == IMAC5K_WIN_PRIMARY_OBJECT_ID);
+}
+
+static bool imac5k_streams_are_object_pair(
+		const struct dc_stream_state *stream1,
+		const struct dc_stream_state *stream2)
+{
+	unsigned int obj1 = imac5k_stream_object_id(stream1);
+	unsigned int obj2 = imac5k_stream_object_id(stream2);
+
+	if (!imac5k_dmi_match() || !stream1 || !stream2)
+		return false;
+
+	return (obj1 == IMAC5K_WIN_PRIMARY_OBJECT_ID &&
+		obj2 == IMAC5K_WIN_SECONDARY_OBJECT_ID) ||
+	       (obj1 == IMAC5K_WIN_SECONDARY_OBJECT_ID &&
+		obj2 == IMAC5K_WIN_PRIMARY_OBJECT_ID);
+}
+
+static bool imac5k_streams_syncable_ignoring_msa(
+		struct dc_stream_state *stream1,
+		struct dc_stream_state *stream2)
+{
+	if (!imac5k_streams_are_tile_pair(stream1, stream2))
+		return false;
+
+	if (!stream1->ignore_msa_timing_param &&
+	    !stream2->ignore_msa_timing_param)
+		return false;
+
+	if (stream1->timing.h_total != stream2->timing.h_total)
+		return false;
+
+	if (stream1->timing.v_total != stream2->timing.v_total)
+		return false;
+
+	if (stream1->timing.h_addressable != stream2->timing.h_addressable)
+		return false;
+
+	if (stream1->timing.v_addressable != stream2->timing.v_addressable)
+		return false;
+
+	if (stream1->timing.v_front_porch != stream2->timing.v_front_porch)
+		return false;
+
+	if (stream1->timing.pix_clk_100hz != stream2->timing.pix_clk_100hz)
+		return false;
+
+	if (stream1->clamping.c_depth != stream2->clamping.c_depth)
+		return false;
+
+	if (stream1->phy_pix_clk != stream2->phy_pix_clk &&
+	    (!dc_is_dp_signal(stream1->signal) ||
+	     !dc_is_dp_signal(stream2->signal)))
+		return false;
+
+	if (stream1->view_format != stream2->view_format)
+		return false;
+
+	return true;
+}
+
 static void program_timing_sync(
 		struct dc *dc,
 		struct dc_state *ctx)
@@ -1656,23 +1775,79 @@ static void program_timing_sync(
 		 * same timing, add all tgs with same timing to the group
 		 */
 		for (j = i + 1; j < pipe_count; j++) {
+			bool imac5k_pair;
+			bool imac5k_genlock_bypass = false;
+			bool timing_sync = false;
+			bool vblank_sync = false;
+
 			if (!unsynced_pipes[j])
 				continue;
-			if (sync_type != TIMING_SYNCHRONIZABLE &&
-				dc->hwss.enable_vblanks_synchronization &&
-				unsynced_pipes[j]->stream_res.tg->funcs->align_vblanks &&
-				resource_are_vblanks_synchronizable(
+
+			imac5k_pair = imac5k_streams_are_object_pair(
 					unsynced_pipes[j]->stream,
-					pipe_set[0]->stream)) {
+					pipe_set[0]->stream);
+
+			if (sync_type != TIMING_SYNCHRONIZABLE &&
+			    dc->hwss.enable_vblanks_synchronization &&
+			    unsynced_pipes[j]->stream_res.tg->funcs->align_vblanks)
+				vblank_sync = resource_are_vblanks_synchronizable(
+						unsynced_pipes[j]->stream,
+						pipe_set[0]->stream);
+
+			if (sync_type != VBLANK_SYNCHRONIZABLE) {
+				timing_sync = resource_are_streams_timing_synchronizable(
+						unsynced_pipes[j]->stream,
+						pipe_set[0]->stream);
+				if (!timing_sync && amdgpu_imac5k_force_genlock)
+					imac5k_genlock_bypass =
+						imac5k_streams_syncable_ignoring_msa(
+							unsynced_pipes[j]->stream,
+							pipe_set[0]->stream);
+			}
+
+			if (imac5k_pair)
+				DC_LOG_WARNING("IMAC5K: timing-sync candidate pipe=%d/%d obj=0x%x/0x%x h=%u/%u v=%u/%u total=%ux%u/%ux%u pixclk=%u/%u phyclk=%d/%d signal=%d/%d ignore_msa=%u/%u vblank_ok=%u timing_ok=%u force_genlock=%d bypass=%u current_sync_type=%d\n",
+					       unsynced_pipes[j]->pipe_idx,
+					       pipe_set[0]->pipe_idx,
+					       imac5k_stream_object_id(unsynced_pipes[j]->stream),
+					       imac5k_stream_object_id(pipe_set[0]->stream),
+					       unsynced_pipes[j]->stream->timing.h_addressable,
+					       pipe_set[0]->stream->timing.h_addressable,
+					       unsynced_pipes[j]->stream->timing.v_addressable,
+					       pipe_set[0]->stream->timing.v_addressable,
+					       unsynced_pipes[j]->stream->timing.h_total,
+					       unsynced_pipes[j]->stream->timing.v_total,
+					       pipe_set[0]->stream->timing.h_total,
+					       pipe_set[0]->stream->timing.v_total,
+					       unsynced_pipes[j]->stream->timing.pix_clk_100hz,
+					       pipe_set[0]->stream->timing.pix_clk_100hz,
+					       unsynced_pipes[j]->stream->phy_pix_clk,
+					       pipe_set[0]->stream->phy_pix_clk,
+					       unsynced_pipes[j]->stream->signal,
+					       pipe_set[0]->stream->signal,
+					       unsynced_pipes[j]->stream->ignore_msa_timing_param,
+					       pipe_set[0]->stream->ignore_msa_timing_param,
+					       vblank_sync, timing_sync,
+					       amdgpu_imac5k_force_genlock,
+					       imac5k_genlock_bypass,
+					       sync_type);
+
+			if (imac5k_pair &&
+			    amdgpu_imac5k_force_genlock &&
+			    sync_type != VBLANK_SYNCHRONIZABLE &&
+			    (timing_sync || imac5k_genlock_bypass)) {
+				sync_type = TIMING_SYNCHRONIZABLE;
+				pipe_set[group_size] = unsynced_pipes[j];
+				unsynced_pipes[j] = NULL;
+				group_size++;
+			} else if (sync_type != TIMING_SYNCHRONIZABLE &&
+				   vblank_sync) {
 				sync_type = VBLANK_SYNCHRONIZABLE;
 				pipe_set[group_size] = unsynced_pipes[j];
 				unsynced_pipes[j] = NULL;
 				group_size++;
-			} else
-			if (sync_type != VBLANK_SYNCHRONIZABLE &&
-				resource_are_streams_timing_synchronizable(
-					unsynced_pipes[j]->stream,
-					pipe_set[0]->stream)) {
+			} else if (sync_type != VBLANK_SYNCHRONIZABLE &&
+				   timing_sync) {
 				sync_type = TIMING_SYNCHRONIZABLE;
 				pipe_set[group_size] = unsynced_pipes[j];
 				unsynced_pipes[j] = NULL;
@@ -1712,6 +1887,20 @@ static void program_timing_sync(
 			else
 				status->timing_sync_info.master = false;
 
+			if (imac5k_stream_is_object_half(pipe_set[k]->stream))
+				DC_LOG_WARNING("IMAC5K: timing-sync result pipe=%d obj=0x%x group_id=%d group_size=%d master=%u sync_type=%d force_genlock=%d ignore_msa=%u h=%u v=%u pixclk=%u\n",
+					       pipe_set[k]->pipe_idx,
+					       imac5k_stream_object_id(pipe_set[k]->stream),
+					       status->timing_sync_info.group_id,
+					       status->timing_sync_info.group_size,
+					       status->timing_sync_info.master,
+					       sync_type,
+					       amdgpu_imac5k_force_genlock,
+					       pipe_set[k]->stream->ignore_msa_timing_param,
+					       pipe_set[k]->stream->timing.h_addressable,
+					       pipe_set[k]->stream->timing.v_addressable,
+					       pipe_set[k]->stream->timing.pix_clk_100hz);
+
 		}
 
 		/* remove any other unblanked pipes as they have already been synced */
@@ -1746,6 +1935,14 @@ static void program_timing_sync(
 		}
 
 		if (group_size > 1) {
+			if (imac5k_stream_is_object_half(pipe_set[0]->stream) ||
+			    imac5k_stream_is_object_half(pipe_set[1]->stream))
+				DC_LOG_WARNING("IMAC5K: timing-sync apply group_index=%d final_group_size=%d sync_type=%d force_genlock=%d first_obj=0x%x second_obj=0x%x\n",
+					       group_index, group_size, sync_type,
+					       amdgpu_imac5k_force_genlock,
+					       imac5k_stream_object_id(pipe_set[0]->stream),
+					       imac5k_stream_object_id(pipe_set[1]->stream));
+
 			if (sync_type == TIMING_SYNCHRONIZABLE) {
 				dc->hwss.enable_timing_synchronization(
 					dc, ctx, group_index, group_size, pipe_set);

@@ -30,6 +30,8 @@
  * directly from connected receivers.
  */
 
+#include <linux/dmi.h>
+
 #include "link_dpms.h"
 #include "link_detection.h"
 #include "link_hwss.h"
@@ -47,9 +49,12 @@
 #include "link_enc_cfg.h"
 #include "dm_helpers.h"
 #include "clk_mgr.h"
+#include "grph_object_id.h"
 
  // Offset DPCD 050Eh == 0x5A
 #define MST_HUB_ID_0x5A  0x5A
+#define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
+#define IMAC5K_WIN_SECONDARY_DDC_HW_INST 2
 
 #define DC_LOGGER \
 	link->ctx->logger
@@ -101,6 +106,69 @@ static enum ddc_transaction_type get_ddc_transaction_type(enum signal_type sink_
 	}
 
 	return transaction_type;
+}
+
+static bool link_is_imac5k_secondary_route(const struct dc_link *link)
+{
+	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
+	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1"))
+		return false;
+
+	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
+		return false;
+
+	if (dal_graphics_object_id_to_uint(link->link_id) !=
+	    IMAC5K_WIN_SECONDARY_OBJECT_ID)
+		return false;
+
+	if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
+		return false;
+
+	if (!link->link_enc ||
+	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
+		return false;
+
+	return true;
+}
+
+static bool imac5k_secondary_try_pre_detect_aux(struct dc_link *link,
+						enum dc_detect_reason reason)
+{
+	enum ddc_transaction_type old_transaction_type;
+	bool old_aux_mode;
+	bool hpd_before;
+	bool hpd_after;
+	enum dc_status status;
+	uint8_t dpcd_rev = 0;
+
+	if (!link_is_imac5k_secondary_route(link) || !link->ddc)
+		return false;
+
+	old_transaction_type = link->ddc->transaction_type;
+	old_aux_mode = link->aux_mode;
+	hpd_before = link_get_hpd_state(link);
+
+	set_ddc_transaction_type(link->ddc, DDC_TRANSACTION_TYPE_I2C_OVER_AUX);
+	link->aux_mode = link_is_in_aux_transaction_mode(link->ddc);
+
+	status = core_link_read_dpcd(link, DP_DPCD_REV,
+				    &dpcd_rev, sizeof(dpcd_rev));
+	hpd_after = link_get_hpd_state(link);
+
+	DC_LOG_WARNING("IMAC5K: secondary 0x3113 pre-detect AUX probe reason=%d link=%u raw_obj=0x%x ddc_hw=%u tx=%d old_aux=%u aux=%u old_transaction=%d status=%d dpcd_rev=0x%02x hpd=%u/%u\n",
+		       reason, link->link_index,
+		       dal_graphics_object_id_to_uint(link->link_id),
+		       link->ddc_hw_inst,
+		       link->link_enc ? link->link_enc->transmitter : -1,
+		       old_aux_mode, link->aux_mode, old_transaction_type,
+		       status, dpcd_rev, hpd_before, hpd_after);
+
+	if (status == DC_OK && dpcd_rev != 0)
+		return true;
+
+	set_ddc_transaction_type(link->ddc, old_transaction_type);
+	link->aux_mode = old_aux_mode;
+	return false;
 }
 
 static enum signal_type get_basic_signal_type(struct graphics_object_id encoder,
@@ -593,6 +661,12 @@ static bool detect_dp(struct dc_link *link,
 	struct audio_support *audio_support = &link->dc->res_pool->audio_support;
 
 	sink_caps->signal = link_detect_sink_signal_type(link, reason);
+	if (link_is_imac5k_secondary_route(link) && link->aux_mode) {
+		DC_LOG_WARNING("IMAC5K: secondary 0x3113 forcing DP sink signal after pre-detect AUX proof link=%u reason=%d\n",
+			       link->link_index, reason);
+		sink_caps->signal = SIGNAL_TYPE_DISPLAY_PORT;
+	}
+
 	sink_caps->transaction_type =
 		get_ddc_transaction_type(sink_caps->signal);
 
@@ -1004,6 +1078,17 @@ static bool detect_link_and_local_sink(struct dc_link *link,
 	if (!link_detect_connection_type(link, &new_connection_type)) {
 		BREAK_TO_DEBUGGER();
 		return false;
+	}
+
+	if (new_connection_type == dc_connection_none &&
+	    imac5k_secondary_try_pre_detect_aux(link, reason)) {
+		DC_LOG_WARNING("IMAC5K: secondary 0x3113 overriding detect connection none->single reason=%d link=%u raw_obj=0x%x ddc_hw=%u tx=%d aux=%u\n",
+			       reason, link->link_index,
+			       dal_graphics_object_id_to_uint(link->link_id),
+			       link->ddc_hw_inst,
+			       link->link_enc ? link->link_enc->transmitter : -1,
+			       link->aux_mode);
+		new_connection_type = dc_connection_single;
 	}
 
 	prev_sink = link->local_sink;
