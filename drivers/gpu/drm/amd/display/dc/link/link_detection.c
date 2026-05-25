@@ -204,6 +204,21 @@ static void imac5k_primary_write_panel_wake(struct dc_link *link,
 		       old_transaction_type, status, verify_status, verify);
 }
 
+static struct dc_link *imac5k_find_primary_link(const struct dc *dc)
+{
+	uint32_t i;
+
+	if (!dc)
+		return NULL;
+
+	for (i = 0; i < dc->link_count; i++) {
+		if (link_is_imac5k_primary_route(dc->links[i]))
+			return dc->links[i];
+	}
+
+	return NULL;
+}
+
 static bool imac5k_secondary_try_pre_detect_aux(struct dc_link *link,
 						enum dc_detect_reason reason)
 {
@@ -216,6 +231,7 @@ static bool imac5k_secondary_try_pre_detect_aux(struct dc_link *link,
 	uint8_t dpcd_rev = 0;
 	unsigned int attempt;
 	unsigned int elapsed_ms;
+	struct dc_link *primary_link;
 
 	if (!link_is_imac5k_secondary_route(link) || !link->ddc)
 		return false;
@@ -227,6 +243,23 @@ static bool imac5k_secondary_try_pre_detect_aux(struct dc_link *link,
 	set_ddc_transaction_type(link->ddc, DDC_TRANSACTION_TYPE_I2C_OVER_AUX);
 	link->aux_mode = link_is_in_aux_transaction_mode(link->ddc);
 	last_hpd = hpd_before;
+
+	/*
+	 * Re-wake the panel via the primary 0x4F1 latch before polling. The
+	 * panel sleeps a few seconds after boot, and a secondary-only HPD
+	 * re-detect (reason=HPDRX) does not run the primary's own detect, so
+	 * the post-primary-edid wake never fires on that path. Without this,
+	 * the secondary AUX stays dead, the poll below times out, and the
+	 * secondary tile is torn down (observed in new_boot_2 at t=10:
+	 * "Old sink=… New sink=0x0" → DP-1 disconnected). Pulsing the primary
+	 * here re-wakes the panel so the poll can catch the secondary AUX
+	 * coming back up. At initial boot this is a redundant, idempotent
+	 * re-assert (the primary was already woken post-primary-edid).
+	 */
+	primary_link = imac5k_find_primary_link(link->dc);
+	if (primary_link)
+		imac5k_primary_write_panel_wake(primary_link, reason,
+						"secondary-redetect-rewake");
 
 	for (attempt = 0, elapsed_ms = 0; ; attempt++,
 	     elapsed_ms += IMAC5K_SECONDARY_AUX_WAKE_POLL_MS) {
