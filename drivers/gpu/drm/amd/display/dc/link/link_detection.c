@@ -53,8 +53,13 @@
 
  // Offset DPCD 050Eh == 0x5A
 #define MST_HUB_ID_0x5A  0x5A
+#define IMAC5K_WIN_PRIMARY_OBJECT_ID 0x3114
+#define IMAC5K_WIN_PRIMARY_DDC_HW_INST 3
 #define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
 #define IMAC5K_WIN_SECONDARY_DDC_HW_INST 2
+#define IMAC5K_DPCD_PANEL_LATCH 0x4F1
+#define IMAC5K_SECONDARY_AUX_WAKE_TIMEOUT_MS 300
+#define IMAC5K_SECONDARY_AUX_WAKE_POLL_MS 30
 
 #define DC_LOGGER \
 	link->ctx->logger
@@ -108,10 +113,37 @@ static enum ddc_transaction_type get_ddc_transaction_type(enum signal_type sink_
 	return transaction_type;
 }
 
+static bool link_is_imac5k_machine(void)
+{
+	return dmi_match(DMI_SYS_VENDOR, "Apple Inc.") &&
+	       dmi_match(DMI_PRODUCT_NAME, "iMac19,1");
+}
+
+static bool link_is_imac5k_primary_route(const struct dc_link *link)
+{
+	if (!link_is_imac5k_machine())
+		return false;
+
+	if (!link || link->connector_signal != SIGNAL_TYPE_EDP)
+		return false;
+
+	if (dal_graphics_object_id_to_uint(link->link_id) !=
+	    IMAC5K_WIN_PRIMARY_OBJECT_ID)
+		return false;
+
+	if (link->ddc_hw_inst != IMAC5K_WIN_PRIMARY_DDC_HW_INST)
+		return false;
+
+	if (!link->link_enc ||
+	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_C)
+		return false;
+
+	return true;
+}
+
 static bool link_is_imac5k_secondary_route(const struct dc_link *link)
 {
-	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
-	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1"))
+	if (!link_is_imac5k_machine())
 		return false;
 
 	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
@@ -131,6 +163,47 @@ static bool link_is_imac5k_secondary_route(const struct dc_link *link)
 	return true;
 }
 
+static void imac5k_primary_write_panel_wake(struct dc_link *link,
+					    enum dc_detect_reason reason,
+					    const char *stage)
+{
+	enum ddc_transaction_type old_transaction_type;
+	bool old_aux_mode;
+	enum dc_status status;
+	enum dc_status verify_status;
+	uint8_t payload = 1;
+	uint8_t verify = 0;
+
+	if (!link_is_imac5k_primary_route(link) || !link->ddc ||
+	    !link->local_sink)
+		return;
+
+	old_transaction_type = link->ddc->transaction_type;
+	old_aux_mode = link->aux_mode;
+
+	set_ddc_transaction_type(link->ddc, DDC_TRANSACTION_TYPE_I2C_OVER_AUX);
+	link->aux_mode = link_is_in_aux_transaction_mode(link->ddc);
+
+	status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+				      &payload, sizeof(payload));
+	if (status != DC_OK) {
+		msleep(10);
+		status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+					      &payload, sizeof(payload));
+	}
+
+	verify_status = core_link_read_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+					    &verify, sizeof(verify));
+
+	DC_LOG_WARNING("IMAC5K: primary 0x3114 panel wake stage=%s reason=%d link=%u raw_obj=0x%x ddc_hw=%u tx=%d local_sink=%p old_aux=%u aux=%u old_transaction=%d status=%d verify_status=%d verify=0x%02x\n",
+		       stage, reason, link->link_index,
+		       dal_graphics_object_id_to_uint(link->link_id),
+		       link->ddc_hw_inst,
+		       link->link_enc ? link->link_enc->transmitter : -1,
+		       link->local_sink, old_aux_mode, link->aux_mode,
+		       old_transaction_type, status, verify_status, verify);
+}
+
 static bool imac5k_secondary_try_pre_detect_aux(struct dc_link *link,
 						enum dc_detect_reason reason)
 {
@@ -138,8 +211,11 @@ static bool imac5k_secondary_try_pre_detect_aux(struct dc_link *link,
 	bool old_aux_mode;
 	bool hpd_before;
 	bool hpd_after;
+	bool last_hpd;
 	enum dc_status status;
 	uint8_t dpcd_rev = 0;
+	unsigned int attempt;
+	unsigned int elapsed_ms;
 
 	if (!link_is_imac5k_secondary_route(link) || !link->ddc)
 		return false;
@@ -150,21 +226,53 @@ static bool imac5k_secondary_try_pre_detect_aux(struct dc_link *link,
 
 	set_ddc_transaction_type(link->ddc, DDC_TRANSACTION_TYPE_I2C_OVER_AUX);
 	link->aux_mode = link_is_in_aux_transaction_mode(link->ddc);
+	last_hpd = hpd_before;
 
-	status = core_link_read_dpcd(link, DP_DPCD_REV,
-				    &dpcd_rev, sizeof(dpcd_rev));
-	hpd_after = link_get_hpd_state(link);
+	for (attempt = 0, elapsed_ms = 0; ; attempt++,
+	     elapsed_ms += IMAC5K_SECONDARY_AUX_WAKE_POLL_MS) {
+		dpcd_rev = 0;
+		status = core_link_read_dpcd(link, DP_DPCD_REV,
+					    &dpcd_rev, sizeof(dpcd_rev));
+		hpd_after = link_get_hpd_state(link);
 
-	DC_LOG_WARNING("IMAC5K: secondary 0x3113 pre-detect AUX probe reason=%d link=%u raw_obj=0x%x ddc_hw=%u tx=%d old_aux=%u aux=%u old_transaction=%d status=%d dpcd_rev=0x%02x hpd=%u/%u\n",
+		if (status == DC_OK && dpcd_rev != 0) {
+			DC_LOG_WARNING("IMAC5K: secondary 0x3113 pre-detect AUX probe result=success reason=%d link=%u raw_obj=0x%x ddc_hw=%u tx=%d old_aux=%u aux=%u old_transaction=%d attempt=%u elapsed_ms=%u status=%d dpcd_rev=0x%02x hpd=%u/%u\n",
+				       reason, link->link_index,
+				       dal_graphics_object_id_to_uint(link->link_id),
+				       link->ddc_hw_inst,
+				       link->link_enc ? link->link_enc->transmitter : -1,
+				       old_aux_mode, link->aux_mode,
+				       old_transaction_type, attempt, elapsed_ms,
+				       status, dpcd_rev, hpd_before, hpd_after);
+			return true;
+		}
+
+		if (attempt == 0 || hpd_after != last_hpd)
+			DC_LOG_WARNING("IMAC5K: secondary 0x3113 pre-detect AUX probe result=poll reason=%d link=%u raw_obj=0x%x ddc_hw=%u tx=%d old_aux=%u aux=%u old_transaction=%d attempt=%u elapsed_ms=%u status=%d dpcd_rev=0x%02x hpd=%u/%u\n",
+				       reason, link->link_index,
+				       dal_graphics_object_id_to_uint(link->link_id),
+				       link->ddc_hw_inst,
+				       link->link_enc ? link->link_enc->transmitter : -1,
+				       old_aux_mode, link->aux_mode,
+				       old_transaction_type, attempt, elapsed_ms,
+				       status, dpcd_rev, hpd_before, hpd_after);
+
+		last_hpd = hpd_after;
+
+		if (elapsed_ms >= IMAC5K_SECONDARY_AUX_WAKE_TIMEOUT_MS)
+			break;
+
+		msleep(IMAC5K_SECONDARY_AUX_WAKE_POLL_MS);
+	}
+
+	DC_LOG_WARNING("IMAC5K: secondary 0x3113 pre-detect AUX probe result=failed reason=%d link=%u raw_obj=0x%x ddc_hw=%u tx=%d old_aux=%u aux=%u old_transaction=%d attempts=%u elapsed_ms=%u status=%d dpcd_rev=0x%02x hpd=%u/%u\n",
 		       reason, link->link_index,
 		       dal_graphics_object_id_to_uint(link->link_id),
 		       link->ddc_hw_inst,
 		       link->link_enc ? link->link_enc->transmitter : -1,
 		       old_aux_mode, link->aux_mode, old_transaction_type,
-		       status, dpcd_rev, hpd_before, hpd_after);
-
-	if (status == DC_OK && dpcd_rev != 0)
-		return true;
+		       attempt + 1, elapsed_ms, status, dpcd_rev,
+		       hpd_before, hpd_after);
 
 	set_ddc_transaction_type(link->ddc, old_transaction_type);
 	link->aux_mode = old_aux_mode;
@@ -1315,6 +1423,9 @@ static bool detect_link_and_local_sink(struct dc_link *link,
 		default:
 			break;
 		}
+
+		imac5k_primary_write_panel_wake(link, reason,
+						"post-primary-edid");
 
 		// Check if edid is the same
 		if ((prev_sink) &&

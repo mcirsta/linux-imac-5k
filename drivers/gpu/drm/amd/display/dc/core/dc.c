@@ -1935,11 +1935,55 @@ static void program_timing_sync(
 		}
 
 		if (group_size > 1) {
+			/*
+			 * IMAC5K: optionally force the primary tile (eDP /
+			 * 0x3114) to be pipe_set[0] — the entry that
+			 * enable_timing_synchronization() programs as the
+			 * timing-source master. The RE indicates Windows uses
+			 * the primary internal tile as the timing-server
+			 * anchor for the 5K tile pair; DC's default
+			 * first-unblanked-pipe heuristic can otherwise leave
+			 * the secondary (DP / 0x3113) as master. Done here,
+			 * right before the sync programming, so it does not
+			 * disturb the pipe-removal loop's reuse of j. Gated by
+			 * a separate module param (default off) so normal
+			 * behavior and non-iMac machines are unchanged.
+			 */
+			if (amdgpu_imac5k_force_primary_master &&
+			    imac5k_dmi_match()) {
+				int p;
+
+				for (p = 0; p < group_size; p++) {
+					if (imac5k_stream_object_id(pipe_set[p]->stream) !=
+					    IMAC5K_WIN_PRIMARY_OBJECT_ID)
+						continue;
+					if (p != 0) {
+						struct dc_stream_status *s0 =
+							dc_state_get_stream_status(ctx, pipe_set[0]->stream);
+						struct dc_stream_status *sp =
+							dc_state_get_stream_status(ctx, pipe_set[p]->stream);
+
+						DC_LOG_WARNING("IMAC5K: timing-sync forcing primary 0x3114 as master: swap pipe_set[0] obj=0x%x <-> pipe_set[%d] obj=0x3114\n",
+							       imac5k_stream_object_id(pipe_set[0]->stream),
+							       p);
+						swap(pipe_set[0], pipe_set[p]);
+						if (s0)
+							s0->timing_sync_info.master = false;
+						if (sp)
+							sp->timing_sync_info.master = true;
+					} else {
+						DC_LOG_WARNING("IMAC5K: timing-sync primary 0x3114 already master (pipe_set[0])\n");
+					}
+					break;
+				}
+			}
+
 			if (imac5k_stream_is_object_half(pipe_set[0]->stream) ||
 			    imac5k_stream_is_object_half(pipe_set[1]->stream))
-				DC_LOG_WARNING("IMAC5K: timing-sync apply group_index=%d final_group_size=%d sync_type=%d force_genlock=%d first_obj=0x%x second_obj=0x%x\n",
+				DC_LOG_WARNING("IMAC5K: timing-sync apply group_index=%d final_group_size=%d sync_type=%d force_genlock=%d force_primary_master=%d first_obj=0x%x second_obj=0x%x\n",
 					       group_index, group_size, sync_type,
 					       amdgpu_imac5k_force_genlock,
+					       amdgpu_imac5k_force_primary_master,
 					       imac5k_stream_object_id(pipe_set[0]->stream),
 					       imac5k_stream_object_id(pipe_set[1]->stream));
 
