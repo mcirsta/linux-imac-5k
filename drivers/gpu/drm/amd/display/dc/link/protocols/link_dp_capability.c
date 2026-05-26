@@ -2606,6 +2606,51 @@ bool dp_verify_link_cap_with_retries(
 		success,
 		fail_count);
 
+	/*
+	 * IMAC5K: bridge the secondary tile's verified cap from its reported
+	 * (DPCD-read) cap. The 5K secondary (0x3113) has a write-marginal AUX:
+	 * reads work (so reported_link_cap holds the real HBR2 x4 the panel
+	 * advertises), but link-cap verification cannot train it -- it bails at
+	 * the HPD-low connection check or the link-config writes fail -- so
+	 * verified_link_cap is left at fail-safe (minimal). DC then prunes the
+	 * real 2560x2880 tile mode for "No DP link bandwidth" (new_boot_3/4).
+	 *
+	 * Windows enumerates modes against the reported DPCD caps and only
+	 * confirms the link by training at SetMode. Mirror that: use the
+	 * reported cap for mode validation on the exact iMac secondary route so
+	 * 2560x2880 survives. This is not a fabricated cap -- it is the sink's
+	 * own reported capability, read over the working AUX-read path. The link
+	 * still must actually train at commit time (handled separately via the
+	 * link-config re-wake/retry); this only unblocks DC's verified-cap-based
+	 * mode pruning, which Windows does not have. Route-gated => no-op
+	 * everywhere else.
+	 */
+	if (link_is_imac5k_secondary_source_dpcd_route(link)) {
+		uint32_t verified_bw =
+			dp_link_bandwidth_kbps(link, &link->verified_link_cap);
+		uint32_t reported_bw =
+			dp_link_bandwidth_kbps(link, &link->reported_link_cap);
+
+		DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-cap bridge check: verified rate=0x%x lanes=%u bw=%u reported rate=0x%x lanes=%u bw=%u success=%d\n",
+			link->verified_link_cap.link_rate,
+			link->verified_link_cap.lane_count, verified_bw,
+			link->reported_link_cap.link_rate,
+			link->reported_link_cap.lane_count, reported_bw,
+			success);
+
+		if (reported_bw > verified_bw &&
+		    link->reported_link_cap.link_rate != LINK_RATE_UNKNOWN &&
+		    link->reported_link_cap.lane_count != LANE_COUNT_UNKNOWN) {
+			link->verified_link_cap = link->reported_link_cap;
+			success = true;
+			DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-cap bridged verified<-reported rate=0x%x lanes=%u; 2560x2880 should now pass bandwidth validation\n",
+				link->verified_link_cap.link_rate,
+				link->verified_link_cap.lane_count);
+		} else {
+			DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-cap NOT bridged (reported not better/known); 2560x2880 will still be pruned -- reported caps were not read as HBR2 x4\n");
+		}
+	}
+
 	return success;
 }
 
