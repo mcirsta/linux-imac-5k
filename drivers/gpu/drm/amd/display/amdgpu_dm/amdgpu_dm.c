@@ -61,6 +61,7 @@
 #include "amdgpu_dm_irq.h"
 #include "dm_helpers.h"
 #include "amdgpu_dm_mst_types.h"
+#include "grph_object_id.h"
 #if defined(CONFIG_DEBUG_FS)
 #include "amdgpu_dm_debugfs.h"
 #endif
@@ -78,6 +79,7 @@
 #include <linux/power_supply.h>
 #include <linux/firmware.h>
 #include <linux/component.h>
+#include <linux/dmi.h>
 #include <linux/sort.h>
 
 #include <drm/drm_privacy_screen_consumer.h>
@@ -8100,6 +8102,73 @@ cleanup:
 	return dc_result;
 }
 
+#define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
+#define IMAC5K_WIN_SECONDARY_DDC_HW_INST 2
+#define IMAC5K_TILE_H_ACTIVE 2560
+#define IMAC5K_TILE_V_ACTIVE 2880
+
+static bool amdgpu_dm_imac5k_dmi_match(void)
+{
+	return dmi_match(DMI_SYS_VENDOR, "Apple Inc.") &&
+	       dmi_match(DMI_PRODUCT_NAME, "iMac19,1");
+}
+
+static bool
+amdgpu_dm_connector_is_imac5k_secondary_route(
+		const struct amdgpu_dm_connector *aconnector)
+{
+	const struct dc_link *link;
+
+	if (!amdgpu_dm_imac5k_dmi_match() || !aconnector)
+		return false;
+
+	link = aconnector->dc_link;
+	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
+		return false;
+
+	if (dal_graphics_object_id_to_uint(link->link_id) !=
+	    IMAC5K_WIN_SECONDARY_OBJECT_ID)
+		return false;
+
+	if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
+		return false;
+
+	if (!link->link_enc ||
+	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
+		return false;
+
+	return true;
+}
+
+static bool
+amdgpu_dm_connector_is_imac5k_secondary_tile(
+		const struct amdgpu_dm_connector *aconnector)
+{
+	const struct drm_connector *connector;
+
+	if (!amdgpu_dm_connector_is_imac5k_secondary_route(aconnector))
+		return false;
+
+	connector = &aconnector->base;
+	if (!connector->has_tile)
+		return false;
+
+	return connector->tile_h_size == IMAC5K_TILE_H_ACTIVE &&
+	       connector->tile_v_size == IMAC5K_TILE_V_ACTIVE &&
+	       connector->tile_h_loc == 1 &&
+	       connector->tile_v_loc == 0 &&
+	       connector->num_h_tile == 2 &&
+	       connector->num_v_tile == 1;
+}
+
+static bool
+amdgpu_dm_mode_is_imac5k_tile_half(const struct drm_display_mode *mode)
+{
+	return mode &&
+	       mode->hdisplay == IMAC5K_TILE_H_ACTIVE &&
+	       mode->vdisplay == IMAC5K_TILE_V_ACTIVE;
+}
+
 struct dc_stream_state *
 create_validate_stream_for_sink(struct drm_connector *connector,
 				const struct drm_display_mode *drm_mode,
@@ -8220,6 +8289,22 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
 		return result;
 
 	/*
+	 * The iMac19,1 5K panel exposes the secondary half as a tiled
+	 * 2560x2880 DisplayPort sink on object 0x3113. A plain-boot bring-up
+	 * can otherwise lose that real mode to single-stream DP bandwidth
+	 * validation, after which DRM adds and selects a synthetic 640x480
+	 * DisplayPort fallback. Keep the secondary connector tile-only so the
+	 * bogus non-tiled fallback cannot drive the panel into the blank path.
+	 */
+	if (amdgpu_dm_connector_is_imac5k_secondary_tile(aconnector) &&
+	    !amdgpu_dm_mode_is_imac5k_tile_half(mode)) {
+		drm_dbg_kms(connector->dev,
+			    "IMAC5K: secondary 0x3113 rejecting non-tile mode %ux%u clock=%d status=MODE_PANEL\n",
+			    mode->hdisplay, mode->vdisplay, mode->clock);
+		return MODE_PANEL;
+	}
+
+	/*
 	 * Only run this the first time mode_valid is called to initilialize
 	 * EDID mgmt
 	 */
@@ -8247,6 +8332,12 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
 	drm_mode_destroy(connector->dev, test_mode);
 	if (stream) {
 		dc_stream_release(stream);
+		result = MODE_OK;
+	} else if (amdgpu_dm_connector_is_imac5k_secondary_tile(aconnector) &&
+		   amdgpu_dm_mode_is_imac5k_tile_half(mode)) {
+		drm_dbg_kms(connector->dev,
+			    "IMAC5K: secondary 0x3113 allowing tile mode %ux%u clock=%d despite single-stream DC validation failure\n",
+			    mode->hdisplay, mode->vdisplay, mode->clock);
 		result = MODE_OK;
 	}
 
