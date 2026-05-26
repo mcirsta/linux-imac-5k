@@ -238,6 +238,10 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector);
 static void handle_hpd_rx_irq(void *param);
 
+/* IMAC5K Change A: forced primary EDID re-read after the secondary tile is up */
+static void amdgpu_dm_imac5k_reprobe_primary_after_secondary(
+		struct amdgpu_device *adev);
+
 static void amdgpu_dm_backlight_set_level(struct amdgpu_display_manager *dm,
 					 int bl_idx,
 					 u32 user_brightness);
@@ -5688,6 +5692,16 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 		amdgpu_set_panel_orientation(&aconnector->base);
 	}
 
+	/*
+	 * IMAC5K Change A: now that every link has been detected (so the
+	 * secondary 0x3113 has had its chance to latch the panel into tile
+	 * mode), force the primary 0x3114 to re-read its EDID. This is the
+	 * RE-recommended empirical probe for whether the primary flips from the
+	 * 4K-compat identity (0xAE25, no tile) to the full tile identity
+	 * (0xAE26, DisplayID tile block). No-op on all non-iMac19,1 hardware.
+	 */
+	amdgpu_dm_imac5k_reprobe_primary_after_secondary(adev);
+
 	/* Debug dump: list all DC links and their associated sinks after detection
 	 * is complete for all connectors. This provides a comprehensive view of the
 	 * final state without repeating the dump for each connector.
@@ -8266,6 +8280,238 @@ amdgpu_dm_imac5k_make_tile_mode_preferred(struct drm_connector *connector)
 	drm_info(connector->dev,
 		 "IMAC5K: %s tile mode 2560x2880 set as sole preferred; demoted %u non-tile preferred mode(s) (4K kept, not preferred)\n",
 		 connector->name, demoted);
+}
+
+static unsigned int
+amdgpu_dm_imac5k_count_tile_modes(struct drm_connector *connector)
+{
+	struct drm_display_mode *mode;
+	unsigned int count = 0;
+
+	list_for_each_entry(mode, &connector->probed_modes, head)
+		if (amdgpu_dm_mode_is_imac5k_tile_half(mode))
+			count++;
+
+	return count;
+}
+
+/*
+ * Dump the literal wire EDID bytes the panel returned, so a re-read can be
+ * judged on raw evidence (e.g. product code 0xAE25 vs 0xAE26, presence of a
+ * DisplayID extension block carrying TILE) rather than only on parsed fields.
+ * The hex slice id8_23 covers EDID bytes 8..23: mfg(8,9) product(10,11)
+ * serial(12-15) week(16) year(17) version(18) revision(19) basic-params(20)
+ * h_size_cm(21) v_size_cm(22) gamma(23). Extension tag 0x70 = DisplayID,
+ * 0x02 = CEA-861.
+ */
+static void
+amdgpu_dm_imac5k_log_edid_raw(struct drm_device *dev, const char *label,
+			      const struct dc_sink *sink)
+{
+	const u8 *e = sink->dc_edid.raw_edid;
+	u32 len = sink->dc_edid.length;
+	char mfg[4] = { 0 };
+	u8 num_ext;
+	u32 i;
+
+	if (len < EDID_LENGTH) {
+		drm_info(dev,
+			 "IMAC5K: primary 0x3114 %s raw-edid: length=%u (too short to parse)\n",
+			 label, len);
+		return;
+	}
+
+	/* Manufacturer ID: bytes 8-9, three packed 5-bit letters ('@'+code). */
+	mfg[0] = '@' + ((e[8] >> 2) & 0x1f);
+	mfg[1] = '@' + (((e[8] & 0x3) << 3) | (e[9] >> 5));
+	mfg[2] = '@' + (e[9] & 0x1f);
+
+	num_ext = e[0x7e];
+
+	drm_info(dev,
+		 "IMAC5K: primary 0x3114 %s raw-edid: length=%u ext_blocks=%u mfg='%s' ver=%u.%u hsize_cm=%u vsize_cm=%u block0_csum=0x%02x id8_23=%*ph\n",
+		 label, len, num_ext, mfg, e[18], e[19], e[21], e[22],
+		 e[0x7f], 16, &e[8]);
+
+	for (i = 1; i <= num_ext && (i + 1) * EDID_LENGTH <= len; i++) {
+		u8 tag = e[i * EDID_LENGTH];
+
+		drm_info(dev,
+			 "IMAC5K: primary 0x3114 %s raw-edid: ext[%u] tag=0x%02x%s hdr=%*ph\n",
+			 label, i, tag,
+			 tag == 0x70 ? " (DisplayID)" :
+			 tag == 0x02 ? " (CEA-861)" : "",
+			 8, &e[i * EDID_LENGTH]);
+	}
+}
+
+/*
+ * IMAC5K Change A: primary post-wake EDID re-read.
+ *
+ * At boot the panel presents its 4K-compatible identity (product 0xAE25, no
+ * DisplayID tile block) until it is latched into tile mode. The secondary route
+ * (DP-1 / 0x3113) performs that latch during its own detect (primary 0x4F1
+ * pulse + AUX wake), after which the panel exposes the full tile identity
+ * (product 0xAE26, DisplayID tile block, 2560x2880 DTD). But the primary
+ * (eDP-1 / 0x3114) was already detected and cached as 0xAE25, so its DRM
+ * connector keeps the 4K-compat EDID with no tile metadata and the tile pair
+ * cannot form.
+ *
+ * Windows' display stack performs a forced per-endpoint EDID re-read
+ * (DalEdidRefreshIfNeededOrForced / EdidReader_RefreshMaybeForced). The
+ * secondary re-read is proven from the captures; the primary invocation is
+ * Windows-shaped but unproven (RE: CURRENT.md 2026-05-26 ss5808/5862), so this
+ * is the RE-recommended empirical probe: once the secondary is up in tile mode,
+ * force the primary connector to re-read its EDID -- refreshing BOTH the DC
+ * sink EDID (via dc_link_detect) AND the DRM connector EDID/TILE (via
+ * amdgpu_dm_update_connector_after_detect) -- and log the before/after
+ * identity. The next dmesg then shows conclusively whether the primary flips
+ * 0xAE25 -> 0xAE26 and gains the tile block.
+ *
+ * Tightly gated: DMI iMac19,1 + exact primary/secondary routes; only runs once
+ * the secondary actually carries the tile (panel proven latched); idempotent
+ * (skips the re-read when the primary already carries the tile identity).
+ * No-op on all other hardware.
+ */
+static void
+amdgpu_dm_imac5k_reprobe_primary_after_secondary(struct amdgpu_device *adev)
+{
+	struct drm_device *dev = adev_to_drm(adev);
+	struct amdgpu_display_manager *dm = &adev->dm;
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	struct amdgpu_dm_connector *primary = NULL;
+	struct amdgpu_dm_connector *secondary = NULL;
+	struct dc_link *primary_link;
+	struct dc_sink *sink;
+	enum dc_edid_status edid_status;
+	unsigned int tile_modes_before, tile_modes_after;
+	u16 mfg_before = 0, prod_before = 0;
+	u16 mfg_after = 0, prod_after = 0;
+	bool tile_before;
+
+	if (!amdgpu_dm_imac5k_dmi_match())
+		return;
+
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
+		struct amdgpu_dm_connector *aconnector;
+
+		if (connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK)
+			continue;
+
+		aconnector = to_amdgpu_dm_connector(connector);
+		if (amdgpu_dm_connector_is_imac5k_primary_route(aconnector))
+			primary = aconnector;
+		else if (amdgpu_dm_connector_is_imac5k_secondary_route(aconnector))
+			secondary = aconnector;
+	}
+	drm_connector_list_iter_end(&iter);
+
+	if (!primary || !secondary)
+		return;
+
+	/*
+	 * Only re-read the primary once the panel has actually latched into tile
+	 * mode (the secondary came up tile-aware). If the secondary never
+	 * flipped, the panel is still 4K-compat and re-reading the primary
+	 * cannot help -- leave it untouched.
+	 */
+	if (!amdgpu_dm_connector_is_imac5k_secondary_tile(secondary)) {
+		drm_info(dev,
+			 "IMAC5K: primary 0x3114 re-read skipped: secondary 0x3113 not in tile mode (has_tile=%d %ux%u)\n",
+			 secondary->base.has_tile,
+			 secondary->base.tile_h_size,
+			 secondary->base.tile_v_size);
+		return;
+	}
+
+	primary_link = primary->dc_link;
+	if (!primary_link)
+		return;
+
+	sink = primary_link->local_sink;
+	if (!sink) {
+		drm_info(dev,
+			 "IMAC5K: primary 0x3114 re-read skipped: no local_sink\n");
+		return;
+	}
+
+	/* Snapshot the primary BEFORE forcing the re-read. */
+	mfg_before = sink->edid_caps.manufacturer_id;
+	prod_before = sink->edid_caps.product_id;
+	tile_before = primary->base.has_tile;
+	tile_modes_before = amdgpu_dm_imac5k_count_tile_modes(&primary->base);
+
+	drm_info(dev,
+		 "IMAC5K: primary 0x3114 pre-reread: product=0x%04x mfg=0x%04x has_tile=%d tile=%ux%u loc=%u,%u grid=%ux%u tile_modes=%u\n",
+		 prod_before, mfg_before, tile_before,
+		 primary->base.tile_h_size, primary->base.tile_v_size,
+		 primary->base.tile_h_loc, primary->base.tile_v_loc,
+		 primary->base.num_h_tile, primary->base.num_v_tile,
+		 tile_modes_before);
+	amdgpu_dm_imac5k_log_edid_raw(dev, "pre-reread", sink);
+
+	/*
+	 * If the primary already carries the tile identity, there is nothing to
+	 * refresh -- avoid churning a good sink.
+	 */
+	if (tile_before &&
+	    primary->base.tile_h_size == IMAC5K_TILE_H_ACTIVE &&
+	    primary->base.tile_v_size == IMAC5K_TILE_V_ACTIVE) {
+		drm_info(dev,
+			 "IMAC5K: primary 0x3114 already tile-aware; skipping forced re-read\n");
+		return;
+	}
+
+	/*
+	 * Re-read the primary EDID directly from the panel.
+	 * dm_helpers_read_local_edid() is exactly what DC uses during detect: it
+	 * reads the EDID over the primary's DDC/AUX, refreshes the DRM
+	 * connector's EDID + TILE metadata (via drm_edid_connector_update) and
+	 * the DC sink's dc_edid + edid_caps in place. Unlike dc_link_detect() it
+	 * does NOT run the eDP connection-type power sequence -- which early-outs
+	 * for an eDP that already has a sink (so no re-read happens) and could
+	 * power the panel down if HPD momentarily read low. So this is the safe,
+	 * power-neutral primary re-read the RE recommends as the probe.
+	 */
+	mutex_lock(&dm->dc_lock);
+	dc_exit_ips_for_hw_access(dm->dc);
+	edid_status = dm_helpers_read_local_edid(primary_link->ctx,
+						 primary_link, sink);
+	mutex_unlock(&dm->dc_lock);
+
+	/*
+	 * Keep aconnector->drm_edid (the cache consumed by get_modes) coherent
+	 * with the freshly-read sink EDID. dm_helpers_read_local_edid() already
+	 * refreshed the connector's internal EDID + has_tile, but not this
+	 * amdgpu-owned copy, so resync the pointer from the same raw bytes.
+	 */
+	if (sink->dc_edid.length) {
+		const struct edid *edid =
+			(const struct edid *)sink->dc_edid.raw_edid;
+
+		drm_edid_free(primary->drm_edid);
+		primary->drm_edid = drm_edid_alloc(edid, sink->dc_edid.length);
+	}
+
+	/* Snapshot the primary AFTER the re-read. */
+	mfg_after = sink->edid_caps.manufacturer_id;
+	prod_after = sink->edid_caps.product_id;
+	tile_modes_after = amdgpu_dm_imac5k_count_tile_modes(&primary->base);
+
+	drm_info(dev,
+		 "IMAC5K: primary 0x3114 post-reread: edid_status=%d product=0x%04x mfg=0x%04x has_tile=%d tile=%ux%u loc=%u,%u grid=%ux%u tile_modes=%u | delta: product 0x%04x->0x%04x has_tile %d->%d tile_modes %u->%u%s\n",
+		 edid_status, prod_after, mfg_after, primary->base.has_tile,
+		 primary->base.tile_h_size, primary->base.tile_v_size,
+		 primary->base.tile_h_loc, primary->base.tile_v_loc,
+		 primary->base.num_h_tile, primary->base.num_v_tile,
+		 tile_modes_after,
+		 prod_before, prod_after, tile_before, primary->base.has_tile,
+		 tile_modes_before, tile_modes_after,
+		 (prod_before != prod_after || tile_before != primary->base.has_tile) ?
+			" CHANGED" : " UNCHANGED");
+	amdgpu_dm_imac5k_log_edid_raw(dev, "post-reread", sink);
 }
 
 struct dc_stream_state *
