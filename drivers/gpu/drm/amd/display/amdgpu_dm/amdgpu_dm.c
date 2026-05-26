@@ -8104,6 +8104,8 @@ cleanup:
 
 #define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
 #define IMAC5K_WIN_SECONDARY_DDC_HW_INST 2
+#define IMAC5K_WIN_PRIMARY_OBJECT_ID 0x3114
+#define IMAC5K_WIN_PRIMARY_DDC_HW_INST 3
 #define IMAC5K_TILE_H_ACTIVE 2560
 #define IMAC5K_TILE_V_ACTIVE 2880
 
@@ -8167,6 +8169,103 @@ amdgpu_dm_mode_is_imac5k_tile_half(const struct drm_display_mode *mode)
 	return mode &&
 	       mode->hdisplay == IMAC5K_TILE_H_ACTIVE &&
 	       mode->vdisplay == IMAC5K_TILE_V_ACTIVE;
+}
+
+static bool
+amdgpu_dm_connector_is_imac5k_primary_route(
+		const struct amdgpu_dm_connector *aconnector)
+{
+	const struct dc_link *link;
+
+	if (!amdgpu_dm_imac5k_dmi_match() || !aconnector)
+		return false;
+
+	link = aconnector->dc_link;
+	if (!link || link->connector_signal != SIGNAL_TYPE_EDP)
+		return false;
+
+	if (dal_graphics_object_id_to_uint(link->link_id) !=
+	    IMAC5K_WIN_PRIMARY_OBJECT_ID)
+		return false;
+
+	if (link->ddc_hw_inst != IMAC5K_WIN_PRIMARY_DDC_HW_INST)
+		return false;
+
+	if (!link->link_enc ||
+	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_C)
+		return false;
+
+	return true;
+}
+
+static bool
+amdgpu_dm_connector_is_imac5k_tile(
+		const struct amdgpu_dm_connector *aconnector)
+{
+	return amdgpu_dm_connector_is_imac5k_primary_route(aconnector) ||
+	       amdgpu_dm_connector_is_imac5k_secondary_route(aconnector);
+}
+
+/*
+ * Make 2560x2880 the sole PREFERRED mode on the iMac 5K tiles.
+ *
+ * The panel's tile EDID marks BOTH the 2560x2880 tile-native DTD and the
+ * 3840x2160 DisplayID fallback as preferred. The larger-area 4K then wins
+ * fbdev/compositor mode selection, the shared framebuffer is sized to 2160
+ * tall, and the 2880-tall tile mode on the peer tile is pruned as VIRTUAL_Y
+ * -- so the tile pair never forms (observed in new_boot_5). The OCLP/probe
+ * boot avoided this because its EDID presented 2560x2880 as the (sole)
+ * preferred mode (RE: 2026-03-26 Probe-Boot Milestone), and Windows reaches
+ * the same effect via the half-panel geometry fixup
+ * (DoubleEdidPhysicalWidthForTiledCaps) -- neither removes the 4K mode.
+ *
+ * Timing: this runs at the end of get_modes, i.e. inside every
+ * drm_helper_probe_single_connector_modes() pass, BEFORE the probed modes
+ * are exposed to fbdev/userspace. So 4K is never seen as preferred from
+ * amdgpu's connector -- the very first modeset (fbdev included) sees
+ * 2560x2880 preferred. 4K stays in the list, just not preferred.
+ */
+static void
+amdgpu_dm_imac5k_make_tile_mode_preferred(struct drm_connector *connector)
+{
+	struct amdgpu_dm_connector *aconnector =
+			to_amdgpu_dm_connector(connector);
+	struct drm_display_mode *mode;
+	bool have_tile_mode = false;
+	unsigned int demoted = 0;
+
+	if (!amdgpu_dm_connector_is_imac5k_tile(aconnector))
+		return;
+
+	/* Only act if the tile-native mode is actually present to become the
+	 * preferred -- never leave the connector with no preferred mode.
+	 */
+	list_for_each_entry(mode, &connector->probed_modes, head) {
+		if (amdgpu_dm_mode_is_imac5k_tile_half(mode)) {
+			have_tile_mode = true;
+			break;
+		}
+	}
+
+	if (!have_tile_mode) {
+		drm_info(connector->dev,
+			 "IMAC5K: %s make-tile-preferred skipped: no 2560x2880 mode present yet\n",
+			 connector->name);
+		return;
+	}
+
+	list_for_each_entry(mode, &connector->probed_modes, head) {
+		if (amdgpu_dm_mode_is_imac5k_tile_half(mode)) {
+			mode->type |= DRM_MODE_TYPE_PREFERRED;
+		} else if (mode->type & DRM_MODE_TYPE_PREFERRED) {
+			mode->type &= ~DRM_MODE_TYPE_PREFERRED;
+			demoted++;
+		}
+	}
+
+	drm_info(connector->dev,
+		 "IMAC5K: %s tile mode 2560x2880 set as sole preferred; demoted %u non-tile preferred mode(s) (4K kept, not preferred)\n",
+		 connector->name, demoted);
 }
 
 struct dc_stream_state *
@@ -9049,6 +9148,17 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 			amdgpu_dm_connector_add_common_modes(encoder, connector);
 		amdgpu_dm_connector_add_freesync_modes(connector, drm_edid);
 	}
+
+	/*
+	 * IMAC5K: demote the 4K-family DisplayID modes from PREFERRED so the
+	 * 2560x2880 tile mode is the sole preferred on each iMac tile. Done
+	 * here (end of get_modes, before the probed modes are exposed) so 4K is
+	 * never picked as preferred by fbdev/userspace, which would size the
+	 * shared framebuffer to 2160 tall and VIRTUAL_Y-prune the peer tile's
+	 * 2880-tall mode. No modes are removed.
+	 */
+	amdgpu_dm_imac5k_make_tile_mode_preferred(connector);
+
 	amdgpu_dm_fbc_init(connector);
 
 	return amdgpu_dm_connector->num_modes;
