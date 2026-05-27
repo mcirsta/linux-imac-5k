@@ -2646,8 +2646,22 @@ bool dp_verify_link_cap_with_retries(
 			DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-cap bridged verified<-reported rate=0x%x lanes=%u; 2560x2880 should now pass bandwidth validation\n",
 				link->verified_link_cap.link_rate,
 				link->verified_link_cap.lane_count);
+		} else if (link->reported_link_cap.link_rate != LINK_RATE_UNKNOWN &&
+			   link->reported_link_cap.lane_count != LANE_COUNT_UNKNOWN) {
+			/*
+			 * reported cap is known but not better than verified =>
+			 * the link already verified/trained at (at least) the
+			 * reported cap. Nothing to bridge, and 2560x2880 is NOT
+			 * pruned for bandwidth. (This is the steady state once the
+			 * secondary trains HBR2 x4 -- verified == reported.)
+			 */
+			DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-cap bridge not needed: verified cap already adequate (rate=0x%x lanes=%u bw=%u >= reported bw=%u); 2560x2880 not pruned for bandwidth\n",
+				link->verified_link_cap.link_rate,
+				link->verified_link_cap.lane_count,
+				verified_bw, reported_bw);
 		} else {
-			DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-cap NOT bridged (reported not better/known); 2560x2880 will still be pruned -- reported caps were not read as HBR2 x4\n");
+			/* reported cap unknown (caps AUX-read failed): cannot bridge. */
+			DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-cap NOT bridged: reported caps unknown (AUX read failed); 2560x2880 may still be pruned for bandwidth\n");
 		}
 	}
 

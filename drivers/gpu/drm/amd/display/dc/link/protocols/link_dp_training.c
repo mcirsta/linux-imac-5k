@@ -1193,6 +1193,21 @@ enum dc_status dpcd_set_link_settings(
 				link->dpcd_caps.max_ln_count.bits.POST_LT_ADJ_REQ_SUPPORTED;
 	}
 
+	/*
+	 * IMAC5K: the secondary panel AUX dozes between cap-read and these
+	 * link-config writes, so the very first write attempt used to fail with
+	 * -5 (a burst of "Too many retries" + DC *ERROR* lines) before the
+	 * re-wake-on-failure retry below recovered it. Pre-wake the panel via the
+	 * primary 0x4F1 latch and settle BEFORE the first attempt so it lands
+	 * cleanly. The retry loop below stays as the safety net. Gated to the
+	 * exact secondary route; no-op on all other hardware.
+	 */
+	if (imac5k_sec) {
+		DC_LOG_WARNING("IMAC5K: secondary 0x3113 pre-waking panel via primary 0x4F1 before first link-config write\n");
+		imac5k_lt_rewake_primary(link);
+		msleep(IMAC5K_LT_REWAKE_SETTLE_MS);
+	}
+
 	while (true) {
 		ds_status = core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
 			&downspread.raw, sizeof(downspread));
@@ -1246,10 +1261,10 @@ enum dc_status dpcd_set_link_settings(
 
 		if (ds_status == DC_OK && lc_status == DC_OK &&
 		    bw_status == DC_OK) {
-			if (imac5k_try)
-				DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-config writes OK after re-wake retry attempt=%u rate=0x%x lanes=%u\n",
-					       imac5k_try, rate,
-					       lt_settings->link_settings.lane_count);
+			DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-config writes OK rate=0x%x lanes=%u (pre-wake done; re-wake retries=%u)\n",
+				       rate,
+				       lt_settings->link_settings.lane_count,
+				       imac5k_try);
 			break;
 		}
 
