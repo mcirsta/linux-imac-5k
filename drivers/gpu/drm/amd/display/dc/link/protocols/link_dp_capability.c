@@ -61,6 +61,10 @@
 
 #define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
 #define IMAC5K_WIN_SECONDARY_DDC_HW_INST 2
+#define IMAC5K_WIN_PRIMARY_OBJECT_ID 0x3114
+#define IMAC5K_WIN_PRIMARY_DDC_HW_INST 3
+#define IMAC5K_DPCD_PANEL_LATCH 0x4F1
+#define IMAC5K_AUX_WAKE_SETTLE_MS 60
 
 #ifndef MAX
 #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
@@ -91,6 +95,42 @@ static bool link_is_imac5k_secondary_source_dpcd_route(
 		return false;
 
 	return true;
+}
+
+/*
+ * Wake the iMac panel by pulsing the primary 0x3114 latch (DPCD 0x4F1 = 1).
+ * The secondary 0x3113 AUX dozes a few hundred ms after the panel was last
+ * touched; pulsing the primary brings the whole panel (and the secondary AUX)
+ * back up. Mirrors imac5k_lt_rewake_primary() in link_dp_training.c.
+ */
+static void imac5k_cap_rewake_primary(const struct dc_link *sec_link)
+{
+	const struct dc *dc = sec_link ? sec_link->dc : NULL;
+	uint8_t payload = 1;
+	uint32_t i;
+
+	if (!dc)
+		return;
+
+	for (i = 0; i < dc->link_count; i++) {
+		struct dc_link *p = dc->links[i];
+
+		if (!p || !p->link_enc)
+			continue;
+		if (p->connector_signal != SIGNAL_TYPE_EDP)
+			continue;
+		if (dal_graphics_object_id_to_uint(p->link_id) !=
+		    IMAC5K_WIN_PRIMARY_OBJECT_ID)
+			continue;
+		if (p->ddc_hw_inst != IMAC5K_WIN_PRIMARY_DDC_HW_INST)
+			continue;
+		if (p->link_enc->transmitter != TRANSMITTER_UNIPHY_C)
+			continue;
+
+		core_link_write_dpcd(p, IMAC5K_DPCD_PANEL_LATCH,
+				     &payload, sizeof(payload));
+		return;
+	}
 }
 
 static void dpcd_set_imac5k_secondary_source_table_revision(
@@ -1463,6 +1503,24 @@ bool dp_overwrite_extended_receiver_cap(struct dc_link *link)
 
 void dpcd_set_source_specific_data(struct dc_link *link)
 {
+	/*
+	 * IMAC5K: the secondary panel AUX dozes between detect and this
+	 * stream-enable step, so the source-specific DPCD writes below
+	 * (DP_SOURCE_OUI, then the 0x310 source-table-revision) used to fail with
+	 * -5 and spam "Too many retries" before the link even trained
+	 * (new_boot_9 t=7.23-7.42). Pre-wake the panel via the primary 0x4F1
+	 * latch + settle here -- the earliest secondary AUX touch in the enable
+	 * path -- so these writes (and everything downstream) land on an awake
+	 * panel. The link-training pre-wake in dpcd_set_link_settings() stays as a
+	 * re-assert. Gated to the exact iMac secondary route; no-op on all other
+	 * hardware and links.
+	 */
+	if (link_is_imac5k_secondary_source_dpcd_route(link)) {
+		DC_LOG_WARNING("IMAC5K: secondary 0x3113 pre-waking panel via primary 0x4F1 before source-specific DPCD writes\n");
+		imac5k_cap_rewake_primary(link);
+		msleep(IMAC5K_AUX_WAKE_SETTLE_MS);
+	}
+
 	if (!link->dc->vendor_signature.is_valid) {
 		enum dc_status __maybe_unused result_write_min_hblank = DC_NOT_SUPPORTED;
 		struct dpcd_amd_signature amd_signature = {0};
