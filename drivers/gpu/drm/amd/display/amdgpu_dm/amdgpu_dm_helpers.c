@@ -49,38 +49,6 @@
 #include "dm_helpers.h"
 #include "ddc_service_types.h"
 #include "clk_mgr.h"
-#include "grph_object_id.h"
-
-#define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
-#define IMAC5K_WIN_SECONDARY_DDC_HW_INST 2
-
-static bool dm_link_is_imac5k_secondary_route(const struct dc_link *link)
-{
-	bool old, new_gate;
-
-	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
-	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1"))
-		old = false;
-	else if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
-		old = false;
-	else if (dal_graphics_object_id_to_uint(link->link_id) !=
-		 IMAC5K_WIN_SECONDARY_OBJECT_ID)
-		old = false;
-	else if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
-		old = false;
-	else if (!link->link_enc ||
-		 link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
-		old = false;
-	else
-		old = true;
-
-	/* Phase 0 WARN bridge — see dc_link_is_apple_5k_slave() in dc.h. */
-	new_gate = dc_link_is_apple_5k_slave(link);
-	WARN_ON_ONCE(old != new_gate);
-
-	return old;
-}
-
 static u32 edid_extract_panel_id(struct edid *edid)
 {
 	return (u32)edid->mfg_id[0] << 24   |
@@ -1191,19 +1159,6 @@ enum dc_edid_status dm_helpers_read_local_edid(
 		DRM_ERROR("EDID err: %d, on connector: %s",
 				edid_status,
 				aconnector->base.name);
-
-	if (dm_link_is_imac5k_secondary_route(link))
-		drm_warn(connector->dev,
-			 "IMAC5K: secondary 0x3113 EDID status=%d length=%u aux=%u has_tile=%u tile_single=%u tile_group=%p tile=%ux%u loc=%ux%u grid=%ux%u name='%s' mfg=0x%x product=0x%x\n",
-			 edid_status, sink->dc_edid.length, link->aux_mode,
-			 connector->has_tile, connector->tile_is_single_monitor,
-			 connector->tile_group,
-			 connector->tile_h_size, connector->tile_v_size,
-			 connector->tile_h_loc, connector->tile_v_loc,
-			 connector->num_h_tile, connector->num_v_tile,
-			 sink->edid_caps.display_name,
-			 sink->edid_caps.manufacturer_id,
-			 sink->edid_caps.product_id);
 
 	if (link->aux_mode) {
 		union test_request test_request = {0};

@@ -77,68 +77,23 @@
 #define MAX_MTP_SLOT_COUNT 64
 #define LINK_TRAINING_ATTEMPTS 4
 #define PEAK_FACTOR_X1000 1006
-#define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
-#define IMAC5K_WIN_SECONDARY_DDC_HW_INST 2
 #define IMAC5K_DPCD_PANEL_LATCH 0x4F1
 
-static bool link_is_imac5k_secondary_route(const struct dc_link *link)
+static void imac5k_secondary_write_panel_latch(struct dc_link *link)
 {
-	bool old, new_gate;
-
-	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
-	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1"))
-		old = false;
-	else if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
-		old = false;
-	else if (dal_graphics_object_id_to_uint(link->link_id) !=
-		 IMAC5K_WIN_SECONDARY_OBJECT_ID)
-		old = false;
-	else if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
-		old = false;
-	else if (!link->link_enc ||
-		 link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
-		old = false;
-	else
-		old = true;
-
-	/* Phase 0 WARN bridge — see dc_link_is_apple_5k_slave() in dc.h. */
-	new_gate = dc_link_is_apple_5k_slave(link);
-	WARN_ON_ONCE(old != new_gate);
-
-	return old;
-}
-
-static void imac5k_secondary_write_panel_latch(struct dc_link *link,
-					       const char *stage)
-{
-	struct dal_logger *dc_logger = link && link->ctx ?
-				       link->ctx->logger : NULL;
 	uint8_t payload = 1;
-	uint8_t verify = 0;
 	enum dc_status status;
-	enum dc_status verify_status;
 
-	if (!link_is_imac5k_secondary_route(link) || !link->local_sink)
+	if (!dc_link_is_apple_5k_slave(link) || !link->local_sink)
 		return;
 
 	status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
 				      &payload, sizeof(payload));
 	if (status != DC_OK) {
 		msleep(10);
-		status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
-					      &payload, sizeof(payload));
+		core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+				     &payload, sizeof(payload));
 	}
-
-	verify_status = core_link_read_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
-					    &verify, sizeof(verify));
-
-	DC_LOG_WARNING("IMAC5K: secondary 0x3113 panel latch stage=%s link=%u raw_obj=0x%x ddc_hw=%u tx=%d local_sink=%p aux=%u status=%d verify_status=%d verify=0x%02x\n",
-		       stage ? stage : "<none>", link->link_index,
-		       dal_graphics_object_id_to_uint(link->link_id),
-		       link->ddc_hw_inst,
-		       link->link_enc ? link->link_enc->transmitter : -1,
-		       link->local_sink, link->aux_mode, status,
-		       verify_status, verify);
 }
 
 void link_blank_all_dp_displays(struct dc *dc)
@@ -1139,8 +1094,7 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx)
 				&new_downspread.raw, sizeof(new_downspread));
 		}
 
-		imac5k_secondary_write_panel_latch(link,
-						   "enable_stream_features");
+		imac5k_secondary_write_panel_latch(link);
 	} else {
 		dm_helpers_mst_enable_stream_features(stream);
 	}

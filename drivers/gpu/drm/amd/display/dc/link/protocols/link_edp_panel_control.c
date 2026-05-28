@@ -48,34 +48,10 @@
 #define DC_LOGGER_INIT(logger)
 
 #define DP_SINK_PR_ENABLE_AND_CONFIGURATION		0x37B
-#define IMAC5K_WIN_SECONDARY_OBJECT_ID			0x3113
-#define IMAC5K_WIN_SECONDARY_DDC_HW_INST		2
 
 static bool link_is_imac5k_secondary_assr_route(const struct dc_link *link)
 {
-	bool old, new_gate;
-
-	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
-	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1"))
-		old = false;
-	else if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
-		old = false;
-	else if (dal_graphics_object_id_to_uint(link->link_id) !=
-		 IMAC5K_WIN_SECONDARY_OBJECT_ID)
-		old = false;
-	else if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
-		old = false;
-	else if (!link->link_enc ||
-		 link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
-		old = false;
-	else
-		old = true;
-
-	/* Phase 0 WARN bridge — see dc_link_is_apple_5k_slave() in dc.h. */
-	new_gate = dc_link_is_apple_5k_slave(link);
-	WARN_ON_ONCE(old != new_gate);
-
-	return old;
+	return dc_link_is_apple_5k_slave(link);
 }
 
 /* Travis */

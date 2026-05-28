@@ -221,8 +221,6 @@ int amdgpu_smu_pptable_id = -1;
 uint amdgpu_dc_feature_mask = 2;
 uint amdgpu_dc_debug_mask;
 uint amdgpu_dc_visual_confirm;
-int amdgpu_imac5k_force_genlock = 1;
-int amdgpu_imac5k_force_primary_master;
 int amdgpu_async_gfx_ring = 1;
 int amdgpu_mcbp = -1;
 int amdgpu_discovery = -1;
@@ -902,14 +900,6 @@ module_param_named(dcdebugmask, amdgpu_dc_debug_mask, uint, 0444);
 
 MODULE_PARM_DESC(visualconfirm, "Visual confirm (0 = off (default), 1 = MPO, 5 = PSR)");
 module_param_named(visualconfirm, amdgpu_dc_visual_confirm, uint, 0444);
-
-MODULE_PARM_DESC(imac5k_force_genlock,
-	"Force timing synchronization for the exact iMac19,1 5K tile pair when only MSA timing-ignore blocks the group (1 = on (default), 0 = off). Only acts on the iMac19,1 5K tile pair; a no-op on all other hardware.");
-module_param_named(imac5k_force_genlock, amdgpu_imac5k_force_genlock, int, 0444);
-
-MODULE_PARM_DESC(imac5k_force_primary_master,
-	"Force the iMac19,1 primary tile (eDP / 0x3114) to be the timing-sync master/anchor instead of DC's first-unblanked-pipe default (0 = off (default), 1 = on). Only takes effect alongside imac5k_force_genlock when the 5K tile pair is grouped.");
-module_param_named(imac5k_force_primary_master, amdgpu_imac5k_force_primary_master, int, 0444);
 
 /**
  * DOC: abmlevel (uint)

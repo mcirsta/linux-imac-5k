@@ -206,8 +206,6 @@ extern uint amdgpu_dc_feature_mask;
 extern uint amdgpu_freesync_vid_mode;
 extern uint amdgpu_dc_debug_mask;
 extern uint amdgpu_dc_visual_confirm;
-extern int amdgpu_imac5k_force_genlock;
-extern int amdgpu_imac5k_force_primary_master;
 extern int amdgpu_dm_abm_level;
 extern int amdgpu_backlight;
 extern int amdgpu_damage_clips;

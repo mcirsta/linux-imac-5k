@@ -59,10 +59,6 @@
 #define DC_LOGGER \
 	link->ctx->logger
 
-#define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
-#define IMAC5K_WIN_SECONDARY_DDC_HW_INST 2
-#define IMAC5K_WIN_PRIMARY_OBJECT_ID 0x3114
-#define IMAC5K_WIN_PRIMARY_DDC_HW_INST 3
 #define IMAC5K_DPCD_PANEL_LATCH 0x4F1
 #define IMAC5K_AUX_WAKE_SETTLE_MS 60
 
@@ -73,78 +69,30 @@
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
 #endif
 
-static bool link_is_imac5k_secondary_source_dpcd_route(
-	const struct dc_link *link)
-{
-	bool old, new_gate;
-
-	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
-	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1"))
-		old = false;
-	else if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
-		old = false;
-	else if (dal_graphics_object_id_to_uint(link->link_id) !=
-		 IMAC5K_WIN_SECONDARY_OBJECT_ID)
-		old = false;
-	else if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
-		old = false;
-	else if (!link->link_enc ||
-		 link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
-		old = false;
-	else
-		old = true;
-
-	/* Phase 0 WARN bridge — see dc_link_is_apple_5k_slave() in dc.h. */
-	new_gate = dc_link_is_apple_5k_slave(link);
-	WARN_ON_ONCE(old != new_gate);
-
-	return old;
-}
-
 /*
- * Wake the iMac panel by pulsing the primary 0x3114 latch (DPCD 0x4F1 = 1).
- * The secondary 0x3113 AUX dozes a few hundred ms after the panel was last
- * touched; pulsing the primary brings the whole panel (and the secondary AUX)
- * back up. Mirrors imac5k_lt_rewake_primary() in link_dp_training.c.
+ * Wake the Apple 5K panel by pulsing the root (eDP) panel latch (DPCD 0x4F1=1).
+ * The slave (DP) AUX dozes a few hundred ms after the panel was last touched;
+ * pulsing the root brings the whole panel (and the slave's AUX) back up.
+ * Mirrors imac5k_lt_rewake_primary() in link_dp_training.c.
  */
 static void imac5k_cap_rewake_primary(const struct dc_link *sec_link)
 {
-	const struct dc *dc = sec_link ? sec_link->dc : NULL;
+	struct dc_link *root = sec_link ? sec_link->tiled_peer : NULL;
 	uint8_t payload = 1;
-	uint32_t i;
 
-	if (!dc)
+	if (!root || !dc_link_is_apple_5k_root(root))
 		return;
 
-	for (i = 0; i < dc->link_count; i++) {
-		struct dc_link *p = dc->links[i];
-
-		if (!p || !p->link_enc)
-			continue;
-		if (p->connector_signal != SIGNAL_TYPE_EDP)
-			continue;
-		if (dal_graphics_object_id_to_uint(p->link_id) !=
-		    IMAC5K_WIN_PRIMARY_OBJECT_ID)
-			continue;
-		if (p->ddc_hw_inst != IMAC5K_WIN_PRIMARY_DDC_HW_INST)
-			continue;
-		if (p->link_enc->transmitter != TRANSMITTER_UNIPHY_C)
-			continue;
-
-		core_link_write_dpcd(p, IMAC5K_DPCD_PANEL_LATCH,
-				     &payload, sizeof(payload));
-		return;
-	}
+	core_link_write_dpcd(root, IMAC5K_DPCD_PANEL_LATCH,
+			     &payload, sizeof(payload));
 }
 
 static void dpcd_set_imac5k_secondary_source_table_revision(
 	struct dc_link *link)
 {
 	uint8_t table_revision[3];
-	enum dc_status status;
 
-	if (!link_is_imac5k_secondary_source_dpcd_route(link) ||
-	    !link->ctx || !link->dc)
+	if (!dc_link_is_apple_5k_slave(link) || !link->ctx || !link->dc)
 		return;
 
 	table_revision[0] = link->ctx->dce_version >= DCE_VERSION_12_0 ?
@@ -152,17 +100,8 @@ static void dpcd_set_imac5k_secondary_source_table_revision(
 	table_revision[1] = 0x1d;
 	table_revision[2] = 0x03;
 
-	status = core_link_write_dpcd(link, DP_SOURCE_TABLE_REVISION,
-				      table_revision, sizeof(table_revision));
-
-	DC_LOG_WARNING("IMAC5K: secondary 0x3113 source-DPCD 0x310 link=%u raw_obj=0x%x ddc_hw=%u tx=%d dce=%d status=%d value=%02x %02x %02x\n",
-		       link->link_index,
-		       dal_graphics_object_id_to_uint(link->link_id),
-		       link->ddc_hw_inst,
-		       link->link_enc ? link->link_enc->transmitter : -1,
-		       link->ctx->dce_version, status,
-		       table_revision[0], table_revision[1],
-		       table_revision[2]);
+	core_link_write_dpcd(link, DP_SOURCE_TABLE_REVISION,
+			     table_revision, sizeof(table_revision));
 }
 
 struct dp_lt_fallback_entry {
@@ -1508,19 +1447,15 @@ bool dp_overwrite_extended_receiver_cap(struct dc_link *link)
 void dpcd_set_source_specific_data(struct dc_link *link)
 {
 	/*
-	 * IMAC5K: the secondary panel AUX dozes between detect and this
-	 * stream-enable step, so the source-specific DPCD writes below
-	 * (DP_SOURCE_OUI, then the 0x310 source-table-revision) used to fail with
-	 * -5 and spam "Too many retries" before the link even trained
-	 * (new_boot_9 t=7.23-7.42). Pre-wake the panel via the primary 0x4F1
-	 * latch + settle here -- the earliest secondary AUX touch in the enable
-	 * path -- so these writes (and everything downstream) land on an awake
-	 * panel. The link-training pre-wake in dpcd_set_link_settings() stays as a
-	 * re-assert. Gated to the exact iMac secondary route; no-op on all other
-	 * hardware and links.
+	 * Apple 5K tiled-slave: AUX dozes between detect and this stream-enable
+	 * step, so the source-specific DPCD writes below (DP_SOURCE_OUI, then the
+	 * 0x310 source-table-revision) would fail with -5 and spam "Too many
+	 * retries" before the link even trained. Pre-wake the panel via the root
+	 * (eDP) panel latch + settle here so these writes (and everything
+	 * downstream) land on an awake panel. The link-training pre-wake in
+	 * dpcd_set_link_settings() stays as a re-assert.
 	 */
-	if (link_is_imac5k_secondary_source_dpcd_route(link)) {
-		DC_LOG_WARNING("IMAC5K: secondary 0x3113 pre-waking panel via primary 0x4F1 before source-specific DPCD writes\n");
+	if (dc_link_is_apple_5k_slave(link)) {
 		imac5k_cap_rewake_primary(link);
 		msleep(IMAC5K_AUX_WAKE_SETTLE_MS);
 	}
@@ -2669,61 +2604,25 @@ bool dp_verify_link_cap_with_retries(
 		fail_count);
 
 	/*
-	 * IMAC5K: bridge the secondary tile's verified cap from its reported
-	 * (DPCD-read) cap. The 5K secondary (0x3113) has a write-marginal AUX:
-	 * reads work (so reported_link_cap holds the real HBR2 x4 the panel
-	 * advertises), but link-cap verification cannot train it -- it bails at
-	 * the HPD-low connection check or the link-config writes fail -- so
-	 * verified_link_cap is left at fail-safe (minimal). DC then prunes the
-	 * real 2560x2880 tile mode for "No DP link bandwidth" (new_boot_3/4).
-	 *
-	 * Windows enumerates modes against the reported DPCD caps and only
-	 * confirms the link by training at SetMode. Mirror that: use the
-	 * reported cap for mode validation on the exact iMac secondary route so
-	 * 2560x2880 survives. This is not a fabricated cap -- it is the sink's
-	 * own reported capability, read over the working AUX-read path. The link
-	 * still must actually train at commit time (handled separately via the
-	 * link-config re-wake/retry); this only unblocks DC's verified-cap-based
-	 * mode pruning, which Windows does not have. Route-gated => no-op
-	 * everywhere else.
+	 * Apple 5K tiled-slave: bridge the slave's verified cap from its
+	 * reported (DPCD-read) cap when verification bailed at the HPD-low
+	 * connection check before training. Boot 1 evidence shows the
+	 * cold-boot path no longer hits the bridge (the wake+retry produces
+	 * the right verified cap directly); the code is kept as a defensive
+	 * remnant for warm-path / HPDRX scenarios. Phase 1.5 may delete this
+	 * if those scenarios also turn out clean.
 	 */
-	if (link_is_imac5k_secondary_source_dpcd_route(link)) {
+	if (dc_link_is_apple_5k_slave(link)) {
 		uint32_t verified_bw =
 			dp_link_bandwidth_kbps(link, &link->verified_link_cap);
 		uint32_t reported_bw =
 			dp_link_bandwidth_kbps(link, &link->reported_link_cap);
-
-		DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-cap bridge check: verified rate=0x%x lanes=%u bw=%u reported rate=0x%x lanes=%u bw=%u success=%d\n",
-			link->verified_link_cap.link_rate,
-			link->verified_link_cap.lane_count, verified_bw,
-			link->reported_link_cap.link_rate,
-			link->reported_link_cap.lane_count, reported_bw,
-			success);
 
 		if (reported_bw > verified_bw &&
 		    link->reported_link_cap.link_rate != LINK_RATE_UNKNOWN &&
 		    link->reported_link_cap.lane_count != LANE_COUNT_UNKNOWN) {
 			link->verified_link_cap = link->reported_link_cap;
 			success = true;
-			DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-cap bridged verified<-reported rate=0x%x lanes=%u; 2560x2880 should now pass bandwidth validation\n",
-				link->verified_link_cap.link_rate,
-				link->verified_link_cap.lane_count);
-		} else if (link->reported_link_cap.link_rate != LINK_RATE_UNKNOWN &&
-			   link->reported_link_cap.lane_count != LANE_COUNT_UNKNOWN) {
-			/*
-			 * reported cap is known but not better than verified =>
-			 * the link already verified/trained at (at least) the
-			 * reported cap. Nothing to bridge, and 2560x2880 is NOT
-			 * pruned for bandwidth. (This is the steady state once the
-			 * secondary trains HBR2 x4 -- verified == reported.)
-			 */
-			DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-cap bridge not needed: verified cap already adequate (rate=0x%x lanes=%u bw=%u >= reported bw=%u); 2560x2880 not pruned for bandwidth\n",
-				link->verified_link_cap.link_rate,
-				link->verified_link_cap.lane_count,
-				verified_bw, reported_bw);
-		} else {
-			/* reported cap unknown (caps AUX-read failed): cannot bridge. */
-			DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-cap NOT bridged: reported caps unknown (AUX read failed); 2560x2880 may still be pruned for bandwidth\n");
 		}
 	}
 

@@ -1093,82 +1093,29 @@ enum dc_status dpcd_set_training_pattern(
 }
 
 /*
- * IMAC5K: the iMac19,1 5K secondary tile (object 0x3113 / DDC3 / UNIPHY_D)
- * has a write-marginal AUX. Reads (EDID, DPCD rev) succeed, but the
- * link-configuration writes below (DP_DOWNSPREAD_CTRL / DP_LANE_COUNT_SET /
- * DP_LINK_BW_SET) fail with -EIO ("aux hw bus 1: Too many retries") because
- * the panel's secondary side is only briefly awake after a primary 0x4F1
- * wake, and link training lands outside that window. When these writes fail
- * DC cannot program the secondary link, the verified cap stays minimal, and
- * create_validate_stream prunes the real 2560x2880 tile mode for
- * "No DP link bandwidth" (observed in new_boot_3). To make training actually
- * program the link, we re-assert the primary 0x4F1 wake on write failure and
- * retry the link-config writes under that wake. Tightly gated to the exact
- * iMac secondary route, so it is a no-op on every other connector/machine.
+ * Apple 5K tiled-slave: AUX is write-marginal. Reads (EDID, DPCD rev) succeed,
+ * but the link-configuration writes (DP_DOWNSPREAD_CTRL / DP_LANE_COUNT_SET /
+ * DP_LINK_BW_SET) fail with -EIO because the slave side is only briefly awake
+ * after a root panel-latch wake, and link training lands outside that window.
+ * When these writes fail DC cannot program the slave link, the verified cap
+ * stays minimal, and create_validate_stream prunes the real tile mode for
+ * "No DP link bandwidth". Pre-wake the panel via the root panel-latch before
+ * the first write, and re-assert the wake + retry on write failure.
  */
-#define IMAC5K_WIN_PRIMARY_OBJECT_ID     0x3114
-#define IMAC5K_WIN_SECONDARY_OBJECT_ID   0x3113
-#define IMAC5K_WIN_PRIMARY_DDC_HW_INST   3
-#define IMAC5K_WIN_SECONDARY_DDC_HW_INST 2
 #define IMAC5K_DPCD_PANEL_LATCH          0x4F1
 #define IMAC5K_LT_REWAKE_SETTLE_MS       60
 #define IMAC5K_LT_MAX_REWAKE_RETRY       4
 
-static bool imac5k_lt_is_secondary_route(const struct dc_link *link)
-{
-	bool old, new_gate;
-
-	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
-	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1"))
-		old = false;
-	else if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
-		old = false;
-	else if (dal_graphics_object_id_to_uint(link->link_id) !=
-		 IMAC5K_WIN_SECONDARY_OBJECT_ID)
-		old = false;
-	else if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
-		old = false;
-	else if (!link->link_enc ||
-		 link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
-		old = false;
-	else
-		old = true;
-
-	/* Phase 0 WARN bridge — see dc_link_is_apple_5k_slave() in dc.h. */
-	new_gate = dc_link_is_apple_5k_slave(link);
-	WARN_ON_ONCE(old != new_gate);
-
-	return old;
-}
-
 static void imac5k_lt_rewake_primary(const struct dc_link *sec_link)
 {
-	const struct dc *dc = sec_link ? sec_link->dc : NULL;
+	struct dc_link *root = sec_link ? sec_link->tiled_peer : NULL;
 	uint8_t payload = 1;
-	uint32_t i;
 
-	if (!dc)
+	if (!root || !dc_link_is_apple_5k_root(root))
 		return;
 
-	for (i = 0; i < dc->link_count; i++) {
-		struct dc_link *p = dc->links[i];
-
-		if (!p || !p->link_enc)
-			continue;
-		if (p->connector_signal != SIGNAL_TYPE_EDP)
-			continue;
-		if (dal_graphics_object_id_to_uint(p->link_id) !=
-		    IMAC5K_WIN_PRIMARY_OBJECT_ID)
-			continue;
-		if (p->ddc_hw_inst != IMAC5K_WIN_PRIMARY_DDC_HW_INST)
-			continue;
-		if (p->link_enc->transmitter != TRANSMITTER_UNIPHY_C)
-			continue;
-
-		core_link_write_dpcd(p, IMAC5K_DPCD_PANEL_LATCH,
-				     &payload, sizeof(payload));
-		return;
-	}
+	core_link_write_dpcd(root, IMAC5K_DPCD_PANEL_LATCH,
+			     &payload, sizeof(payload));
 }
 
 enum dc_status dpcd_set_link_settings(
@@ -1177,7 +1124,7 @@ enum dc_status dpcd_set_link_settings(
 {
 	uint8_t rate;
 	enum dc_status status;
-	bool imac5k_sec = imac5k_lt_is_secondary_route(link);
+	bool imac5k_sec = dc_link_is_apple_5k_slave(link);
 	unsigned int imac5k_try = 0;
 	enum dc_status ds_status = DC_OK;
 	enum dc_status lc_status = DC_OK;
@@ -1203,16 +1150,13 @@ enum dc_status dpcd_set_link_settings(
 	}
 
 	/*
-	 * IMAC5K: the secondary panel AUX dozes between cap-read and these
-	 * link-config writes, so the very first write attempt used to fail with
-	 * -5 (a burst of "Too many retries" + DC *ERROR* lines) before the
-	 * re-wake-on-failure retry below recovered it. Pre-wake the panel via the
-	 * primary 0x4F1 latch and settle BEFORE the first attempt so it lands
-	 * cleanly. The retry loop below stays as the safety net. Gated to the
-	 * exact secondary route; no-op on all other hardware.
+	 * Apple 5K tiled-slave: AUX dozes between cap-read and these link-config
+	 * writes, so the first write attempt would fail with -5 before the
+	 * re-wake-on-failure retry below recovered it. Pre-wake the panel via
+	 * the root panel-latch and settle BEFORE the first attempt so it lands
+	 * cleanly. The retry loop below stays as the safety net.
 	 */
 	if (imac5k_sec) {
-		DC_LOG_WARNING("IMAC5K: secondary 0x3113 pre-waking panel via primary 0x4F1 before first link-config write\n");
 		imac5k_lt_rewake_primary(link);
 		msleep(IMAC5K_LT_REWAKE_SETTLE_MS);
 	}
@@ -1261,31 +1205,17 @@ enum dc_status dpcd_set_link_settings(
 				DC_LOG_ERROR("%s:%d: core_link_write_dpcd (DP_LINK_BW_SET) failed\n", __func__, __LINE__);
 		}
 
-		/*
-		 * IMAC5K: only the exact secondary route retries. On the common
-		 * (success) path there is no extra wake or delay.
-		 */
+		/* Only the Apple 5K slave retries; common path falls through. */
 		if (!imac5k_sec)
 			break;
 
 		if (ds_status == DC_OK && lc_status == DC_OK &&
-		    bw_status == DC_OK) {
-			DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-config writes OK rate=0x%x lanes=%u (pre-wake done; re-wake retries=%u)\n",
-				       rate,
-				       lt_settings->link_settings.lane_count,
-				       imac5k_try);
+		    bw_status == DC_OK)
 			break;
-		}
 
-		if (imac5k_try >= IMAC5K_LT_MAX_REWAKE_RETRY) {
-			DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-config writes STILL failing after %u re-wake retries ds=%d lc=%d bw=%d (link will be pruned for bandwidth)\n",
-				       imac5k_try + 1, ds_status, lc_status,
-				       bw_status);
+		if (imac5k_try >= IMAC5K_LT_MAX_REWAKE_RETRY)
 			break;
-		}
 
-		DC_LOG_WARNING("IMAC5K: secondary 0x3113 link-config write failed (ds=%d lc=%d bw=%d); re-waking primary 0x4F1 and retrying attempt=%u\n",
-			       ds_status, lc_status, bw_status, imac5k_try);
 		imac5k_lt_rewake_primary(link);
 		msleep(IMAC5K_LT_REWAKE_SETTLE_MS);
 		imac5k_try++;
