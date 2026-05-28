@@ -53,7 +53,6 @@
 
  // Offset DPCD 050Eh == 0x5A
 #define MST_HUB_ID_0x5A  0x5A
-#define IMAC5K_DPCD_PANEL_LATCH 0x4F1
 #define IMAC5K_SECONDARY_AUX_WAKE_TIMEOUT_MS 300
 #define IMAC5K_SECONDARY_AUX_WAKE_POLL_MS 30
 
@@ -111,22 +110,17 @@ static enum ddc_transaction_type get_ddc_transaction_type(enum signal_type sink_
 
 static void imac5k_primary_write_panel_wake(struct dc_link *link)
 {
-	enum dc_status status;
-	uint8_t payload = 1;
-
 	if (!dc_link_is_apple_5k_root(link) || !link->ddc || !link->local_sink)
 		return;
 
+	/* Detection-time only: force the DDC into AUX mode before the latch
+	 * pulse. Unlike the secondary's pre-detect AUX poll, we don't restore
+	 * the prior transaction type here -- DC expects the root to stay in
+	 * AUX mode for subsequent reads. */
 	set_ddc_transaction_type(link->ddc, DDC_TRANSACTION_TYPE_I2C_OVER_AUX);
 	link->aux_mode = link_is_in_aux_transaction_mode(link->ddc);
 
-	status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
-				      &payload, sizeof(payload));
-	if (status != DC_OK) {
-		msleep(10);
-		core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
-				     &payload, sizeof(payload));
-	}
+	link_apple_5k_root_panel_latch_pulse(link);
 }
 
 static bool imac5k_secondary_try_pre_detect_aux(struct dc_link *link)

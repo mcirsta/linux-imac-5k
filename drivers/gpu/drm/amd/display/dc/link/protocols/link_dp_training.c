@@ -1099,24 +1099,12 @@ enum dc_status dpcd_set_training_pattern(
  * after a root panel-latch wake, and link training lands outside that window.
  * When these writes fail DC cannot program the slave link, the verified cap
  * stays minimal, and create_validate_stream prunes the real tile mode for
- * "No DP link bandwidth". Pre-wake the panel via the root panel-latch before
- * the first write, and re-assert the wake + retry on write failure.
+ * "No DP link bandwidth". Pre-wake the panel via the root panel-latch
+ * (link_apple_5k_root_panel_latch_pulse) before the first write, and re-assert
+ * the wake + retry on write failure.
  */
-#define IMAC5K_DPCD_PANEL_LATCH          0x4F1
 #define IMAC5K_LT_REWAKE_SETTLE_MS       60
 #define IMAC5K_LT_MAX_REWAKE_RETRY       4
-
-static void imac5k_lt_rewake_primary(const struct dc_link *sec_link)
-{
-	struct dc_link *root = sec_link ? sec_link->tiled_peer : NULL;
-	uint8_t payload = 1;
-
-	if (!root || !dc_link_is_apple_5k_root(root))
-		return;
-
-	core_link_write_dpcd(root, IMAC5K_DPCD_PANEL_LATCH,
-			     &payload, sizeof(payload));
-}
 
 enum dc_status dpcd_set_link_settings(
 	struct dc_link *link,
@@ -1157,7 +1145,7 @@ enum dc_status dpcd_set_link_settings(
 	 * cleanly. The retry loop below stays as the safety net.
 	 */
 	if (imac5k_sec) {
-		imac5k_lt_rewake_primary(link);
+		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
 		msleep(IMAC5K_LT_REWAKE_SETTLE_MS);
 	}
 
@@ -1216,7 +1204,7 @@ enum dc_status dpcd_set_link_settings(
 		if (imac5k_try >= IMAC5K_LT_MAX_REWAKE_RETRY)
 			break;
 
-		imac5k_lt_rewake_primary(link);
+		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
 		msleep(IMAC5K_LT_REWAKE_SETTLE_MS);
 		imac5k_try++;
 	}

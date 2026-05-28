@@ -8116,9 +8116,6 @@ cleanup:
 	return dc_result;
 }
 
-#define IMAC5K_TILE_H_ACTIVE 2560
-#define IMAC5K_TILE_V_ACTIVE 2880
-
 static bool
 amdgpu_dm_connector_is_imac5k_secondary_route(
 		const struct amdgpu_dm_connector *aconnector)

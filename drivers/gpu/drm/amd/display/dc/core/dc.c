@@ -1625,9 +1625,6 @@ static void enable_timing_multisync(
 	}
 }
 
-#define IMAC5K_TILE_H_ACTIVE 2560
-#define IMAC5K_TILE_V_ACTIVE 2880
-
 /*
  * Apple 5K tile-pair stream helpers. Replace the previous DMI + object-id
  * checks with the panel-patch flag set by apply_edid_quirks() on both halves
@@ -1636,7 +1633,7 @@ static void enable_timing_multisync(
 static bool imac5k_stream_is_apple_5k(const struct dc_stream_state *stream)
 {
 	return stream && stream->sink &&
-	       stream->sink->edid_caps.panel_patch.tiled_pair_genlock_ignore_msa;
+	       stream->sink->edid_caps.panel_patch.tiled_pair_force_sync_group;
 }
 
 static bool imac5k_stream_is_tile_half(const struct dc_stream_state *stream)

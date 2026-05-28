@@ -172,12 +172,11 @@ static void apply_edid_quirks(struct drm_device *dev,
 			edid_caps->panel_patch.tiled_slave_root_wake = 1;
 			edid_caps->panel_patch.tiled_slave_keep_connected = 1;
 			edid_caps->panel_patch.tiled_slave_source_table_rev = 1;
-			edid_caps->panel_patch.tiled_use_reported_link_cap = 1;
 			edid_caps->panel_patch.tiled_stream_enable_latch = 1;
 		}
 		/* Pair-level flag: set on either side; consumer (dc.c) also checks
 		 * drm_connector->tile_group->id for actual pairing. */
-		edid_caps->panel_patch.tiled_pair_genlock_ignore_msa = 1;
+		edid_caps->panel_patch.tiled_pair_force_sync_group = 1;
 		break;
 	default:
 		return;

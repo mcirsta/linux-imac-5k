@@ -59,7 +59,6 @@
 #define DC_LOGGER \
 	link->ctx->logger
 
-#define IMAC5K_DPCD_PANEL_LATCH 0x4F1
 #define IMAC5K_AUX_WAKE_SETTLE_MS 60
 
 #ifndef MAX
@@ -68,24 +67,6 @@
 #ifndef MIN
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
 #endif
-
-/*
- * Wake the Apple 5K panel by pulsing the root (eDP) panel latch (DPCD 0x4F1=1).
- * The slave (DP) AUX dozes a few hundred ms after the panel was last touched;
- * pulsing the root brings the whole panel (and the slave's AUX) back up.
- * Mirrors imac5k_lt_rewake_primary() in link_dp_training.c.
- */
-static void imac5k_cap_rewake_primary(const struct dc_link *sec_link)
-{
-	struct dc_link *root = sec_link ? sec_link->tiled_peer : NULL;
-	uint8_t payload = 1;
-
-	if (!root || !dc_link_is_apple_5k_root(root))
-		return;
-
-	core_link_write_dpcd(root, IMAC5K_DPCD_PANEL_LATCH,
-			     &payload, sizeof(payload));
-}
 
 static void dpcd_set_imac5k_secondary_source_table_revision(
 	struct dc_link *link)
@@ -1456,7 +1437,7 @@ void dpcd_set_source_specific_data(struct dc_link *link)
 	 * dpcd_set_link_settings() stays as a re-assert.
 	 */
 	if (dc_link_is_apple_5k_slave(link)) {
-		imac5k_cap_rewake_primary(link);
+		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
 		msleep(IMAC5K_AUX_WAKE_SETTLE_MS);
 	}
 
@@ -2602,29 +2583,6 @@ bool dp_verify_link_cap_with_retries(
 		__func__, link->link_index,
 		success,
 		fail_count);
-
-	/*
-	 * Apple 5K tiled-slave: bridge the slave's verified cap from its
-	 * reported (DPCD-read) cap when verification bailed at the HPD-low
-	 * connection check before training. Boot 1 evidence shows the
-	 * cold-boot path no longer hits the bridge (the wake+retry produces
-	 * the right verified cap directly); the code is kept as a defensive
-	 * remnant for warm-path / HPDRX scenarios. Phase 1.5 may delete this
-	 * if those scenarios also turn out clean.
-	 */
-	if (dc_link_is_apple_5k_slave(link)) {
-		uint32_t verified_bw =
-			dp_link_bandwidth_kbps(link, &link->verified_link_cap);
-		uint32_t reported_bw =
-			dp_link_bandwidth_kbps(link, &link->reported_link_cap);
-
-		if (reported_bw > verified_bw &&
-		    link->reported_link_cap.link_rate != LINK_RATE_UNKNOWN &&
-		    link->reported_link_cap.lane_count != LANE_COUNT_UNKNOWN) {
-			link->verified_link_cap = link->reported_link_cap;
-			success = true;
-		}
-	}
 
 	return success;
 }
