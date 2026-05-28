@@ -183,6 +183,23 @@ struct dc_panel_patch {
 	bool oled_optimize_display_on;
 	unsigned int force_mst_blocked_discovery;
 	unsigned int wait_after_dpcd_poweroff_ms;
+
+	/*
+	 * Apple 27" 5K dual-tile internal panel (iMac15,1 / 17,1 / 18,3 / 19,1).
+	 * Set in apply_edid_quirks() on the APP/AE25 + APP/AE26 panel-family,
+	 * branching on connector_signal so root- and slave-side flags land on
+	 * the right link's panel-patch. Consumers compose:
+	 *     link->local_sink->edid_caps.panel_patch.tiled_X
+	 * with link->connector_signal (and link->tiled_peer for cross-link work).
+	 * See iMac_5K_Docs/Mainline_Plan_iMac5K.md §4.2.
+	 */
+	unsigned int tiled_slave_root_wake;          /* DP slave: pulse root 0x4F1 before AUX */
+	unsigned int tiled_slave_keep_connected;     /* DP slave: HPD-low -> still single */
+	unsigned int tiled_slave_source_table_rev;   /* DP slave: publish source-DPCD 0x310 = 04 1d 03 */
+	unsigned int tiled_use_reported_link_cap;    /* DP slave: bridge reported->verified cap */
+	unsigned int tiled_root_force_edid_reread;   /* eDP root: re-read EDID after slave up (Change A) */
+	unsigned int tiled_pair_genlock_ignore_msa;  /* pair-level: MSA-ignore override for sync */
+	unsigned int tiled_stream_enable_latch;      /* DP slave: 0x4F1=1 at stream-enable */
 };
 
 /**

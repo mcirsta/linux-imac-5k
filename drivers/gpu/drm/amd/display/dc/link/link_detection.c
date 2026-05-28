@@ -121,46 +121,58 @@ static bool link_is_imac5k_machine(void)
 
 static bool link_is_imac5k_primary_route(const struct dc_link *link)
 {
+	bool old, new_gate;
+
 	if (!link_is_imac5k_machine())
-		return false;
+		old = false;
+	else if (!link || link->connector_signal != SIGNAL_TYPE_EDP)
+		old = false;
+	else if (dal_graphics_object_id_to_uint(link->link_id) !=
+		 IMAC5K_WIN_PRIMARY_OBJECT_ID)
+		old = false;
+	else if (link->ddc_hw_inst != IMAC5K_WIN_PRIMARY_DDC_HW_INST)
+		old = false;
+	else if (!link->link_enc ||
+		 link->link_enc->transmitter != TRANSMITTER_UNIPHY_C)
+		old = false;
+	else
+		old = true;
 
-	if (!link || link->connector_signal != SIGNAL_TYPE_EDP)
-		return false;
+	/* Phase 0 WARN bridge: new gate is the panel-patch + signal helper
+	 * (defined in dc.h). Mismatch tells us where the EDID-derived gate
+	 * disagrees with the DMI/object-id gate on iMac19,1. */
+	new_gate = dc_link_is_apple_5k_root(link);
+	WARN_ON_ONCE(old != new_gate);
 
-	if (dal_graphics_object_id_to_uint(link->link_id) !=
-	    IMAC5K_WIN_PRIMARY_OBJECT_ID)
-		return false;
-
-	if (link->ddc_hw_inst != IMAC5K_WIN_PRIMARY_DDC_HW_INST)
-		return false;
-
-	if (!link->link_enc ||
-	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_C)
-		return false;
-
-	return true;
+	return old;
 }
 
 static bool link_is_imac5k_secondary_route(const struct dc_link *link)
 {
+	bool old, new_gate;
+
 	if (!link_is_imac5k_machine())
-		return false;
+		old = false;
+	else if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
+		old = false;
+	else if (dal_graphics_object_id_to_uint(link->link_id) !=
+		 IMAC5K_WIN_SECONDARY_OBJECT_ID)
+		old = false;
+	else if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
+		old = false;
+	else if (!link->link_enc ||
+		 link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
+		old = false;
+	else
+		old = true;
 
-	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
-		return false;
+	/* Phase 0 WARN bridge: new gate is the panel-patch + signal + peer
+	 * helper (defined in dc.h). For pre-detect calls (local_sink NULL on
+	 * the slave) the new gate falls through to peer->panel_patch. */
+	new_gate = dc_link_is_apple_5k_slave(link);
+	WARN_ON_ONCE(old != new_gate);
 
-	if (dal_graphics_object_id_to_uint(link->link_id) !=
-	    IMAC5K_WIN_SECONDARY_OBJECT_ID)
-		return false;
-
-	if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
-		return false;
-
-	if (!link->link_enc ||
-	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
-		return false;
-
-	return true;
+	return old;
 }
 
 static void imac5k_primary_write_panel_wake(struct dc_link *link,

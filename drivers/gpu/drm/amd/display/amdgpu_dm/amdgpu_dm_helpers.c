@@ -56,25 +56,29 @@
 
 static bool dm_link_is_imac5k_secondary_route(const struct dc_link *link)
 {
+	bool old, new_gate;
+
 	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
 	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1"))
-		return false;
+		old = false;
+	else if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
+		old = false;
+	else if (dal_graphics_object_id_to_uint(link->link_id) !=
+		 IMAC5K_WIN_SECONDARY_OBJECT_ID)
+		old = false;
+	else if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
+		old = false;
+	else if (!link->link_enc ||
+		 link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
+		old = false;
+	else
+		old = true;
 
-	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
-		return false;
+	/* Phase 0 WARN bridge — see dc_link_is_apple_5k_slave() in dc.h. */
+	new_gate = dc_link_is_apple_5k_slave(link);
+	WARN_ON_ONCE(old != new_gate);
 
-	if (dal_graphics_object_id_to_uint(link->link_id) !=
-	    IMAC5K_WIN_SECONDARY_OBJECT_ID)
-		return false;
-
-	if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
-		return false;
-
-	if (!link->link_enc ||
-	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
-		return false;
-
-	return true;
+	return old;
 }
 
 static u32 edid_extract_panel_id(struct edid *edid)
@@ -84,7 +88,73 @@ static u32 edid_extract_panel_id(struct edid *edid)
 	       (u32)EDID_PRODUCT_ID(edid);
 }
 
-static void apply_edid_quirks(struct drm_device *dev, struct edid *edid, struct dc_edid_caps *edid_caps)
+/*
+ * Phase 0 peer-wiring for the Apple 5K dual-tile panel.
+ *
+ * Called from dm_helpers_parse_edid_caps() after apply_edid_quirks() has
+ * (possibly) set the tiled_root_* / tiled_slave_* flags on this link's
+ * edid_caps. If so, walk the dc's links and cross-wire tiled_peer between
+ * this link and its tile-pair peer so DC-core consumers on the slave's
+ * pre-detect path (where slave's local_sink is NULL) can still reach the
+ * root's panel-patch.
+ *
+ * Phase 0 heuristic: for iMac19,1 (and probably 15,1/17,1/18,3) there is
+ * one eDP link (root) and one internal DP link (slave) on the dc. From the
+ * root side, pick the first DP sibling. From the slave side, pick the
+ * first eDP sibling already carrying the root flag.
+ *
+ * On boards with multiple DP outputs this may guess wrong — the
+ * WARN_ON_ONCE bridges at the existing iMac5K predicate sites will
+ * surface that. Phase 1.5 refines (e.g. require has_tile + same DRM
+ * tile_group->id) once parse/detect ordering is observed.
+ *
+ * See iMac_5K_Docs/Mainline_Plan_iMac5K.md §4.2.
+ */
+static void dm_helpers_wire_tiled_peer(struct drm_device *dev,
+				       struct dc_link *link,
+				       const struct dc_edid_caps *edid_caps)
+{
+	const struct dc_panel_patch *pp = &edid_caps->panel_patch;
+	bool is_root = pp->tiled_root_force_edid_reread &&
+		       link->connector_signal == SIGNAL_TYPE_EDP;
+	bool is_slave = pp->tiled_slave_root_wake &&
+			link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT;
+	uint32_t i;
+
+	if (!link->dc || (!is_root && !is_slave))
+		return;
+	if (link->tiled_peer)
+		return; /* already wired */
+
+	for (i = 0; i < link->dc->link_count; i++) {
+		struct dc_link *other = link->dc->links[i];
+
+		if (!other || other == link || other->tiled_peer)
+			continue;
+
+		if (is_root && other->connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
+			link->tiled_peer = other;
+			other->tiled_peer = link;
+			drm_dbg_driver(dev, "Apple 5K tiled_peer wired: root link[%u] <-> dp link[%u]\n",
+				       link->link_index, other->link_index);
+			return;
+		}
+		if (is_slave && other->connector_signal == SIGNAL_TYPE_EDP &&
+		    other->local_sink &&
+		    other->local_sink->edid_caps.panel_patch.tiled_root_force_edid_reread) {
+			link->tiled_peer = other;
+			other->tiled_peer = link;
+			drm_dbg_driver(dev, "Apple 5K tiled_peer wired: slave link[%u] <-> edp link[%u]\n",
+				       link->link_index, other->link_index);
+			return;
+		}
+	}
+}
+
+static void apply_edid_quirks(struct drm_device *dev,
+			      enum signal_type connector_signal,
+			      struct edid *edid,
+			      struct dc_edid_caps *edid_caps)
 {
 	uint32_t panel_id = edid_extract_panel_id(edid);
 
@@ -114,6 +184,32 @@ static void apply_edid_quirks(struct drm_device *dev, struct edid *edid, struct 
 	case drm_edid_encode_panel_id('S', 'D', 'C', 0x4171):
 		drm_dbg_driver(dev, "Disabling VSC on monitor with panel id %X\n", panel_id);
 		edid_caps->panel_patch.disable_colorimetry = true;
+		break;
+	/*
+	 * Apple 27" 5K dual-tile internal panel (iMac15,1 / 17,1 / 18,3 / 19,1).
+	 * Both endpoints can present either identity:
+	 *   - AE25 = 4K-compat identity (primary, pre-wake);
+	 *   - AE26 = tile identity (secondary always, primary after root-wake re-read).
+	 * Role discrimination is by connector_signal (eDP=root, DP=slave) — not by
+	 * panel-id alone, since the primary flips AE25->AE26 after the wake.
+	 * See iMac_5K_Docs/Mainline_Plan_iMac5K.md §4.1.
+	 */
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE25):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE26):
+		drm_dbg_driver(dev, "Apple 5K tiled panel: panel_id=%X signal=%d\n",
+			       panel_id, connector_signal);
+		if (connector_signal == SIGNAL_TYPE_EDP) {
+			edid_caps->panel_patch.tiled_root_force_edid_reread = 1;
+		} else if (connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
+			edid_caps->panel_patch.tiled_slave_root_wake = 1;
+			edid_caps->panel_patch.tiled_slave_keep_connected = 1;
+			edid_caps->panel_patch.tiled_slave_source_table_rev = 1;
+			edid_caps->panel_patch.tiled_use_reported_link_cap = 1;
+			edid_caps->panel_patch.tiled_stream_enable_latch = 1;
+		}
+		/* Pair-level flag: set on either side; consumer (dc.c) also checks
+		 * drm_connector->tile_group->id for actual pairing. */
+		edid_caps->panel_patch.tiled_pair_genlock_ignore_msa = 1;
 		break;
 	default:
 		return;
@@ -175,7 +271,8 @@ enum dc_edid_status dm_helpers_parse_edid_caps(
 	if (edid_caps->edid_hdmi)
 		populate_hdmi_info_from_connector(&connector->display_info.hdmi, edid_caps);
 
-	apply_edid_quirks(dev, edid_buf, edid_caps);
+	apply_edid_quirks(dev, link->connector_signal, edid_buf, edid_caps);
+	dm_helpers_wire_tiled_peer(dev, link, edid_caps);
 
 	sad_count = drm_edid_to_sad((struct edid *) edid->raw_edid, &sads);
 	if (sad_count <= 0)

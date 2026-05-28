@@ -8133,27 +8133,24 @@ static bool
 amdgpu_dm_connector_is_imac5k_secondary_route(
 		const struct amdgpu_dm_connector *aconnector)
 {
-	const struct dc_link *link;
+	const struct dc_link *link = aconnector ? aconnector->dc_link : NULL;
+	bool old = false;
+	bool new_gate;
 
-	if (!amdgpu_dm_imac5k_dmi_match() || !aconnector)
-		return false;
+	if (amdgpu_dm_imac5k_dmi_match() && link &&
+	    link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT &&
+	    dal_graphics_object_id_to_uint(link->link_id) ==
+		IMAC5K_WIN_SECONDARY_OBJECT_ID &&
+	    link->ddc_hw_inst == IMAC5K_WIN_SECONDARY_DDC_HW_INST &&
+	    link->link_enc &&
+	    link->link_enc->transmitter == TRANSMITTER_UNIPHY_D)
+		old = true;
 
-	link = aconnector->dc_link;
-	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
-		return false;
+	/* Phase 0 WARN bridge — see dc_link_is_apple_5k_slave() in dc.h. */
+	new_gate = dc_link_is_apple_5k_slave(link);
+	WARN_ON_ONCE(old != new_gate);
 
-	if (dal_graphics_object_id_to_uint(link->link_id) !=
-	    IMAC5K_WIN_SECONDARY_OBJECT_ID)
-		return false;
-
-	if (link->ddc_hw_inst != IMAC5K_WIN_SECONDARY_DDC_HW_INST)
-		return false;
-
-	if (!link->link_enc ||
-	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_D)
-		return false;
-
-	return true;
+	return old;
 }
 
 static bool
@@ -8189,27 +8186,24 @@ static bool
 amdgpu_dm_connector_is_imac5k_primary_route(
 		const struct amdgpu_dm_connector *aconnector)
 {
-	const struct dc_link *link;
+	const struct dc_link *link = aconnector ? aconnector->dc_link : NULL;
+	bool old = false;
+	bool new_gate;
 
-	if (!amdgpu_dm_imac5k_dmi_match() || !aconnector)
-		return false;
+	if (amdgpu_dm_imac5k_dmi_match() && link &&
+	    link->connector_signal == SIGNAL_TYPE_EDP &&
+	    dal_graphics_object_id_to_uint(link->link_id) ==
+		IMAC5K_WIN_PRIMARY_OBJECT_ID &&
+	    link->ddc_hw_inst == IMAC5K_WIN_PRIMARY_DDC_HW_INST &&
+	    link->link_enc &&
+	    link->link_enc->transmitter == TRANSMITTER_UNIPHY_C)
+		old = true;
 
-	link = aconnector->dc_link;
-	if (!link || link->connector_signal != SIGNAL_TYPE_EDP)
-		return false;
+	/* Phase 0 WARN bridge — see dc_link_is_apple_5k_root() in dc.h. */
+	new_gate = dc_link_is_apple_5k_root(link);
+	WARN_ON_ONCE(old != new_gate);
 
-	if (dal_graphics_object_id_to_uint(link->link_id) !=
-	    IMAC5K_WIN_PRIMARY_OBJECT_ID)
-		return false;
-
-	if (link->ddc_hw_inst != IMAC5K_WIN_PRIMARY_DDC_HW_INST)
-		return false;
-
-	if (!link->link_enc ||
-	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_C)
-		return false;
-
-	return true;
+	return old;
 }
 
 static bool
