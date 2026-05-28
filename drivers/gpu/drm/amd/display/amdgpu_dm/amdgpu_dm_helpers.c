@@ -135,8 +135,8 @@ static void dm_helpers_wire_tiled_peer(struct drm_device *dev,
 		if (is_root && other->connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
 			link->tiled_peer = other;
 			other->tiled_peer = link;
-			drm_dbg_driver(dev, "Apple 5K tiled_peer wired: root link[%u] <-> dp link[%u]\n",
-				       link->link_index, other->link_index);
+			pr_info("APPLE5K: tiled_peer wired: root link[%u] <-> dp link[%u]\n",
+				link->link_index, other->link_index);
 			return;
 		}
 		if (is_slave && other->connector_signal == SIGNAL_TYPE_EDP &&
@@ -144,8 +144,8 @@ static void dm_helpers_wire_tiled_peer(struct drm_device *dev,
 		    other->local_sink->edid_caps.panel_patch.tiled_root_force_edid_reread) {
 			link->tiled_peer = other;
 			other->tiled_peer = link;
-			drm_dbg_driver(dev, "Apple 5K tiled_peer wired: slave link[%u] <-> edp link[%u]\n",
-				       link->link_index, other->link_index);
+			pr_info("APPLE5K: tiled_peer wired: slave link[%u] <-> edp link[%u]\n",
+				link->link_index, other->link_index);
 			return;
 		}
 	}
@@ -196,8 +196,8 @@ static void apply_edid_quirks(struct drm_device *dev,
 	 */
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE25):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE26):
-		drm_dbg_driver(dev, "Apple 5K tiled panel: panel_id=%X signal=%d\n",
-			       panel_id, connector_signal);
+		pr_info("APPLE5K: tiled panel match: panel_id=0x%X signal=%d (EDP=128, DP=32)\n",
+			panel_id, connector_signal);
 		if (connector_signal == SIGNAL_TYPE_EDP) {
 			edid_caps->panel_patch.tiled_root_force_edid_reread = 1;
 		} else if (connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
