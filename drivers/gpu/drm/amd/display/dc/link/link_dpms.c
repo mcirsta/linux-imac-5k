@@ -85,6 +85,8 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 	if (!dc_link_needs_tiled_stream_enable_latch(link) || !link->local_sink)
 		return;
 
+	DC_LOGGER_INIT(link->ctx->logger);
+
 	status = core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
 				      &payload, sizeof(payload));
 	DC_LOG_INFO("APPLE5K: stream-enable latch 0x4F1 link[%u] status=%d value=0x%02x sink=%p\n",
