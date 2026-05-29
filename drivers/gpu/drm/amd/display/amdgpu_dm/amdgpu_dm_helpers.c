@@ -171,6 +171,7 @@ static void apply_edid_quirks(struct drm_device *dev,
 			edid_caps->panel_patch.tiled_slave_root_wake = 1;
 			edid_caps->panel_patch.tiled_slave_source_table_rev = 1;
 			edid_caps->panel_patch.tiled_stream_enable_latch = 1;
+			edid_caps->panel_patch.aux_ready_before_link_training = 1;
 		}
 		break;
 	default:

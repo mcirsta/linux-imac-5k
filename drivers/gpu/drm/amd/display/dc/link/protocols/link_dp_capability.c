@@ -59,7 +59,8 @@
 #define DC_LOGGER \
 	link->ctx->logger
 
-#define APPLE_5K_AUX_WAKE_SETTLE_MS 60
+#define APPLE_5K_AUX_READY_ATTEMPTS 3
+#define APPLE_5K_AUX_READY_COOLDOWN_US 1000
 
 #ifndef MAX
 #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
@@ -83,6 +84,36 @@ static void dpcd_set_apple_5k_slave_source_table_revision(
 
 	core_link_write_dpcd(link, DP_SOURCE_TABLE_REVISION,
 			     table_revision, sizeof(table_revision));
+}
+
+static bool apple_5k_slave_prepare_aux_write(struct dc_link *link)
+{
+	uint8_t dpcd_rev;
+	uint8_t power_state = DP_POWER_STATE_D0;
+	unsigned int try;
+
+	if (!dc_link_is_apple_5k_slave(link))
+		return true;
+
+	for (try = 0; try < APPLE_5K_AUX_READY_ATTEMPTS; try++) {
+		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
+
+		if (core_link_write_dpcd(link, DP_SET_POWER,
+					 &power_state, sizeof(power_state)) != DC_OK)
+			goto retry;
+
+		dpcd_rev = 0;
+		if (core_link_read_dpcd(link, DP_DPCD_REV,
+					&dpcd_rev, sizeof(dpcd_rev)) == DC_OK &&
+		    dpcd_rev != 0)
+			return true;
+
+retry:
+		if (try + 1 < APPLE_5K_AUX_READY_ATTEMPTS)
+			fsleep(APPLE_5K_AUX_READY_COOLDOWN_US);
+	}
+
+	return false;
 }
 
 struct dp_lt_fallback_entry {
@@ -1431,15 +1462,11 @@ void dpcd_set_source_specific_data(struct dc_link *link)
 	 * Apple 5K tiled-slave: AUX dozes between detect and this stream-enable
 	 * step, so the source-specific DPCD writes below (DP_SOURCE_OUI, then the
 	 * 0x310 source-table-revision) would fail with -5 and spam "Too many
-	 * retries" before the link even trained. Pre-wake the panel via the root
-	 * (eDP) panel latch + settle here so these writes (and everything
-	 * downstream) land on an awake panel. The link-training pre-wake in
-	 * dpcd_set_link_settings() stays as a re-assert.
+	 * retries" before the link even trained. Make the writes conditional on
+	 * an observed slave AUX response after pulsing the root (eDP) panel latch.
 	 */
-	if (dc_link_is_apple_5k_slave(link)) {
-		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
-		msleep(APPLE_5K_AUX_WAKE_SETTLE_MS);
-	}
+	if (!apple_5k_slave_prepare_aux_write(link))
+		return;
 
 	if (!link->dc->vendor_signature.is_valid) {
 		enum dc_status __maybe_unused result_write_min_hblank = DC_NOT_SUPPORTED;

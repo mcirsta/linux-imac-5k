@@ -189,6 +189,7 @@ struct dc_panel_patch {
 	bool oled_optimize_display_on;
 	unsigned int force_mst_blocked_discovery;
 	unsigned int wait_after_dpcd_poweroff_ms;
+	unsigned int aux_ready_before_link_training; /* require observed AUX response before LT */
 
 	/*
 	 * Apple 27" 5K dual-tile internal panel (iMac15,1 / 17,1 / 18,3 / 19,1).
