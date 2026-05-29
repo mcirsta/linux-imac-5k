@@ -230,6 +230,9 @@ static int amdgpu_dm_encoder_init(struct drm_device *dev,
 				  uint32_t link_index);
 
 static int amdgpu_dm_connector_get_modes(struct drm_connector *connector);
+static bool amdgpu_dm_mode_matches_tile_size(
+		const struct drm_connector *connector,
+		const struct drm_display_mode *mode);
 static void amdgpu_dm_log_apple5k_probe_identity(struct amdgpu_device *adev);
 static void amdgpu_dm_log_apple5k_connector_tile(
 		struct amdgpu_dm_connector *aconnector,
