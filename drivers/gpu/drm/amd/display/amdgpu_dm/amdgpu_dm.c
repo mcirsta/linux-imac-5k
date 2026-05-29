@@ -80,9 +80,8 @@
 #include <linux/firmware.h>
 #include <linux/component.h>
 #include <linux/dmi.h>
-#include <linux/init.h>
 #include <linux/sort.h>
-#include <linux/utsname.h>
+#include <generated/utsrelease.h>
 
 #include <drm/drm_privacy_screen_consumer.h>
 #include <drm/display/drm_dp_mst_helper.h>
@@ -8161,16 +8160,14 @@ static void amdgpu_dm_log_apple5k_probe_identity(struct amdgpu_device *adev)
 	const char *board = dmi_get_system_info(DMI_BOARD_NAME);
 	const char *bios = dmi_get_system_info(DMI_BIOS_VERSION);
 	const char *vendor = dmi_get_system_info(DMI_SYS_VENDOR);
-	const char *cmdline = saved_command_line ? saved_command_line : "";
 
 	drm_info(dev,
-		 "APPLE5K: probe identity vendor=\"%s\" product=\"%s\" board=\"%s\" bios=\"%s\" kernel=\"%s\" cmdline=\"%s\" gpu=%04x:%04x subsystem=%04x:%04x rev=%02x family=%d asic=%d dc=%s dce=%s links=%u vbios_pn=\"%s\" vbios_ver=\"%s\" vbios_date=\"%s\"\n",
+		 "APPLE5K: probe identity vendor=\"%s\" product=\"%s\" board=\"%s\" bios=\"%s\" kernel=\"%s\" gpu=%04x:%04x subsystem=%04x:%04x rev=%02x family=%d asic=%d dc=%s dce=%s links=%u vbios_pn=\"%s\" vbios_ver=\"%s\" vbios_date=\"%s\"\n",
 		 vendor ? vendor : "unknown",
 		 product ? product : "unknown",
 		 board ? board : "unknown",
 		 bios ? bios : "unknown",
-		 init_utsname()->release,
-		 cmdline,
+		 UTS_RELEASE,
 		 adev->pdev->vendor, adev->pdev->device,
 		 adev->pdev->subsystem_vendor, adev->pdev->subsystem_device,
 		 adev->pdev->revision, adev->family, adev->asic_type, DC_VER,
