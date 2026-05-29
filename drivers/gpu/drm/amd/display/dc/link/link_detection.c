@@ -30,8 +30,6 @@
  * directly from connected receivers.
  */
 
-#include <linux/dmi.h>
-
 #include "link_dpms.h"
 #include "link_detection.h"
 #include "link_hwss.h"
@@ -914,6 +912,14 @@ static bool should_verify_link_capability_destructively(struct dc_link *link,
 				dc_is_embedded_signal(link->local_sink->sink_signal) ||
 				(link->ep_type == DISPLAY_ENDPOINT_USB4_DPIA &&
 				!link->dc->config.enable_dpia_pre_training)) {
+			destrictive = false;
+		} else if (dc_link_has_tiled_slave_panel_patch(link)) {
+			/*
+			 * Some internal tiled DP slaves report HPD low during
+			 * detection, but are already proven present by bounded AUX
+			 * probing. Use the non-destructive capability path for
+			 * validation, as with other internal panel paths.
+			 */
 			destrictive = false;
 		} else if (link_dp_get_encoding_format(&max_link_cap) ==
 				DP_8b_10b_ENCODING) {

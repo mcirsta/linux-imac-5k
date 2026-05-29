@@ -35,8 +35,6 @@
  * boundary between link and stream is not clearly defined.
  */
 
-#include <linux/dmi.h>
-
 #include "link_dpms.h"
 #include "link_hwss.h"
 #include "link_validation.h"
@@ -82,18 +80,12 @@
 static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 {
 	uint8_t payload = 1;
-	enum dc_status status;
 
 	if (!dc_link_needs_tiled_stream_enable_latch(link) || !link->local_sink)
 		return;
 
-	status = core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
-				      &payload, sizeof(payload));
-	if (status != DC_OK) {
-		msleep(10);
-		core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
-				     &payload, sizeof(payload));
-	}
+	core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
+			     &payload, sizeof(payload));
 }
 
 void link_blank_all_dp_displays(struct dc *dc)

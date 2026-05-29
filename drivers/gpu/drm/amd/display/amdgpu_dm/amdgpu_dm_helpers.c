@@ -26,7 +26,6 @@
 
 #include <acpi/video.h>
 
-#include <linux/dmi.h>
 #include <linux/string.h>
 #include <linux/acpi.h>
 #include <linux/i2c.h>

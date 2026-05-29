@@ -34,8 +34,6 @@
  * structure used to represent link capability instead of function interfaces.
  */
 
-#include <linux/dmi.h>
-
 #include "link_dp_capability.h"
 #include "link_ddc.h"
 #include "link_dpcd.h"

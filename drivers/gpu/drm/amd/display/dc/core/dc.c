@@ -22,8 +22,6 @@
  * Authors: AMD
  */
 
-#include <linux/dmi.h>
-
 #include "dm_services.h"
 
 #include "amdgpu.h"
@@ -7568,4 +7566,3 @@ bool dc_update_planes_and_stream_cleanup(
 			? update_planes_and_stream_cleanup_v3(scratch)
 			: update_planes_and_stream_cleanup_v2(scratch);
 }
-
