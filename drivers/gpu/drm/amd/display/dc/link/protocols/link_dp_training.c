@@ -47,8 +47,6 @@
 #include "link_enc_cfg.h"
 #include "resource.h"
 #include "dm_helpers.h"
-#include <linux/dmi.h>
-#include "grph_object_id.h"
 
 #define DC_LOGGER \
 	link->ctx->logger
@@ -1101,30 +1099,28 @@ enum dc_status dpcd_set_training_pattern(
 #define DP_LT_AUX_READY_COOLDOWN_US        1000
 #define DP_LT_DPCD_WRITE_RETRIES           4
 
-static void dp_pre_link_training_wake(struct dc_link *link,
-				      const struct dc_panel_patch *sink_patches)
+static void dp_pre_link_training_wake(struct dc_link *link)
 {
-	if (!link || !sink_patches)
+	if (!link)
 		return;
 
-	if (sink_patches->tiled_slave_root_wake)
+	if (dc_link_needs_tiled_slave_root_wake(link))
 		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
 }
 
 static bool dp_prepare_sink_for_link_training(struct dc_link *link,
-					      const struct dc_panel_patch *sink_patches,
 					      unsigned int attempts)
 {
 	uint8_t dpcd_rev;
 	uint8_t power_state = DP_POWER_STATE_D0;
 	unsigned int try;
 
-	if (!link || link->aux_access_disabled || !sink_patches ||
-	    !sink_patches->aux_ready_before_link_training)
+	if (!link || link->aux_access_disabled ||
+	    !dc_link_needs_pre_training_aux_ready(link))
 		return true;
 
 	for (try = 0; try < attempts; try++) {
-		dp_pre_link_training_wake(link, sink_patches);
+		dp_pre_link_training_wake(link);
 
 		if (core_link_write_dpcd(link, DP_SET_POWER,
 					 &power_state, sizeof(power_state)) != DC_OK)
@@ -1144,23 +1140,13 @@ retry:
 	return false;
 }
 
-static const struct dc_panel_patch *dp_link_get_panel_patch(const struct dc_link *link)
-{
-	if (!link || !link->local_sink)
-		return NULL;
-
-	return &link->local_sink->edid_caps.panel_patch;
-}
-
 enum dc_status dpcd_set_link_settings(
 	struct dc_link *link,
 	const struct link_training_settings *lt_settings)
 {
 	uint8_t rate = 0;
 	enum dc_status status;
-	const struct dc_panel_patch *sink_patches = dp_link_get_panel_patch(link);
-	bool retry_dpcd_writes = sink_patches &&
-		sink_patches->aux_ready_before_link_training;
+	bool retry_dpcd_writes = dc_link_needs_pre_training_aux_ready(link);
 	unsigned int retry = 0;
 	enum dc_status ds_status = DC_OK;
 	enum dc_status lc_status = DC_OK;
@@ -1192,7 +1178,7 @@ enum dc_status dpcd_set_link_settings(
 	 */
 	while (true) {
 		if (retry_dpcd_writes &&
-		    !dp_prepare_sink_for_link_training(link, sink_patches, 1)) {
+		    !dp_prepare_sink_for_link_training(link, 1)) {
 			status = DC_ERROR_UNEXPECTED;
 			goto dpcd_write_retry;
 		}
@@ -1772,7 +1758,7 @@ bool perform_link_training_with_retries(
 			msleep(delay_dp_power_up_in_ms);
 		}
 
-		if (!dp_prepare_sink_for_link_training(link, &stream->sink_patches,
+		if (!dp_prepare_sink_for_link_training(link,
 						       DP_LT_AUX_READY_ATTEMPTS)) {
 			DC_LOG_WARNING("%s: DP link(%d) sink AUX not ready for training\n",
 				       __func__, link->link_index);

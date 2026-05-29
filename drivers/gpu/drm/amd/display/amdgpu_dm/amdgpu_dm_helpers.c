@@ -57,8 +57,6 @@ static u32 edid_extract_panel_id(struct edid *edid)
 }
 
 /*
- * Phase 0 peer-wiring for the Apple 5K dual-tile panel.
- *
  * Called from dm_helpers_parse_edid_caps() after apply_edid_quirks() has
  * (possibly) set the tiled_root_* / tiled_slave_* flags on this link's
  * edid_caps. If so, walk the dc's links and cross-wire tiled_peer between
@@ -66,16 +64,9 @@ static u32 edid_extract_panel_id(struct edid *edid)
  * pre-detect path (where slave's local_sink is NULL) can still reach the
  * root's panel-patch.
  *
- * Phase 0 heuristic: for iMac19,1 (and probably 15,1/17,1/18,3) there is
- * one eDP link (root) and one internal DP link (slave) on the dc. From the
- * root side, pick the first DP sibling. From the slave side, pick the
- * first eDP sibling already carrying the root flag.
- *
- * On boards with multiple DP outputs this may guess wrong. Phase 1.5
- * refines (e.g. require has_tile + same DRM tile_group->id) once
- * parse/detect ordering is observed on a second-model.
- *
- * See iMac_5K_Docs/Mainline_Plan_iMac5K.md §4.2.
+ * Current supported wiring has one eDP root and one internal DP slave.
+ * From the root side, pick the first DP sibling. From the slave side,
+ * pick the first eDP sibling already carrying the root flag.
  */
 static void dm_helpers_wire_tiled_peer(struct drm_device *dev,
 				       struct dc_link *link,
@@ -102,8 +93,8 @@ static void dm_helpers_wire_tiled_peer(struct drm_device *dev,
 		if (is_root && other->connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
 			link->tiled_peer = other;
 			other->tiled_peer = link;
-			pr_info("APPLE5K: tiled_peer wired: root link[%u] <-> dp link[%u]\n",
-				link->link_index, other->link_index);
+			drm_dbg_driver(dev, "tiled panel peer wired: root link[%u] <-> dp link[%u]\n",
+				       link->link_index, other->link_index);
 			return;
 		}
 		if (is_slave && other->connector_signal == SIGNAL_TYPE_EDP &&
@@ -111,8 +102,8 @@ static void dm_helpers_wire_tiled_peer(struct drm_device *dev,
 		    other->local_sink->edid_caps.panel_patch.tiled_root_force_edid_reread) {
 			link->tiled_peer = other;
 			other->tiled_peer = link;
-			pr_info("APPLE5K: tiled_peer wired: slave link[%u] <-> edp link[%u]\n",
-				link->link_index, other->link_index);
+			drm_dbg_driver(dev, "tiled panel peer wired: slave link[%u] <-> edp link[%u]\n",
+				       link->link_index, other->link_index);
 			return;
 		}
 	}
@@ -159,19 +150,20 @@ static void apply_edid_quirks(struct drm_device *dev,
 	 *   - AE26 = tile identity (secondary always, primary after root-wake re-read).
 	 * Role discrimination is by connector_signal (eDP=root, DP=slave) — not by
 	 * panel-id alone, since the primary flips AE25->AE26 after the wake.
-	 * See iMac_5K_Docs/Mainline_Plan_iMac5K.md §4.1.
 	 */
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE25):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE26):
-		pr_info("APPLE5K: tiled panel match: panel_id=0x%X signal=%d (EDP=128, DP=32)\n",
-			panel_id, connector_signal);
+		drm_dbg_driver(dev, "Apple 5K tiled panel match: panel_id=0x%X signal=%d\n",
+			       panel_id, connector_signal);
 		if (connector_signal == SIGNAL_TYPE_EDP) {
 			edid_caps->panel_patch.tiled_root_force_edid_reread = 1;
+			edid_caps->panel_patch.prefer_tile_native_mode = 1;
 		} else if (connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
 			edid_caps->panel_patch.tiled_slave_root_wake = 1;
 			edid_caps->panel_patch.tiled_slave_source_table_rev = 1;
 			edid_caps->panel_patch.tiled_stream_enable_latch = 1;
 			edid_caps->panel_patch.aux_ready_before_link_training = 1;
+			edid_caps->panel_patch.prefer_tile_native_mode = 1;
 		}
 		break;
 	default:

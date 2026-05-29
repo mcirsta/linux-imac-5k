@@ -79,12 +79,12 @@
 #define PEAK_FACTOR_X1000 1006
 #define APPLE_5K_DPCD_PANEL_LATCH 0x4F1
 
-static void apple_5k_slave_write_panel_latch(struct dc_link *link)
+static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 {
 	uint8_t payload = 1;
 	enum dc_status status;
 
-	if (!dc_link_is_apple_5k_slave(link) || !link->local_sink)
+	if (!dc_link_needs_tiled_stream_enable_latch(link) || !link->local_sink)
 		return;
 
 	status = core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
@@ -1094,7 +1094,7 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx)
 				&new_downspread.raw, sizeof(new_downspread));
 		}
 
-		apple_5k_slave_write_panel_latch(link);
+		dp_write_tiled_stream_enable_latch(link);
 	} else {
 		dm_helpers_mst_enable_stream_features(stream);
 	}

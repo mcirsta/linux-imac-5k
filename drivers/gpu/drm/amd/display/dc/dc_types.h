@@ -162,12 +162,6 @@ struct dc_edid {
 
 #define AUDIO_INFO_DISPLAY_NAME_SIZE_IN_CHARS 20
 
-/* Apple 27" 5K dual-tile internal panel: per-tile active resolution.
- * Each tile carries half the 5120x2880 panel. See dc_panel_patch tiled_*
- * flags below. */
-#define APPLE_5K_TILE_H_ACTIVE 2560
-#define APPLE_5K_TILE_V_ACTIVE 2880
-
 struct dc_panel_patch {
 	unsigned int dppowerup_delay;
 	unsigned int extra_t12_ms;
@@ -190,15 +184,12 @@ struct dc_panel_patch {
 	unsigned int force_mst_blocked_discovery;
 	unsigned int wait_after_dpcd_poweroff_ms;
 	unsigned int aux_ready_before_link_training; /* require observed AUX response before LT */
+	unsigned int prefer_tile_native_mode;        /* prefer modes matching DRM tile size */
 
 	/*
-	 * Apple 27" 5K dual-tile internal panel (iMac15,1 / 17,1 / 18,3 / 19,1).
-	 * Set in apply_edid_quirks() on the APP/AE25 + APP/AE26 panel-family,
-	 * branching on connector_signal so root- and slave-side flags land on
-	 * the right link's panel-patch. Consumers compose:
-	 *     link->local_sink->edid_caps.panel_patch.tiled_X
-	 * with link->connector_signal (and link->tiled_peer for cross-link work).
-	 * See iMac_5K_Docs/Mainline_Plan_iMac5K.md §4.2.
+	 * Internal tiled-panel quirks. EDID quirks identify the panel once and
+	 * set these role flags; consumers combine them with connector signal,
+	 * DRM tile metadata and link->tiled_peer where ordering requires it.
 	 */
 	unsigned int tiled_slave_root_wake;          /* DP slave: pulse root 0x4F1 before AUX */
 	unsigned int tiled_slave_source_table_rev;   /* DP slave: publish source-DPCD 0x310 = 04 1d 03 */

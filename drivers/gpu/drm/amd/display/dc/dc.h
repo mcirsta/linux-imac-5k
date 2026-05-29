@@ -1746,12 +1746,9 @@ struct dc_scratch_space {
 	enum backlight_control_type backlight_control_type;
 
 	/*
-	 * Peer link of a paired tiled panel (Apple 5K dual-tile internal
-	 * panel: eDP root + DP slave). Set symmetrically by amdgpu_dm at
-	 * EDID-parse time when the panel-family is identified on either
-	 * side; allows DC consumers on the slave's pre-detect path (where
-	 * local_sink is still NULL) to consult the peer's panel-patch.
-	 * NULL on all other panels. See iMac_5K_Docs/Mainline_Plan_iMac5K.md §4.2.
+	 * Peer link of a paired tiled panel. Set symmetrically by amdgpu_dm
+	 * at EDID-parse time so pre-sink slave paths can consult the root's
+	 * panel-patch.
 	 */
 	struct dc_link *tiled_peer;
 };
@@ -2695,53 +2692,89 @@ struct dc_sink {
 void dc_sink_retain(struct dc_sink *sink);
 void dc_sink_release(struct dc_sink *sink);
 
-/*
- * Apple 5K tiled-panel gate helpers (Phase 0).
- *
- * The "new" panel-patch + signal + peer gates replace the existing DMI +
- * object-id + DDC + transmitter predicates. During Phase 0 both gates run
- * in parallel with WARN_ON_ONCE bridges so equivalence can be observed on
- * a single iMac19,1 boot; behaviour is still driven by the existing gates.
- *
- * Placed after struct dc_sink so the inlines can deref local_sink->edid_caps.
- *
- * Notes on robustness against NULL pointers:
- *  - link->local_sink is NULL during pre-detect; the slave-side helper
- *    therefore consults the *peer's* (root's) panel-patch, which is
- *    available as soon as the root's EDID is parsed at boot.
- *  - the root-side helper does read its own local_sink, because every
- *    site that calls dc_link_is_apple_5k_root() requires local_sink
- *    anyway (see the root-wake call sites in link_detection.c).
- *
- * See iMac_5K_Docs/Mainline_Plan_iMac5K.md §4.1–§4.2.
- */
-static inline bool dc_link_is_apple_5k_root(const struct dc_link *link)
+static inline const struct dc_panel_patch *
+dc_link_get_panel_patch(const struct dc_link *link)
 {
-	return link &&
-	       link->connector_signal == SIGNAL_TYPE_EDP &&
-	       link->local_sink &&
-	       link->local_sink->edid_caps.panel_patch.tiled_root_force_edid_reread;
+	if (!link || !link->local_sink)
+		return NULL;
+
+	return &link->local_sink->edid_caps.panel_patch;
 }
 
-static inline bool dc_link_is_apple_5k_slave(const struct dc_link *link)
+static inline bool dc_link_has_tiled_root_panel_patch(const struct dc_link *link)
 {
-	const struct dc_link *peer;
+	const struct dc_panel_patch *patch = dc_link_get_panel_patch(link);
+
+	return link &&
+	       link->connector_signal == SIGNAL_TYPE_EDP &&
+	       patch &&
+	       patch->tiled_root_force_edid_reread;
+}
+
+static inline bool dc_link_has_tiled_slave_panel_patch(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch;
 
 	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
 		return false;
 
-	/* Post-EDID: own panel-patch is authoritative. */
-	if (link->local_sink &&
-	    link->local_sink->edid_caps.panel_patch.tiled_slave_root_wake)
+	patch = dc_link_get_panel_patch(link);
+	if (patch && patch->tiled_slave_root_wake)
 		return true;
 
-	/* Pre-detect: consult peer's panel-patch. tiled_peer was wired at
-	 * root-EDID-parse time, before slave pre-detect runs. */
-	peer = link->tiled_peer;
-	return peer &&
-	       peer->connector_signal == SIGNAL_TYPE_EDP &&
-	       peer->local_sink &&
-	       peer->local_sink->edid_caps.panel_patch.tiled_root_force_edid_reread;
+	/* Pre-sink slave paths can still inherit the root's tiled-panel quirk. */
+	return dc_link_has_tiled_root_panel_patch(link->tiled_peer);
+}
+
+static inline bool dc_link_needs_tiled_slave_root_wake(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch;
+
+	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
+		return false;
+
+	patch = dc_link_get_panel_patch(link);
+	if (patch && patch->tiled_slave_root_wake)
+		return true;
+
+	return dc_link_has_tiled_root_panel_patch(link->tiled_peer);
+}
+
+static inline bool dc_link_needs_pre_training_aux_ready(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch = dc_link_get_panel_patch(link);
+
+	if (patch && patch->aux_ready_before_link_training)
+		return true;
+
+	return dc_link_needs_tiled_slave_root_wake(link);
+}
+
+static inline bool dc_link_needs_tiled_slave_source_table_rev(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch = dc_link_get_panel_patch(link);
+
+	return link &&
+	       link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT &&
+	       patch &&
+	       patch->tiled_slave_source_table_rev;
+}
+
+static inline bool dc_link_needs_tiled_stream_enable_latch(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch = dc_link_get_panel_patch(link);
+
+	return link &&
+	       link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT &&
+	       patch &&
+	       patch->tiled_stream_enable_latch;
+}
+
+static inline bool dc_link_prefers_tile_native_mode(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch = dc_link_get_panel_patch(link);
+
+	return patch && patch->prefer_tile_native_mode;
 }
 
 struct dc_sink_init_data {

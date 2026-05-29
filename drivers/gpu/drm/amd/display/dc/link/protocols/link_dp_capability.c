@@ -59,8 +59,8 @@
 #define DC_LOGGER \
 	link->ctx->logger
 
-#define APPLE_5K_AUX_READY_ATTEMPTS 3
-#define APPLE_5K_AUX_READY_COOLDOWN_US 1000
+#define DP_SOURCE_DPCD_AUX_READY_ATTEMPTS 3
+#define DP_SOURCE_DPCD_AUX_READY_COOLDOWN_US 1000
 
 #ifndef MAX
 #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
@@ -69,12 +69,13 @@
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
 #endif
 
-static void dpcd_set_apple_5k_slave_source_table_revision(
+static void dpcd_set_tiled_slave_source_table_revision(
 	struct dc_link *link)
 {
 	uint8_t table_revision[3];
 
-	if (!dc_link_is_apple_5k_slave(link) || !link->ctx || !link->dc)
+	if (!dc_link_needs_tiled_slave_source_table_rev(link) ||
+	    !link->ctx || !link->dc)
 		return;
 
 	table_revision[0] = link->ctx->dce_version >= DCE_VERSION_12_0 ?
@@ -86,16 +87,16 @@ static void dpcd_set_apple_5k_slave_source_table_revision(
 			     table_revision, sizeof(table_revision));
 }
 
-static bool apple_5k_slave_prepare_aux_write(struct dc_link *link)
+static bool dp_prepare_source_dpcd_write(struct dc_link *link)
 {
 	uint8_t dpcd_rev;
 	uint8_t power_state = DP_POWER_STATE_D0;
 	unsigned int try;
 
-	if (!dc_link_is_apple_5k_slave(link))
+	if (!dc_link_needs_tiled_slave_root_wake(link))
 		return true;
 
-	for (try = 0; try < APPLE_5K_AUX_READY_ATTEMPTS; try++) {
+	for (try = 0; try < DP_SOURCE_DPCD_AUX_READY_ATTEMPTS; try++) {
 		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
 
 		if (core_link_write_dpcd(link, DP_SET_POWER,
@@ -109,8 +110,8 @@ static bool apple_5k_slave_prepare_aux_write(struct dc_link *link)
 			return true;
 
 retry:
-		if (try + 1 < APPLE_5K_AUX_READY_ATTEMPTS)
-			fsleep(APPLE_5K_AUX_READY_COOLDOWN_US);
+		if (try + 1 < DP_SOURCE_DPCD_AUX_READY_ATTEMPTS)
+			fsleep(DP_SOURCE_DPCD_AUX_READY_COOLDOWN_US);
 	}
 
 	return false;
@@ -1458,14 +1459,7 @@ bool dp_overwrite_extended_receiver_cap(struct dc_link *link)
 
 void dpcd_set_source_specific_data(struct dc_link *link)
 {
-	/*
-	 * Apple 5K tiled-slave: AUX dozes between detect and this stream-enable
-	 * step, so the source-specific DPCD writes below (DP_SOURCE_OUI, then the
-	 * 0x310 source-table-revision) would fail with -5 and spam "Too many
-	 * retries" before the link even trained. Make the writes conditional on
-	 * an observed slave AUX response after pulsing the root (eDP) panel latch.
-	 */
-	if (!apple_5k_slave_prepare_aux_write(link))
+	if (!dp_prepare_source_dpcd_write(link))
 		return;
 
 	if (!link->dc->vendor_signature.is_valid) {
@@ -1548,7 +1542,7 @@ void dpcd_set_source_specific_data(struct dc_link *link)
 				sizeof(link->dc->vendor_signature.data.raw));
 	}
 
-	dpcd_set_apple_5k_slave_source_table_revision(link);
+	dpcd_set_tiled_slave_source_table_revision(link);
 }
 
 void dpcd_write_cable_id_to_dprx(struct dc_link *link)

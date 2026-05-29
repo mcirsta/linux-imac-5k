@@ -49,9 +49,9 @@
 
 #define DP_SINK_PR_ENABLE_AND_CONFIGURATION		0x37B
 
-static bool link_is_apple_5k_slave_assr_route(const struct dc_link *link)
+static bool link_needs_tiled_slave_assr_route(const struct dc_link *link)
 {
-	return dc_link_is_apple_5k_slave(link);
+	return dc_link_has_tiled_slave_panel_patch(link);
 }
 
 /* Travis */
@@ -150,7 +150,7 @@ enum dp_panel_mode dp_get_panel_mode(struct dc_link *link)
 		}
 	}
 
-	if (link_is_apple_5k_slave_assr_route(link))
+	if (link_needs_tiled_slave_assr_route(link))
 		return DP_PANEL_MODE_EDP;
 
 	if (link->dpcd_caps.panel_mode_edp &&
