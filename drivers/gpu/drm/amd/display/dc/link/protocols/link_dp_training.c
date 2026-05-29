@@ -1100,23 +1100,56 @@ enum dc_status dpcd_set_training_pattern(
  * When these writes fail DC cannot program the slave link, the verified cap
  * stays minimal, and create_validate_stream prunes the real tile mode for
  * "No DP link bandwidth". Pre-wake the panel via the root panel-latch
- * (link_apple_5k_root_panel_latch_pulse) before the first write, and re-assert
- * the wake + retry on write failure.
+ * (link_apple_5k_root_panel_latch_pulse) and require an observed slave AUX
+ * response before training, then re-assert the wake + retry on write failure.
  */
-#define APPLE_5K_LT_REWAKE_SETTLE_MS       60
+#define APPLE_5K_LT_READY_ATTEMPTS         3
 #define APPLE_5K_LT_MAX_REWAKE_RETRY       4
+#define APPLE_5K_LT_RETRY_COOLDOWN_US      1000
+
+static bool apple_5k_slave_prepare_link_training(struct dc_link *link,
+						 unsigned int attempts)
+{
+	uint8_t dpcd_rev;
+	uint8_t power_state = DP_POWER_STATE_D0;
+	unsigned int apple_5k_try;
+
+	if (!link || link->aux_access_disabled || !dc_link_is_apple_5k_slave(link))
+		return true;
+
+	for (apple_5k_try = 0; apple_5k_try < attempts; apple_5k_try++) {
+		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
+
+		if (core_link_write_dpcd(link, DP_SET_POWER,
+					 &power_state, sizeof(power_state)) != DC_OK)
+			goto retry;
+
+		dpcd_rev = 0;
+		if (core_link_read_dpcd(link, DP_DPCD_REV,
+					&dpcd_rev, sizeof(dpcd_rev)) == DC_OK &&
+		    dpcd_rev != 0)
+			return true;
+
+retry:
+		if (apple_5k_try + 1 < attempts)
+			fsleep(APPLE_5K_LT_RETRY_COOLDOWN_US);
+	}
+
+	return false;
+}
 
 enum dc_status dpcd_set_link_settings(
 	struct dc_link *link,
 	const struct link_training_settings *lt_settings)
 {
-	uint8_t rate;
+	uint8_t rate = 0;
 	enum dc_status status;
 	bool apple_5k_sec = dc_link_is_apple_5k_slave(link);
 	unsigned int apple_5k_try = 0;
 	enum dc_status ds_status = DC_OK;
 	enum dc_status lc_status = DC_OK;
 	enum dc_status bw_status = DC_OK;
+	enum dc_status rate_status = DC_OK;
 
 	union down_spread_ctrl downspread = {0};
 	union lane_count_set lane_count_set = {0};
@@ -1138,18 +1171,19 @@ enum dc_status dpcd_set_link_settings(
 	}
 
 	/*
-	 * Apple 5K tiled-slave: AUX dozes between cap-read and these link-config
-	 * writes, so the first write attempt would fail with -5 before the
-	 * re-wake-on-failure retry below recovered it. Pre-wake the panel via
-	 * the root panel-latch and settle BEFORE the first attempt so it lands
-	 * cleanly. The retry loop below stays as the safety net.
+	 * Apple 5K tiled-slave: AUX dozes between cap-read and these
+	 * link-config writes. Keep every retry tied to observed slave AUX
+	 * readiness instead of a fixed wake delay.
 	 */
-	if (apple_5k_sec) {
-		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
-		msleep(APPLE_5K_LT_REWAKE_SETTLE_MS);
-	}
-
 	while (true) {
+		if (apple_5k_sec &&
+		    !apple_5k_slave_prepare_link_training(link, 1)) {
+			status = DC_ERROR_UNEXPECTED;
+			goto apple_5k_retry;
+		}
+
+		rate_status = DC_OK;
+
 		ds_status = core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
 			&downspread.raw, sizeof(downspread));
 		status = ds_status;
@@ -1182,6 +1216,7 @@ enum dc_status dpcd_set_link_settings(
 
 			status = core_link_write_dpcd(link, DP_LINK_RATE_SET,
 					&lt_settings->link_settings.link_rate_set, 1);
+			rate_status = status;
 			if (status != DC_OK)
 				DC_LOG_ERROR("%s:%d: core_link_write_dpcd (DP_LINK_RATE_SET) failed\n", __func__, __LINE__);
 		} else {
@@ -1198,14 +1233,14 @@ enum dc_status dpcd_set_link_settings(
 			break;
 
 		if (ds_status == DC_OK && lc_status == DC_OK &&
-		    bw_status == DC_OK)
+		    bw_status == DC_OK && rate_status == DC_OK)
 			break;
 
+apple_5k_retry:
 		if (apple_5k_try >= APPLE_5K_LT_MAX_REWAKE_RETRY)
 			break;
 
-		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
-		msleep(APPLE_5K_LT_REWAKE_SETTLE_MS);
+		fsleep(APPLE_5K_LT_RETRY_COOLDOWN_US);
 		apple_5k_try++;
 	}
 
@@ -1723,6 +1758,14 @@ bool perform_link_training_with_retries(
 			msleep(delay_dp_power_up_in_ms);
 		}
 
+		if (!apple_5k_slave_prepare_link_training(link,
+							  APPLE_5K_LT_READY_ATTEMPTS)) {
+			DC_LOG_WARNING("%s: Apple 5K slave link(%d) AUX not ready for training\n",
+				       __func__, link->link_index);
+			status = LINK_TRAINING_ABORT;
+			goto link_training_failed;
+		}
+
 		edp_set_panel_assr(link, pipe_ctx, &panel_mode, true);
 
 		dp_set_panel_mode(link, panel_mode);
@@ -1773,6 +1816,7 @@ bool perform_link_training_with_retries(
 			}
 		}
 
+link_training_failed:
 		fail_count++;
 		dp_trace_lt_fail_count_update(link, fail_count, false);
 		if (link->ep_type == DISPLAY_ENDPOINT_PHY) {
@@ -1867,4 +1911,3 @@ bool perform_link_training_with_retries(
 
 	return false;
 }
-
