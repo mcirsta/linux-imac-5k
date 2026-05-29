@@ -2710,8 +2710,8 @@ void dc_sink_release(struct dc_sink *sink);
  *    therefore consults the *peer's* (root's) panel-patch, which is
  *    available as soon as the root's EDID is parsed at boot.
  *  - the root-side helper does read its own local_sink, because every
- *    site that currently calls link_is_imac5k_primary_route() requires
- *    local_sink anyway (see link_detection.c:177 etc.).
+ *    site that calls dc_link_is_apple_5k_root() requires local_sink
+ *    anyway (see the root-wake call sites in link_detection.c).
  *
  * See iMac_5K_Docs/Mainline_Plan_iMac5K.md §4.1–§4.2.
  */

@@ -49,7 +49,7 @@
 
 #define DP_SINK_PR_ENABLE_AND_CONFIGURATION		0x37B
 
-static bool link_is_imac5k_secondary_assr_route(const struct dc_link *link)
+static bool link_is_apple_5k_slave_assr_route(const struct dc_link *link)
 {
 	return dc_link_is_apple_5k_slave(link);
 }
@@ -150,16 +150,8 @@ enum dp_panel_mode dp_get_panel_mode(struct dc_link *link)
 		}
 	}
 
-	if (link_is_imac5k_secondary_assr_route(link)) {
-		DC_LOG_DETECTION_DP_CAPS("%d iMac5K secondary 0x3113 forced ASSR panel mode: raw_obj=0x%x ddc_hw=%u tx=%d internal=%d advertised_panel_mode_edp=%d\n",
-					 link->link_index,
-					 dal_graphics_object_id_to_uint(link->link_id),
-					 link->ddc_hw_inst,
-					 link->link_enc ? link->link_enc->transmitter : 0,
-					 link->is_internal_display,
-					 link->dpcd_caps.panel_mode_edp);
+	if (link_is_apple_5k_slave_assr_route(link))
 		return DP_PANEL_MODE_EDP;
-	}
 
 	if (link->dpcd_caps.panel_mode_edp &&
 		(link->connector_signal == SIGNAL_TYPE_EDP ||

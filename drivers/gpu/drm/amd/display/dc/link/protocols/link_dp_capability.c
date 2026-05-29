@@ -59,7 +59,7 @@
 #define DC_LOGGER \
 	link->ctx->logger
 
-#define IMAC5K_AUX_WAKE_SETTLE_MS 60
+#define APPLE_5K_AUX_WAKE_SETTLE_MS 60
 
 #ifndef MAX
 #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
@@ -68,7 +68,7 @@
 #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
 #endif
 
-static void dpcd_set_imac5k_secondary_source_table_revision(
+static void dpcd_set_apple_5k_slave_source_table_revision(
 	struct dc_link *link)
 {
 	uint8_t table_revision[3];
@@ -1438,7 +1438,7 @@ void dpcd_set_source_specific_data(struct dc_link *link)
 	 */
 	if (dc_link_is_apple_5k_slave(link)) {
 		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
-		msleep(IMAC5K_AUX_WAKE_SETTLE_MS);
+		msleep(APPLE_5K_AUX_WAKE_SETTLE_MS);
 	}
 
 	if (!link->dc->vendor_signature.is_valid) {
@@ -1521,7 +1521,7 @@ void dpcd_set_source_specific_data(struct dc_link *link)
 				sizeof(link->dc->vendor_signature.data.raw));
 	}
 
-	dpcd_set_imac5k_secondary_source_table_revision(link);
+	dpcd_set_apple_5k_slave_source_table_revision(link);
 }
 
 void dpcd_write_cable_id_to_dprx(struct dc_link *link)

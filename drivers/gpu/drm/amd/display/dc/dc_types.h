@@ -165,8 +165,8 @@ struct dc_edid {
 /* Apple 27" 5K dual-tile internal panel: per-tile active resolution.
  * Each tile carries half the 5120x2880 panel. See dc_panel_patch tiled_*
  * flags below. */
-#define IMAC5K_TILE_H_ACTIVE 2560
-#define IMAC5K_TILE_V_ACTIVE 2880
+#define APPLE_5K_TILE_H_ACTIVE 2560
+#define APPLE_5K_TILE_V_ACTIVE 2880
 
 struct dc_panel_patch {
 	unsigned int dppowerup_delay;
@@ -200,10 +200,8 @@ struct dc_panel_patch {
 	 * See iMac_5K_Docs/Mainline_Plan_iMac5K.md §4.2.
 	 */
 	unsigned int tiled_slave_root_wake;          /* DP slave: pulse root 0x4F1 before AUX */
-	unsigned int tiled_slave_keep_connected;     /* DP slave: HPD-low -> still single */
 	unsigned int tiled_slave_source_table_rev;   /* DP slave: publish source-DPCD 0x310 = 04 1d 03 */
 	unsigned int tiled_root_force_edid_reread;   /* eDP root: re-read EDID after slave up (Change A) */
-	unsigned int tiled_pair_force_sync_group;    /* pair-level: force timing-sync group of the tile pair */
 	unsigned int tiled_stream_enable_latch;      /* DP slave: 0x4F1=1 at stream-enable */
 };
 

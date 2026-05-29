@@ -238,8 +238,8 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector);
 static void handle_hpd_rx_irq(void *param);
 
-/* IMAC5K Change A: forced primary EDID re-read after the secondary tile is up */
-static void amdgpu_dm_imac5k_reprobe_primary_after_secondary(
+/* Apple 5K Change A: re-read root EDID after slave latches the panel into tile mode */
+static void amdgpu_dm_apple_5k_reprobe_root_after_slave(
 		struct amdgpu_device *adev);
 
 static void amdgpu_dm_backlight_set_level(struct amdgpu_display_manager *dm,
@@ -5693,14 +5693,14 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 	}
 
 	/*
-	 * IMAC5K Change A: now that every link has been detected (so the
+	 * Apple 5K Change A: now that every link has been detected (so the
 	 * secondary 0x3113 has had its chance to latch the panel into tile
 	 * mode), force the primary 0x3114 to re-read its EDID. This is the
 	 * RE-recommended empirical probe for whether the primary flips from the
 	 * 4K-compat identity (0xAE25, no tile) to the full tile identity
 	 * (0xAE26, DisplayID tile block). No-op on all non-iMac19,1 hardware.
 	 */
-	amdgpu_dm_imac5k_reprobe_primary_after_secondary(adev);
+	amdgpu_dm_apple_5k_reprobe_root_after_slave(adev);
 
 	/* Debug dump: list all DC links and their associated sinks after detection
 	 * is complete for all connectors. This provides a comprehensive view of the
@@ -8117,27 +8117,27 @@ cleanup:
 }
 
 static bool
-amdgpu_dm_connector_is_imac5k_secondary_route(
+amdgpu_dm_connector_is_apple_5k_slave(
 		const struct amdgpu_dm_connector *aconnector)
 {
 	return aconnector && dc_link_is_apple_5k_slave(aconnector->dc_link);
 }
 
 static bool
-amdgpu_dm_connector_is_imac5k_secondary_tile(
+amdgpu_dm_connector_is_apple_5k_slave_tile(
 		const struct amdgpu_dm_connector *aconnector)
 {
 	const struct drm_connector *connector;
 
-	if (!amdgpu_dm_connector_is_imac5k_secondary_route(aconnector))
+	if (!amdgpu_dm_connector_is_apple_5k_slave(aconnector))
 		return false;
 
 	connector = &aconnector->base;
 	if (!connector->has_tile)
 		return false;
 
-	return connector->tile_h_size == IMAC5K_TILE_H_ACTIVE &&
-	       connector->tile_v_size == IMAC5K_TILE_V_ACTIVE &&
+	return connector->tile_h_size == APPLE_5K_TILE_H_ACTIVE &&
+	       connector->tile_v_size == APPLE_5K_TILE_V_ACTIVE &&
 	       connector->tile_h_loc == 1 &&
 	       connector->tile_v_loc == 0 &&
 	       connector->num_h_tile == 2 &&
@@ -8145,26 +8145,26 @@ amdgpu_dm_connector_is_imac5k_secondary_tile(
 }
 
 static bool
-amdgpu_dm_mode_is_imac5k_tile_half(const struct drm_display_mode *mode)
+amdgpu_dm_mode_is_apple_5k_tile_half(const struct drm_display_mode *mode)
 {
 	return mode &&
-	       mode->hdisplay == IMAC5K_TILE_H_ACTIVE &&
-	       mode->vdisplay == IMAC5K_TILE_V_ACTIVE;
+	       mode->hdisplay == APPLE_5K_TILE_H_ACTIVE &&
+	       mode->vdisplay == APPLE_5K_TILE_V_ACTIVE;
 }
 
 static bool
-amdgpu_dm_connector_is_imac5k_primary_route(
+amdgpu_dm_connector_is_apple_5k_root(
 		const struct amdgpu_dm_connector *aconnector)
 {
 	return aconnector && dc_link_is_apple_5k_root(aconnector->dc_link);
 }
 
 static bool
-amdgpu_dm_connector_is_imac5k_tile(
+amdgpu_dm_connector_is_apple_5k_tile(
 		const struct amdgpu_dm_connector *aconnector)
 {
-	return amdgpu_dm_connector_is_imac5k_primary_route(aconnector) ||
-	       amdgpu_dm_connector_is_imac5k_secondary_route(aconnector);
+	return amdgpu_dm_connector_is_apple_5k_root(aconnector) ||
+	       amdgpu_dm_connector_is_apple_5k_slave(aconnector);
 }
 
 /*
@@ -8187,21 +8187,21 @@ amdgpu_dm_connector_is_imac5k_tile(
  * 2560x2880 preferred. 4K stays in the list, just not preferred.
  */
 static void
-amdgpu_dm_imac5k_make_tile_mode_preferred(struct drm_connector *connector)
+amdgpu_dm_apple_5k_make_tile_mode_preferred(struct drm_connector *connector)
 {
 	struct amdgpu_dm_connector *aconnector =
 			to_amdgpu_dm_connector(connector);
 	struct drm_display_mode *mode;
 	bool have_tile_mode = false;
 
-	if (!amdgpu_dm_connector_is_imac5k_tile(aconnector))
+	if (!amdgpu_dm_connector_is_apple_5k_tile(aconnector))
 		return;
 
 	/* Only act if the tile-native mode is actually present to become the
 	 * preferred -- never leave the connector with no preferred mode.
 	 */
 	list_for_each_entry(mode, &connector->probed_modes, head) {
-		if (amdgpu_dm_mode_is_imac5k_tile_half(mode)) {
+		if (amdgpu_dm_mode_is_apple_5k_tile_half(mode)) {
 			have_tile_mode = true;
 			break;
 		}
@@ -8211,7 +8211,7 @@ amdgpu_dm_imac5k_make_tile_mode_preferred(struct drm_connector *connector)
 		return;
 
 	list_for_each_entry(mode, &connector->probed_modes, head) {
-		if (amdgpu_dm_mode_is_imac5k_tile_half(mode))
+		if (amdgpu_dm_mode_is_apple_5k_tile_half(mode))
 			mode->type |= DRM_MODE_TYPE_PREFERRED;
 		else if (mode->type & DRM_MODE_TYPE_PREFERRED)
 			mode->type &= ~DRM_MODE_TYPE_PREFERRED;
@@ -8239,7 +8239,7 @@ amdgpu_dm_imac5k_make_tile_mode_preferred(struct drm_connector *connector)
  * apply_edid_quirks() on the Apple 5K eDP root; no-op on every other panel.
  */
 static void
-amdgpu_dm_imac5k_reprobe_primary_after_secondary(struct amdgpu_device *adev)
+amdgpu_dm_apple_5k_reprobe_root_after_slave(struct amdgpu_device *adev)
 {
 	struct drm_device *dev = adev_to_drm(adev);
 	struct amdgpu_display_manager *dm = &adev->dm;
@@ -8258,9 +8258,9 @@ amdgpu_dm_imac5k_reprobe_primary_after_secondary(struct amdgpu_device *adev)
 			continue;
 
 		aconnector = to_amdgpu_dm_connector(connector);
-		if (amdgpu_dm_connector_is_imac5k_primary_route(aconnector))
+		if (amdgpu_dm_connector_is_apple_5k_root(aconnector))
 			primary = aconnector;
-		else if (amdgpu_dm_connector_is_imac5k_secondary_route(aconnector))
+		else if (amdgpu_dm_connector_is_apple_5k_slave(aconnector))
 			secondary = aconnector;
 	}
 	drm_connector_list_iter_end(&iter);
@@ -8271,7 +8271,7 @@ amdgpu_dm_imac5k_reprobe_primary_after_secondary(struct amdgpu_device *adev)
 	/* Only re-read once the slave has actually latched the panel into tile
 	 * mode. If the slave never flipped, the panel is still 4K-compat and
 	 * re-reading the root cannot help. */
-	if (!amdgpu_dm_connector_is_imac5k_secondary_tile(secondary))
+	if (!amdgpu_dm_connector_is_apple_5k_slave_tile(secondary))
 		return;
 
 	primary_link = primary->dc_link;
@@ -8281,8 +8281,8 @@ amdgpu_dm_imac5k_reprobe_primary_after_secondary(struct amdgpu_device *adev)
 
 	/* Skip if the root already carries the tile identity. */
 	if (primary->base.has_tile &&
-	    primary->base.tile_h_size == IMAC5K_TILE_H_ACTIVE &&
-	    primary->base.tile_v_size == IMAC5K_TILE_V_ACTIVE)
+	    primary->base.tile_h_size == APPLE_5K_TILE_H_ACTIVE &&
+	    primary->base.tile_v_size == APPLE_5K_TILE_V_ACTIVE)
 		return;
 
 	mutex_lock(&dm->dc_lock);
@@ -8428,8 +8428,8 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
 	 * DisplayPort fallback. Keep the secondary connector tile-only so the
 	 * bogus non-tiled fallback cannot drive the panel into the blank path.
 	 */
-	if (amdgpu_dm_connector_is_imac5k_secondary_tile(aconnector) &&
-	    !amdgpu_dm_mode_is_imac5k_tile_half(mode))
+	if (amdgpu_dm_connector_is_apple_5k_slave_tile(aconnector) &&
+	    !amdgpu_dm_mode_is_apple_5k_tile_half(mode))
 		return MODE_PANEL;
 
 	/*
@@ -8461,8 +8461,8 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
 	if (stream) {
 		dc_stream_release(stream);
 		result = MODE_OK;
-	} else if (amdgpu_dm_connector_is_imac5k_secondary_tile(aconnector) &&
-		   amdgpu_dm_mode_is_imac5k_tile_half(mode)) {
+	} else if (amdgpu_dm_connector_is_apple_5k_slave_tile(aconnector) &&
+		   amdgpu_dm_mode_is_apple_5k_tile_half(mode)) {
 		result = MODE_OK;
 	}
 
@@ -9183,7 +9183,7 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 	 * shared framebuffer to 2160 tall and VIRTUAL_Y-prune the peer tile's
 	 * 2880-tall mode. No modes are removed.
 	 */
-	amdgpu_dm_imac5k_make_tile_mode_preferred(connector);
+	amdgpu_dm_apple_5k_make_tile_mode_preferred(connector);
 
 	amdgpu_dm_fbc_init(connector);
 

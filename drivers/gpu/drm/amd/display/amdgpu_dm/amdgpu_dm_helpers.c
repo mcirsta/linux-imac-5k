@@ -71,10 +71,9 @@ static u32 edid_extract_panel_id(struct edid *edid)
  * root side, pick the first DP sibling. From the slave side, pick the
  * first eDP sibling already carrying the root flag.
  *
- * On boards with multiple DP outputs this may guess wrong — the
- * WARN_ON_ONCE bridges at the existing iMac5K predicate sites will
- * surface that. Phase 1.5 refines (e.g. require has_tile + same DRM
- * tile_group->id) once parse/detect ordering is observed.
+ * On boards with multiple DP outputs this may guess wrong. Phase 1.5
+ * refines (e.g. require has_tile + same DRM tile_group->id) once
+ * parse/detect ordering is observed on a second-model.
  *
  * See iMac_5K_Docs/Mainline_Plan_iMac5K.md §4.2.
  */
@@ -170,13 +169,9 @@ static void apply_edid_quirks(struct drm_device *dev,
 			edid_caps->panel_patch.tiled_root_force_edid_reread = 1;
 		} else if (connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
 			edid_caps->panel_patch.tiled_slave_root_wake = 1;
-			edid_caps->panel_patch.tiled_slave_keep_connected = 1;
 			edid_caps->panel_patch.tiled_slave_source_table_rev = 1;
 			edid_caps->panel_patch.tiled_stream_enable_latch = 1;
 		}
-		/* Pair-level flag: set on either side; consumer (dc.c) also checks
-		 * drm_connector->tile_group->id for actual pairing. */
-		edid_caps->panel_patch.tiled_pair_force_sync_group = 1;
 		break;
 	default:
 		return;

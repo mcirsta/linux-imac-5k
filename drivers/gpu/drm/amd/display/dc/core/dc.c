@@ -1625,83 +1625,6 @@ static void enable_timing_multisync(
 	}
 }
 
-/*
- * Apple 5K tile-pair stream helpers. Replace the previous DMI + object-id
- * checks with the panel-patch flag set by apply_edid_quirks() on both halves
- * of the panel-family (APP/AE25 + APP/AE26 on either eDP root or DP slave).
- */
-static bool imac5k_stream_is_apple_5k(const struct dc_stream_state *stream)
-{
-	return stream && stream->sink &&
-	       stream->sink->edid_caps.panel_patch.tiled_pair_force_sync_group;
-}
-
-static bool imac5k_stream_is_tile_half(const struct dc_stream_state *stream)
-{
-	return imac5k_stream_is_apple_5k(stream) &&
-	       stream->timing.h_addressable == IMAC5K_TILE_H_ACTIVE &&
-	       stream->timing.v_addressable == IMAC5K_TILE_V_ACTIVE;
-}
-
-static bool imac5k_streams_are_tile_pair(
-		const struct dc_stream_state *stream1,
-		const struct dc_stream_state *stream2)
-{
-	return imac5k_stream_is_tile_half(stream1) &&
-	       imac5k_stream_is_tile_half(stream2);
-}
-
-static bool imac5k_streams_are_object_pair(
-		const struct dc_stream_state *stream1,
-		const struct dc_stream_state *stream2)
-{
-	return imac5k_stream_is_apple_5k(stream1) &&
-	       imac5k_stream_is_apple_5k(stream2);
-}
-
-static bool imac5k_streams_syncable_ignoring_msa(
-		struct dc_stream_state *stream1,
-		struct dc_stream_state *stream2)
-{
-	if (!imac5k_streams_are_tile_pair(stream1, stream2))
-		return false;
-
-	if (!stream1->ignore_msa_timing_param &&
-	    !stream2->ignore_msa_timing_param)
-		return false;
-
-	if (stream1->timing.h_total != stream2->timing.h_total)
-		return false;
-
-	if (stream1->timing.v_total != stream2->timing.v_total)
-		return false;
-
-	if (stream1->timing.h_addressable != stream2->timing.h_addressable)
-		return false;
-
-	if (stream1->timing.v_addressable != stream2->timing.v_addressable)
-		return false;
-
-	if (stream1->timing.v_front_porch != stream2->timing.v_front_porch)
-		return false;
-
-	if (stream1->timing.pix_clk_100hz != stream2->timing.pix_clk_100hz)
-		return false;
-
-	if (stream1->clamping.c_depth != stream2->clamping.c_depth)
-		return false;
-
-	if (stream1->phy_pix_clk != stream2->phy_pix_clk &&
-	    (!dc_is_dp_signal(stream1->signal) ||
-	     !dc_is_dp_signal(stream2->signal)))
-		return false;
-
-	if (stream1->view_format != stream2->view_format)
-		return false;
-
-	return true;
-}
-
 static void program_timing_sync(
 		struct dc *dc,
 		struct dc_state *ctx)
@@ -1736,17 +1659,11 @@ static void program_timing_sync(
 		 * same timing, add all tgs with same timing to the group
 		 */
 		for (j = i + 1; j < pipe_count; j++) {
-			bool imac5k_pair;
-			bool imac5k_genlock_bypass = false;
 			bool timing_sync = false;
 			bool vblank_sync = false;
 
 			if (!unsynced_pipes[j])
 				continue;
-
-			imac5k_pair = imac5k_streams_are_object_pair(
-					unsynced_pipes[j]->stream,
-					pipe_set[0]->stream);
 
 			if (sync_type != TIMING_SYNCHRONIZABLE &&
 			    dc->hwss.enable_vblanks_synchronization &&
@@ -1755,26 +1672,13 @@ static void program_timing_sync(
 						unsynced_pipes[j]->stream,
 						pipe_set[0]->stream);
 
-			if (sync_type != VBLANK_SYNCHRONIZABLE) {
+			if (sync_type != VBLANK_SYNCHRONIZABLE)
 				timing_sync = resource_are_streams_timing_synchronizable(
 						unsynced_pipes[j]->stream,
 						pipe_set[0]->stream);
-				if (!timing_sync && imac5k_pair)
-					imac5k_genlock_bypass =
-						imac5k_streams_syncable_ignoring_msa(
-							unsynced_pipes[j]->stream,
-							pipe_set[0]->stream);
-			}
 
-			if (imac5k_pair &&
-			    sync_type != VBLANK_SYNCHRONIZABLE &&
-			    (timing_sync || imac5k_genlock_bypass)) {
-				sync_type = TIMING_SYNCHRONIZABLE;
-				pipe_set[group_size] = unsynced_pipes[j];
-				unsynced_pipes[j] = NULL;
-				group_size++;
-			} else if (sync_type != TIMING_SYNCHRONIZABLE &&
-				   vblank_sync) {
+			if (sync_type != TIMING_SYNCHRONIZABLE &&
+			    vblank_sync) {
 				sync_type = VBLANK_SYNCHRONIZABLE;
 				pipe_set[group_size] = unsynced_pipes[j];
 				unsynced_pipes[j] = NULL;

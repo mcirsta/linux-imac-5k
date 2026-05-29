@@ -53,8 +53,8 @@
 
  // Offset DPCD 050Eh == 0x5A
 #define MST_HUB_ID_0x5A  0x5A
-#define IMAC5K_SECONDARY_AUX_WAKE_TIMEOUT_MS 300
-#define IMAC5K_SECONDARY_AUX_WAKE_POLL_MS 30
+#define APPLE_5K_SLAVE_AUX_WAKE_TIMEOUT_MS 300
+#define APPLE_5K_SLAVE_AUX_WAKE_POLL_MS 30
 
 #define DC_LOGGER \
 	link->ctx->logger
@@ -108,7 +108,7 @@ static enum ddc_transaction_type get_ddc_transaction_type(enum signal_type sink_
 	return transaction_type;
 }
 
-static void imac5k_primary_write_panel_wake(struct dc_link *link)
+static void apple_5k_root_write_panel_wake(struct dc_link *link)
 {
 	if (!dc_link_is_apple_5k_root(link) || !link->ddc || !link->local_sink)
 		return;
@@ -123,7 +123,7 @@ static void imac5k_primary_write_panel_wake(struct dc_link *link)
 	link_apple_5k_root_panel_latch_pulse(link);
 }
 
-static bool imac5k_secondary_try_pre_detect_aux(struct dc_link *link)
+static bool apple_5k_slave_try_pre_detect_aux(struct dc_link *link)
 {
 	enum ddc_transaction_type old_transaction_type;
 	bool old_aux_mode;
@@ -148,9 +148,9 @@ static bool imac5k_secondary_try_pre_detect_aux(struct dc_link *link)
 	 * torn down. At initial boot this is an idempotent re-assert.
 	 */
 	if (link->tiled_peer)
-		imac5k_primary_write_panel_wake(link->tiled_peer);
+		apple_5k_root_write_panel_wake(link->tiled_peer);
 
-	for (elapsed_ms = 0; ; elapsed_ms += IMAC5K_SECONDARY_AUX_WAKE_POLL_MS) {
+	for (elapsed_ms = 0; ; elapsed_ms += APPLE_5K_SLAVE_AUX_WAKE_POLL_MS) {
 		dpcd_rev = 0;
 		status = core_link_read_dpcd(link, DP_DPCD_REV,
 					    &dpcd_rev, sizeof(dpcd_rev));
@@ -158,10 +158,10 @@ static bool imac5k_secondary_try_pre_detect_aux(struct dc_link *link)
 		if (status == DC_OK && dpcd_rev != 0)
 			return true;
 
-		if (elapsed_ms >= IMAC5K_SECONDARY_AUX_WAKE_TIMEOUT_MS)
+		if (elapsed_ms >= APPLE_5K_SLAVE_AUX_WAKE_TIMEOUT_MS)
 			break;
 
-		msleep(IMAC5K_SECONDARY_AUX_WAKE_POLL_MS);
+		msleep(APPLE_5K_SLAVE_AUX_WAKE_POLL_MS);
 	}
 
 	set_ddc_transaction_type(link->ddc, old_transaction_type);
@@ -1075,8 +1075,23 @@ static bool detect_link_and_local_sink(struct dc_link *link,
 		return false;
 	}
 
+	/*
+	 * Apple 5K dual-tile internal panel: the slave (DP) half is the
+	 * non-root tile of a DisplayID tile pair whose root is an eDP. Its
+	 * HPD pin is not wired in the panel; the root's HPD covers the whole
+	 * panel. Mainline DC's eDP code already treats eDP as hardwired-
+	 * connected for the same reason. Here we apply the same treatment to
+	 * the slave half: if the pre-detect AUX probe succeeds (proving the
+	 * panel is actually present and responding via the slave's AUX),
+	 * override the HPD-low `dc_connection_none` to `dc_connection_single`.
+	 *
+	 * Structurally gated: dc_link_is_apple_5k_slave() (inside the helper)
+	 * checks the peer eDP's panel-patch flag, which was set when the root
+	 * EDID identified APP/AE25 or APP/AE26. So this branch never fires on
+	 * any non-Apple-5K-tile DP link.
+	 */
 	if (new_connection_type == dc_connection_none &&
-	    imac5k_secondary_try_pre_detect_aux(link))
+	    apple_5k_slave_try_pre_detect_aux(link))
 		new_connection_type = dc_connection_single;
 
 	prev_sink = link->local_sink;
@@ -1304,7 +1319,7 @@ static bool detect_link_and_local_sink(struct dc_link *link,
 			break;
 		}
 
-		imac5k_primary_write_panel_wake(link);
+		apple_5k_root_write_panel_wake(link);
 
 		// Check if edid is the same
 		if ((prev_sink) &&

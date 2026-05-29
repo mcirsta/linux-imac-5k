@@ -1103,8 +1103,8 @@ enum dc_status dpcd_set_training_pattern(
  * (link_apple_5k_root_panel_latch_pulse) before the first write, and re-assert
  * the wake + retry on write failure.
  */
-#define IMAC5K_LT_REWAKE_SETTLE_MS       60
-#define IMAC5K_LT_MAX_REWAKE_RETRY       4
+#define APPLE_5K_LT_REWAKE_SETTLE_MS       60
+#define APPLE_5K_LT_MAX_REWAKE_RETRY       4
 
 enum dc_status dpcd_set_link_settings(
 	struct dc_link *link,
@@ -1112,8 +1112,8 @@ enum dc_status dpcd_set_link_settings(
 {
 	uint8_t rate;
 	enum dc_status status;
-	bool imac5k_sec = dc_link_is_apple_5k_slave(link);
-	unsigned int imac5k_try = 0;
+	bool apple_5k_sec = dc_link_is_apple_5k_slave(link);
+	unsigned int apple_5k_try = 0;
 	enum dc_status ds_status = DC_OK;
 	enum dc_status lc_status = DC_OK;
 	enum dc_status bw_status = DC_OK;
@@ -1144,9 +1144,9 @@ enum dc_status dpcd_set_link_settings(
 	 * the root panel-latch and settle BEFORE the first attempt so it lands
 	 * cleanly. The retry loop below stays as the safety net.
 	 */
-	if (imac5k_sec) {
+	if (apple_5k_sec) {
 		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
-		msleep(IMAC5K_LT_REWAKE_SETTLE_MS);
+		msleep(APPLE_5K_LT_REWAKE_SETTLE_MS);
 	}
 
 	while (true) {
@@ -1194,19 +1194,19 @@ enum dc_status dpcd_set_link_settings(
 		}
 
 		/* Only the Apple 5K slave retries; common path falls through. */
-		if (!imac5k_sec)
+		if (!apple_5k_sec)
 			break;
 
 		if (ds_status == DC_OK && lc_status == DC_OK &&
 		    bw_status == DC_OK)
 			break;
 
-		if (imac5k_try >= IMAC5K_LT_MAX_REWAKE_RETRY)
+		if (apple_5k_try >= APPLE_5K_LT_MAX_REWAKE_RETRY)
 			break;
 
 		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
-		msleep(IMAC5K_LT_REWAKE_SETTLE_MS);
-		imac5k_try++;
+		msleep(APPLE_5K_LT_REWAKE_SETTLE_MS);
+		apple_5k_try++;
 	}
 
 	if (rate) {

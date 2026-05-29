@@ -77,9 +77,9 @@
 #define MAX_MTP_SLOT_COUNT 64
 #define LINK_TRAINING_ATTEMPTS 4
 #define PEAK_FACTOR_X1000 1006
-#define IMAC5K_DPCD_PANEL_LATCH 0x4F1
+#define APPLE_5K_DPCD_PANEL_LATCH 0x4F1
 
-static void imac5k_secondary_write_panel_latch(struct dc_link *link)
+static void apple_5k_slave_write_panel_latch(struct dc_link *link)
 {
 	uint8_t payload = 1;
 	enum dc_status status;
@@ -87,11 +87,11 @@ static void imac5k_secondary_write_panel_latch(struct dc_link *link)
 	if (!dc_link_is_apple_5k_slave(link) || !link->local_sink)
 		return;
 
-	status = core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+	status = core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
 				      &payload, sizeof(payload));
 	if (status != DC_OK) {
 		msleep(10);
-		core_link_write_dpcd(link, IMAC5K_DPCD_PANEL_LATCH,
+		core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
 				     &payload, sizeof(payload));
 	}
 }
@@ -1094,7 +1094,7 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx)
 				&new_downspread.raw, sizeof(new_downspread));
 		}
 
-		imac5k_secondary_write_panel_latch(link);
+		apple_5k_slave_write_panel_latch(link);
 	} else {
 		dm_helpers_mst_enable_stream_features(stream);
 	}
