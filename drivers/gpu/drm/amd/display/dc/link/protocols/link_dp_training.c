@@ -1101,11 +1101,18 @@ enum dc_status dpcd_set_training_pattern(
 
 static void dp_pre_link_training_wake(struct dc_link *link)
 {
+	enum dc_status status;
+
 	if (!link)
 		return;
 
-	if (dc_link_needs_tiled_slave_root_wake(link))
-		link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
+	if (dc_link_needs_tiled_slave_root_wake(link)) {
+		status = link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
+		DC_LOG_INFO("APPLE5K: root wake 0x4F1 stage=training slave_link[%u] root_link[%d] status=%d\n",
+			    link->link_index,
+			    link->tiled_peer ? (int)link->tiled_peer->link_index : -1,
+			    status);
+	}
 }
 
 static bool dp_prepare_sink_for_link_training(struct dc_link *link,
@@ -1120,16 +1127,26 @@ static bool dp_prepare_sink_for_link_training(struct dc_link *link,
 		return true;
 
 	for (try = 0; try < attempts; try++) {
+		enum dc_status power_status;
+		enum dc_status rev_status;
+
 		dp_pre_link_training_wake(link);
 
-		if (core_link_write_dpcd(link, DP_SET_POWER,
-					 &power_state, sizeof(power_state)) != DC_OK)
+		power_status = core_link_write_dpcd(link, DP_SET_POWER,
+						    &power_state,
+						    sizeof(power_state));
+		if (power_status != DC_OK) {
+			DC_LOG_INFO("APPLE5K: training AUX power write failed link[%u] try=%u status=%d\n",
+				    link->link_index, try, power_status);
 			goto retry;
+		}
 
 		dpcd_rev = 0;
-		if (core_link_read_dpcd(link, DP_DPCD_REV,
-					&dpcd_rev, sizeof(dpcd_rev)) == DC_OK &&
-		    dpcd_rev != 0)
+		rev_status = core_link_read_dpcd(link, DP_DPCD_REV,
+						 &dpcd_rev, sizeof(dpcd_rev));
+		DC_LOG_INFO("APPLE5K: training AUX rev poll link[%u] try=%u status=%d dpcd_rev=0x%02x\n",
+			    link->link_index, try, rev_status, dpcd_rev);
+		if (rev_status == DC_OK && dpcd_rev != 0)
 			return true;
 
 retry:
@@ -1137,6 +1154,8 @@ retry:
 			fsleep(DP_LT_AUX_READY_COOLDOWN_US);
 	}
 
+	DC_LOG_INFO("APPLE5K: training AUX not ready link[%u] attempts=%u\n",
+		    link->link_index, attempts);
 	return false;
 }
 
@@ -1176,6 +1195,21 @@ enum dc_status dpcd_set_link_settings(
 	 * Keep retryable link-config writes tied to observed sink AUX readiness
 	 * instead of a fixed wake delay.
 	 */
+	if (dc_link_needs_tiled_slave_root_wake(link))
+		DC_LOG_INFO("APPLE5K: link-config start link[%u] rate=%d rate_set=%d use_rate_set=%d lanes=%d spread=%d enhanced=%d retries=%u reported_rate=%d reported_lanes=%d verified_rate=%d verified_lanes=%d\n",
+			    link->link_index,
+			    lt_settings->link_settings.link_rate,
+			    lt_settings->link_settings.link_rate_set,
+			    lt_settings->link_settings.use_link_rate_set,
+			    lt_settings->link_settings.lane_count,
+			    lt_settings->link_settings.link_spread,
+			    lt_settings->enhanced_framing,
+			    DP_LT_DPCD_WRITE_RETRIES,
+			    link->reported_link_cap.link_rate,
+			    link->reported_link_cap.lane_count,
+			    link->verified_link_cap.link_rate,
+			    link->verified_link_cap.lane_count);
+
 	while (true) {
 		if (retry_dpcd_writes &&
 		    !dp_prepare_sink_for_link_training(link, 1)) {
@@ -1232,6 +1266,10 @@ enum dc_status dpcd_set_link_settings(
 		if (!retry_dpcd_writes)
 			break;
 
+		DC_LOG_INFO("APPLE5K: link-config write pass link[%u] retry=%u downspread=%d lane_count=%d bandwidth=%d rate_set=%d\n",
+			    link->link_index, retry, ds_status, lc_status,
+			    bw_status, rate_status);
+
 		if (ds_status == DC_OK && lc_status == DC_OK &&
 		    bw_status == DC_OK && rate_status == DC_OK)
 			break;
@@ -1243,6 +1281,11 @@ dpcd_write_retry:
 		fsleep(DP_LT_AUX_READY_COOLDOWN_US);
 		retry++;
 	}
+
+	if (dc_link_needs_tiled_slave_root_wake(link))
+		DC_LOG_INFO("APPLE5K: link-config final link[%u] retry=%u status=%d downspread=%d lane_count=%d bandwidth=%d rate_set=%d rate_byte=0x%02x\n",
+			    link->link_index, retry, status, ds_status,
+			    lc_status, bw_status, rate_status, rate);
 
 	if (rate) {
 		DC_LOG_HW_LINK_TRAINING("%s\n %x rate = %x\n %x lane = %x framing = %x\n %x spread = %x\n",

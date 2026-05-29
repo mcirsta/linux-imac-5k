@@ -80,12 +80,15 @@
 static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 {
 	uint8_t payload = 1;
+	enum dc_status status;
 
 	if (!dc_link_needs_tiled_stream_enable_latch(link) || !link->local_sink)
 		return;
 
-	core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
-			     &payload, sizeof(payload));
+	status = core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
+				      &payload, sizeof(payload));
+	DC_LOG_INFO("APPLE5K: stream-enable latch 0x4F1 link[%u] status=%d value=0x%02x sink=%p\n",
+		    link->link_index, status, payload, link->local_sink);
 }
 
 void link_blank_all_dp_displays(struct dc *dc)

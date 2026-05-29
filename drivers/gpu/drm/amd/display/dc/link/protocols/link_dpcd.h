@@ -45,6 +45,6 @@ enum dc_status core_link_write_dpcd(
  * pre-detect / source-DPCD / link-training paths to wake the panel before
  * touching the slave's AUX. Safe to call with NULL or non-root link — no-op.
  */
-void link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link);
+enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link);
 
 #endif

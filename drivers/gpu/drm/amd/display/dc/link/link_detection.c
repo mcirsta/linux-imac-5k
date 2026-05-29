@@ -106,11 +106,15 @@ static enum ddc_transaction_type get_ddc_transaction_type(enum signal_type sink_
 	return transaction_type;
 }
 
-static void tiled_root_write_panel_wake(struct dc_link *link)
+static enum dc_status tiled_root_write_panel_wake(struct dc_link *link,
+						  const struct dc_link *slave_link,
+						  const char *stage)
 {
+	enum dc_status status;
+
 	if (!dc_link_has_tiled_root_panel_patch(link) ||
 	    !link->ddc || !link->local_sink)
-		return;
+		return DC_OK;
 
 	/* Detection-time only: force the DDC into AUX mode before the latch
 	 * pulse. Unlike the secondary's pre-detect AUX poll, we don't restore
@@ -119,10 +123,20 @@ static void tiled_root_write_panel_wake(struct dc_link *link)
 	set_ddc_transaction_type(link->ddc, DDC_TRANSACTION_TYPE_I2C_OVER_AUX);
 	link->aux_mode = link_is_in_aux_transaction_mode(link->ddc);
 
-	link_apple_5k_root_panel_latch_pulse(link);
+	status = link_apple_5k_root_panel_latch_pulse(link);
+	DC_LOG_INFO("APPLE5K: root wake 0x4F1 stage=%s root_link[%u] slave_link[%d] status=%d root_aux=%d\n",
+		    stage ? stage : "unknown", link->link_index,
+		    slave_link ? (int)slave_link->link_index : -1,
+		    status, link->aux_mode);
+
+	return status;
 }
 
-static bool tiled_slave_try_pre_detect_aux(struct dc_link *link)
+static bool tiled_slave_poll_aux(struct dc_link *link,
+				 struct dc_link *root_link,
+				 const char *stage,
+				 uint8_t *dpcd_rev_out,
+				 unsigned int *elapsed_ms_out)
 {
 	enum ddc_transaction_type old_transaction_type;
 	bool old_aux_mode;
@@ -130,11 +144,16 @@ static bool tiled_slave_try_pre_detect_aux(struct dc_link *link)
 	uint8_t dpcd_rev = 0;
 	unsigned int elapsed_ms;
 
-	if (!dc_link_has_tiled_slave_panel_patch(link) || !link->ddc)
+	if (!link || !link->ddc)
 		return false;
 
 	old_transaction_type = link->ddc->transaction_type;
 	old_aux_mode = link->aux_mode;
+
+	DC_LOG_INFO("APPLE5K: slave AUX poll start stage=%s link[%u] root_link[%d] hpd=%d aux=%d old_transaction=%d\n",
+		    stage ? stage : "unknown", link->link_index,
+		    root_link ? (int)root_link->link_index : -1,
+		    link->hpd_status, link->aux_mode, old_transaction_type);
 
 	set_ddc_transaction_type(link->ddc, DDC_TRANSACTION_TYPE_I2C_OVER_AUX);
 	link->aux_mode = link_is_in_aux_transaction_mode(link->ddc);
@@ -146,16 +165,26 @@ static bool tiled_slave_try_pre_detect_aux(struct dc_link *link)
 	 * slave's AUX stays dead, the poll below times out, and the tile is
 	 * torn down. At initial boot this is an idempotent re-assert.
 	 */
-	if (link->tiled_peer)
-		tiled_root_write_panel_wake(link->tiled_peer);
+	if (root_link)
+		tiled_root_write_panel_wake(root_link, link, stage);
 
 	for (elapsed_ms = 0; ; elapsed_ms += TILED_SLAVE_AUX_WAKE_POLL_MS) {
 		dpcd_rev = 0;
 		status = core_link_read_dpcd(link, DP_DPCD_REV,
 					    &dpcd_rev, sizeof(dpcd_rev));
 
-		if (status == DC_OK && dpcd_rev != 0)
+		DC_LOG_INFO("APPLE5K: slave AUX poll stage=%s link[%u] elapsed_ms=%u status=%d dpcd_rev=0x%02x hpd=%d aux=%d\n",
+			    stage ? stage : "unknown", link->link_index,
+			    elapsed_ms, status, dpcd_rev,
+			    link->hpd_status, link->aux_mode);
+
+		if (status == DC_OK && dpcd_rev != 0) {
+			if (dpcd_rev_out)
+				*dpcd_rev_out = dpcd_rev;
+			if (elapsed_ms_out)
+				*elapsed_ms_out = elapsed_ms;
 			return true;
+		}
 
 		if (elapsed_ms >= TILED_SLAVE_AUX_WAKE_TIMEOUT_MS)
 			break;
@@ -165,6 +194,95 @@ static bool tiled_slave_try_pre_detect_aux(struct dc_link *link)
 
 	set_ddc_transaction_type(link->ddc, old_transaction_type);
 	link->aux_mode = old_aux_mode;
+	if (dpcd_rev_out)
+		*dpcd_rev_out = dpcd_rev;
+	if (elapsed_ms_out)
+		*elapsed_ms_out = elapsed_ms;
+
+	DC_LOG_INFO("APPLE5K: slave AUX poll failed stage=%s link[%u] elapsed_ms=%u last_status=%d last_dpcd_rev=0x%02x restored_transaction=%d restored_aux=%d\n",
+		    stage ? stage : "unknown", link->link_index,
+		    elapsed_ms, status, dpcd_rev,
+		    old_transaction_type, old_aux_mode);
+
+	return false;
+}
+
+static void tiled_slave_rewire_peer(struct dc_link *link, struct dc_link *root_link)
+{
+	struct dc_link *old_peer;
+
+	if (!link || !root_link || root_link->tiled_peer == link)
+		return;
+
+	old_peer = root_link->tiled_peer;
+	if (old_peer)
+		old_peer->tiled_peer = NULL;
+
+	root_link->tiled_peer = link;
+	link->tiled_peer = root_link;
+
+	DC_LOG_INFO("APPLE5K: peer fallback selected root link[%u] old_slave[%d] new_slave[%u]\n",
+		    root_link->link_index,
+		    old_peer ? (int)old_peer->link_index : -1,
+		    link->link_index);
+}
+
+static bool tiled_slave_try_pre_detect_aux(struct dc_link *link)
+{
+	struct dc_link *root_link;
+	uint8_t dpcd_rev = 0;
+	unsigned int elapsed_ms = 0;
+	unsigned int i;
+
+	if (!dc_link_has_tiled_slave_panel_patch(link) || !link->ddc)
+		return false;
+
+	root_link = link->tiled_peer;
+
+	if (tiled_slave_poll_aux(link, root_link, "slave-predetect",
+				&dpcd_rev, &elapsed_ms)) {
+		DC_LOG_INFO("APPLE5K: slave pre-detect AUX success link[%u] root_link[%d] dpcd_rev=0x%02x elapsed_ms=%u\n",
+			    link->link_index,
+			    root_link ? (int)root_link->link_index : -1,
+			    dpcd_rev, elapsed_ms);
+		return true;
+	}
+
+	if (!root_link || !root_link->dc)
+		return false;
+
+	DC_LOG_INFO("APPLE5K: first slave peer link[%u] failed AUX; trying DP sibling fallback candidates from root link[%u]\n",
+		    link->link_index, root_link->link_index);
+
+	for (i = 0; i < root_link->dc->link_count; i++) {
+		struct dc_link *candidate = root_link->dc->links[i];
+
+		if (!candidate || candidate == root_link ||
+		    candidate == link ||
+		    candidate->connector_signal != SIGNAL_TYPE_DISPLAY_PORT ||
+		    !candidate->ddc)
+			continue;
+
+		DC_LOG_INFO("APPLE5K: fallback candidate link[%u] signal=%d internal=%d aux=%d has_sink=%d hpd=%d ddc_hw=%u hpd_src=%u enc=%u eng=%d\n",
+			    candidate->link_index, candidate->connector_signal,
+			    candidate->is_internal_display, candidate->aux_mode,
+			    !!candidate->local_sink, candidate->hpd_status,
+			    candidate->ddc_hw_inst, candidate->hpd_src,
+			    candidate->link_enc_hw_inst, candidate->eng_id);
+
+		if (tiled_slave_poll_aux(candidate, root_link,
+					"slave-predetect-fallback",
+					&dpcd_rev, &elapsed_ms)) {
+			tiled_slave_rewire_peer(candidate, root_link);
+			DC_LOG_INFO("APPLE5K: fallback candidate responded link[%u] dpcd_rev=0x%02x elapsed_ms=%u current_detect_link[%u]\n",
+				    candidate->link_index, dpcd_rev, elapsed_ms,
+				    link->link_index);
+			return candidate == link;
+		}
+	}
+
+	DC_LOG_INFO("APPLE5K: no DP fallback candidate responded for root link[%u]\n",
+		    root_link->link_index);
 	return false;
 }
 
@@ -1082,6 +1200,12 @@ static bool detect_link_and_local_sink(struct dc_link *link,
 		return false;
 	}
 
+	if (dc_link_has_tiled_slave_panel_patch(link))
+		DC_LOG_INFO("APPLE5K: detect connection link[%u] signal=%d reason=%d initial_connection=%d hpd=%d aux=%d root_link[%d]\n",
+			    link->link_index, link->connector_signal, reason,
+			    new_connection_type, link->hpd_status, link->aux_mode,
+			    link->tiled_peer ? (int)link->tiled_peer->link_index : -1);
+
 	/*
 	 * Some internal tiled DP slaves share panel presence with an eDP root
 	 * and may report HPD low. If a bounded AUX probe proves the slave is
@@ -1316,7 +1440,24 @@ static bool detect_link_and_local_sink(struct dc_link *link,
 			break;
 		}
 
-		tiled_root_write_panel_wake(link);
+		if (dc_link_has_tiled_root_panel_patch(link) ||
+		    dc_link_has_tiled_slave_panel_patch(link))
+			DC_LOG_INFO("APPLE5K: EDID read link[%u] status=%d length=%u base_bytes=%*ph ext=%u flags root=%u slave=%u source_dpcd=%u stream_latch=%u prefer_tile=%u reported_rate=%d reported_lanes=%d verified_rate=%d verified_lanes=%d\n",
+				    link->link_index, edid_status,
+				    sink->dc_edid.length, 16,
+				    sink->dc_edid.raw_edid + 8,
+				    sink->dc_edid.raw_edid[126],
+				    sink->edid_caps.panel_patch.tiled_root_force_edid_reread,
+				    sink->edid_caps.panel_patch.tiled_slave_root_wake,
+				    sink->edid_caps.panel_patch.tiled_slave_source_table_rev,
+				    sink->edid_caps.panel_patch.tiled_stream_enable_latch,
+				    sink->edid_caps.panel_patch.prefer_tile_native_mode,
+				    link->reported_link_cap.link_rate,
+				    link->reported_link_cap.lane_count,
+				    link->verified_link_cap.link_rate,
+				    link->verified_link_cap.lane_count);
+
+		tiled_root_write_panel_wake(link, NULL, "post-root-edid");
 
 		// Check if edid is the same
 		if ((prev_sink) &&

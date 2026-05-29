@@ -79,7 +79,10 @@
 #include <linux/power_supply.h>
 #include <linux/firmware.h>
 #include <linux/component.h>
+#include <linux/dmi.h>
+#include <linux/init.h>
 #include <linux/sort.h>
+#include <linux/utsname.h>
 
 #include <drm/drm_privacy_screen_consumer.h>
 #include <drm/display/drm_dp_mst_helper.h>
@@ -227,6 +230,13 @@ static int amdgpu_dm_encoder_init(struct drm_device *dev,
 				  uint32_t link_index);
 
 static int amdgpu_dm_connector_get_modes(struct drm_connector *connector);
+static void amdgpu_dm_log_apple5k_probe_identity(struct amdgpu_device *adev);
+static void amdgpu_dm_log_apple5k_connector_tile(
+		struct amdgpu_dm_connector *aconnector,
+		const char *stage);
+static void amdgpu_dm_log_apple5k_dc_streams(struct drm_device *dev,
+					     const struct dc_state *dc_state,
+					     const char *stage);
 
 static int amdgpu_dm_atomic_setup_commit(struct drm_atomic_state *state);
 static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state);
@@ -2021,6 +2031,7 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
 	if (adev->dm.dc) {
 		drm_info(adev_to_drm(adev), "Display Core v%s initialized on %s\n", DC_VER,
 			 dce_version_to_string(adev->dm.dc->ctx->dce_version));
+		amdgpu_dm_log_apple5k_probe_identity(adev);
 	} else {
 		drm_info(adev_to_drm(adev), "Display Core failed to initialize with v%s!\n", DC_VER);
 		goto error;
@@ -3945,6 +3956,8 @@ void amdgpu_dm_update_connector_after_detect(
 
 		amdgpu_dm_update_freesync_caps(connector, aconnector->drm_edid);
 		update_connector_ext_caps(aconnector);
+		amdgpu_dm_log_apple5k_connector_tile(aconnector,
+						      "connector-update");
 	} else {
 		hdmi_cec_unset_edid(aconnector);
 		drm_dp_cec_unset_edid(&aconnector->dm_dp_aux.aux);
@@ -5609,6 +5622,15 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 		struct dc_link *link = NULL;
 
 		link = dc_get_link_at_index(dm->dc, i);
+		drm_info(adev_to_drm(adev),
+			 "APPLE5K: link inventory pre-detect link[%u] signal=%d internal=%d endpoint=%d link_id=%u:%u:%u ddc_hw=%u hpd_src=%u hpd=%d aux=%d enc=%u eng=%d has_sink=%d has_peer=%d\n",
+			 link->link_index, link->connector_signal,
+			 link->is_internal_display, link->ep_type,
+			 link->link_id.type, link->link_id.id,
+			 link->link_id.enum_id, link->ddc_hw_inst,
+			 link->hpd_src, link->hpd_status, link->aux_mode,
+			 link->link_enc_hw_inst, link->eng_id,
+			 !!link->local_sink, !!link->tiled_peer);
 
 		if (link->connector_signal == SIGNAL_TYPE_VIRTUAL) {
 			struct amdgpu_dm_wb_connector *wbcon = kzalloc_obj(*wbcon);
@@ -8128,6 +8150,174 @@ amdgpu_dm_connector_has_tiled_patch(
 	       amdgpu_dm_connector_has_tiled_slave_patch(aconnector);
 }
 
+static void amdgpu_dm_log_apple5k_probe_identity(struct amdgpu_device *adev)
+{
+	struct drm_device *dev = adev_to_drm(adev);
+	struct atom_context *atom = adev->mode_info.atom_context;
+	const char *product = dmi_get_system_info(DMI_PRODUCT_NAME);
+	const char *board = dmi_get_system_info(DMI_BOARD_NAME);
+	const char *bios = dmi_get_system_info(DMI_BIOS_VERSION);
+	const char *vendor = dmi_get_system_info(DMI_SYS_VENDOR);
+	const char *cmdline = saved_command_line ? saved_command_line : "";
+
+	drm_info(dev,
+		 "APPLE5K: probe identity vendor=\"%s\" product=\"%s\" board=\"%s\" bios=\"%s\" kernel=\"%s\" cmdline=\"%s\" gpu=%04x:%04x subsystem=%04x:%04x rev=%02x family=%d asic=%d dc=%s dce=%s links=%u vbios_pn=\"%s\" vbios_ver=\"%s\" vbios_date=\"%s\"\n",
+		 vendor ? vendor : "unknown",
+		 product ? product : "unknown",
+		 board ? board : "unknown",
+		 bios ? bios : "unknown",
+		 init_utsname()->release,
+		 cmdline,
+		 adev->pdev->vendor, adev->pdev->device,
+		 adev->pdev->subsystem_vendor, adev->pdev->subsystem_device,
+		 adev->pdev->revision, adev->family, adev->asic_type, DC_VER,
+		 adev->dm.dc ? dce_version_to_string(adev->dm.dc->ctx->dce_version) : "none",
+		 adev->dm.dc ? adev->dm.dc->link_count : 0,
+		 atom ? (const char *)atom->vbios_pn : "unknown",
+		 atom ? (const char *)atom->vbios_ver_str : "unknown",
+		 atom ? (const char *)atom->date : "unknown");
+}
+
+static void amdgpu_dm_log_apple5k_connector_tile(
+		struct amdgpu_dm_connector *aconnector,
+		const char *stage)
+{
+	struct drm_connector *connector;
+	struct drm_display_mode *mode;
+	const struct edid *edid = NULL;
+	unsigned int mode_count = 0;
+	unsigned int tile_mode_count = 0;
+	unsigned int preferred_count = 0;
+	int tile_group_id = 0;
+
+	if (!amdgpu_dm_connector_has_tiled_patch(aconnector))
+		return;
+
+	connector = &aconnector->base;
+	if (connector->tile_group)
+		tile_group_id = connector->tile_group->id;
+
+	if (aconnector->drm_edid)
+		edid = drm_edid_raw(aconnector->drm_edid);
+
+	list_for_each_entry(mode, &connector->probed_modes, head) {
+		mode_count++;
+		if (mode->type & DRM_MODE_TYPE_PREFERRED)
+			preferred_count++;
+		if (connector->has_tile &&
+		    mode->hdisplay == connector->tile_h_size &&
+		    mode->vdisplay == connector->tile_v_size)
+			tile_mode_count++;
+	}
+
+	drm_info(connector->dev,
+		 "APPLE5K: tile state stage=%s connector=%s link[%u] signal=%d has_tile=%d single=%d tile_group=%p id=%d grid=%ux%u loc=%u,%u size=%ux%u modes=%u tile_modes=%u preferred=%u status=%d sink=%p drm_edid=%p sink_edid_len=%u\n",
+		 stage ? stage : "unknown", connector->name,
+		 aconnector->dc_link ? aconnector->dc_link->link_index : 0xffffffff,
+		 aconnector->dc_link ? aconnector->dc_link->connector_signal : SIGNAL_TYPE_NONE,
+		 connector->has_tile, connector->tile_is_single_monitor,
+		 connector->tile_group, tile_group_id,
+		 connector->num_h_tile, connector->num_v_tile,
+		 connector->tile_h_loc, connector->tile_v_loc,
+		 connector->tile_h_size, connector->tile_v_size,
+		 mode_count, tile_mode_count, preferred_count, connector->status,
+		 aconnector->dc_sink, aconnector->drm_edid,
+		 aconnector->dc_sink ? aconnector->dc_sink->dc_edid.length : 0);
+
+	if (edid)
+		drm_info(connector->dev,
+			 "APPLE5K: EDID snapshot stage=%s connector=%s link[%u] bytes8_23=%*ph ext=%u product=0x%04x\n",
+			 stage ? stage : "unknown", connector->name,
+			 aconnector->dc_link ? aconnector->dc_link->link_index : 0xffffffff,
+			 16, (const u8 *)edid + 8, edid->extensions,
+			 EDID_PRODUCT_ID(edid));
+}
+
+static void amdgpu_dm_log_apple5k_modes(struct drm_connector *connector,
+					const char *stage)
+{
+	struct amdgpu_dm_connector *aconnector =
+			to_amdgpu_dm_connector(connector);
+	struct drm_display_mode *mode;
+	unsigned int mode_count = 0;
+
+	if (!amdgpu_dm_connector_has_tiled_patch(aconnector))
+		return;
+
+	list_for_each_entry(mode, &connector->probed_modes, head) {
+		bool tile_match = amdgpu_dm_mode_matches_tile_size(connector, mode);
+
+		mode_count++;
+		drm_info(connector->dev,
+			 "APPLE5K: mode stage=%s connector=%s link[%u] name=\"%s\" %dx%d@%d clock=%d preferred=%d tile_match=%d type=0x%x flags=0x%x htotal=%d vtotal=%d\n",
+			 stage ? stage : "unknown", connector->name,
+			 aconnector->dc_link ? aconnector->dc_link->link_index : 0xffffffff,
+			 mode->name, mode->hdisplay, mode->vdisplay,
+			 drm_mode_vrefresh(mode), mode->clock,
+			 !!(mode->type & DRM_MODE_TYPE_PREFERRED),
+			 tile_match, mode->type, mode->flags,
+			 mode->htotal, mode->vtotal);
+	}
+
+	drm_info(connector->dev,
+		 "APPLE5K: mode summary stage=%s connector=%s modes=%u has_tile=%d tile_size=%ux%u\n",
+		 stage ? stage : "unknown", connector->name, mode_count,
+		 connector->has_tile, connector->tile_h_size,
+		 connector->tile_v_size);
+}
+
+static void amdgpu_dm_log_apple5k_dc_streams(struct drm_device *dev,
+					     const struct dc_state *dc_state,
+					     const char *stage)
+{
+	bool has_apple5k_stream = false;
+	unsigned int i;
+
+	if (!dc_state)
+		return;
+
+	for (i = 0; i < dc_state->stream_count; i++) {
+		const struct dc_stream_state *stream = dc_state->streams[i];
+		const struct dc_link *link = stream ? stream->link : NULL;
+
+		if (link && (dc_link_has_tiled_root_panel_patch(link) ||
+			     dc_link_has_tiled_slave_panel_patch(link))) {
+			has_apple5k_stream = true;
+			break;
+		}
+	}
+
+	if (!has_apple5k_stream)
+		return;
+
+	drm_info(dev, "APPLE5K: stream state stage=%s stream_count=%u\n",
+		 stage ? stage : "unknown", dc_state->stream_count);
+
+	for (i = 0; i < dc_state->stream_count; i++) {
+		const struct dc_stream_state *stream = dc_state->streams[i];
+		const struct dc_link *link = stream ? stream->link : NULL;
+		const struct dc_stream_state *master =
+			stream ? stream->triggered_crtc_reset.event_source : NULL;
+
+		if (!stream || !link)
+			continue;
+
+		drm_info(dev,
+			 "APPLE5K: stream[%u] stage=%s link[%u] signal=%d timing=%ux%u total=%ux%u pixclk_100hz=%u src=%d,%d %dx%d dst=%d,%d %dx%d sync_enabled=%d master_link[%d] event=%d delay=%d\n",
+			 i, stage ? stage : "unknown", link->link_index,
+			 stream->signal, stream->timing.h_addressable,
+			 stream->timing.v_addressable, stream->timing.h_total,
+			 stream->timing.v_total, stream->timing.pix_clk_100hz,
+			 stream->src.x, stream->src.y, stream->src.width,
+			 stream->src.height, stream->dst.x, stream->dst.y,
+			 stream->dst.width, stream->dst.height,
+			 stream->triggered_crtc_reset.enabled,
+			 master && master->link ? (int)master->link->link_index : -1,
+			 stream->triggered_crtc_reset.event,
+			 stream->triggered_crtc_reset.delay);
+	}
+}
+
 static bool
 amdgpu_dm_connector_is_tiled_slave_tile(
 		const struct amdgpu_dm_connector *aconnector)
@@ -8210,6 +8400,12 @@ amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev)
 	struct amdgpu_dm_connector *secondary = NULL;
 	struct dc_link *primary_link;
 	struct dc_sink *sink;
+	u8 old_edid_bytes[16] = {0};
+	u8 new_edid_bytes[16] = {0};
+	u16 old_product = 0;
+	u16 new_product = 0;
+	unsigned int old_len = 0;
+	const char *reread_result;
 
 	drm_connector_list_iter_begin(dev, &iter);
 	drm_for_each_connector_iter(connector, &iter) {
@@ -8226,25 +8422,85 @@ amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev)
 	}
 	drm_connector_list_iter_end(&iter);
 
-	if (!primary || !secondary)
+	if (!primary || !secondary) {
+		drm_info(dev,
+			 "APPLE5K: root re-read skipped primary=%p secondary=%p\n",
+			 primary, secondary);
 		return;
+	}
 
 	/* Re-read only after the slave exposes tile metadata. */
-	if (!amdgpu_dm_connector_is_tiled_slave_tile(secondary))
+	if (!amdgpu_dm_connector_is_tiled_slave_tile(secondary)) {
+		drm_info(dev,
+			 "APPLE5K: root re-read waiting for slave tile secondary=%s has_tile=%d loc=%u,%u grid=%ux%u size=%ux%u\n",
+			 secondary->base.name, secondary->base.has_tile,
+			 secondary->base.tile_h_loc, secondary->base.tile_v_loc,
+			 secondary->base.num_h_tile, secondary->base.num_v_tile,
+			 secondary->base.tile_h_size, secondary->base.tile_v_size);
+		amdgpu_dm_log_apple5k_connector_tile(secondary,
+						      "slave-before-root-reread");
 		return;
+	}
 
 	primary_link = primary->dc_link;
-	if (!primary_link || !primary_link->local_sink)
+	if (!primary_link || !primary_link->local_sink) {
+		drm_info(dev,
+			 "APPLE5K: root re-read skipped missing primary link/sink link=%p sink=%p\n",
+			 primary_link, primary_link ? primary_link->local_sink : NULL);
 		return;
+	}
 	sink = primary_link->local_sink;
 
-	if (primary->base.has_tile)
+	amdgpu_dm_log_apple5k_connector_tile(secondary,
+					      "slave-before-root-reread");
+	amdgpu_dm_log_apple5k_connector_tile(primary,
+					      "root-before-reread");
+
+	if (primary->base.has_tile) {
+		drm_info(dev,
+			 "APPLE5K: root re-read skipped primary already tile connector=%s loc=%u,%u grid=%ux%u size=%ux%u\n",
+			 primary->base.name, primary->base.tile_h_loc,
+			 primary->base.tile_v_loc, primary->base.num_h_tile,
+			 primary->base.num_v_tile, primary->base.tile_h_size,
+			 primary->base.tile_v_size);
 		return;
+	}
+
+	old_len = sink->dc_edid.length;
+	if (old_len >= 24) {
+		memcpy(old_edid_bytes, sink->dc_edid.raw_edid + 8,
+		       sizeof(old_edid_bytes));
+		old_product = sink->dc_edid.raw_edid[10] |
+			      (sink->dc_edid.raw_edid[11] << 8);
+	}
 
 	mutex_lock(&dm->dc_lock);
 	dc_exit_ips_for_hw_access(dm->dc);
 	dm_helpers_read_local_edid(primary_link->ctx, primary_link, sink);
 	mutex_unlock(&dm->dc_lock);
+
+	if (sink->dc_edid.length >= 24) {
+		memcpy(new_edid_bytes, sink->dc_edid.raw_edid + 8,
+		       sizeof(new_edid_bytes));
+		new_product = sink->dc_edid.raw_edid[10] |
+			      (sink->dc_edid.raw_edid[11] << 8);
+	}
+
+	if (!sink->dc_edid.length)
+		reread_result = "READ_FAILED";
+	else if (old_len != sink->dc_edid.length ||
+		 (old_len >= 24 &&
+		  memcmp(old_edid_bytes, new_edid_bytes,
+			 sizeof(old_edid_bytes))))
+		reread_result = "CHANGED";
+	else
+		reread_result = "UNCHANGED";
+
+	drm_info(dev,
+		 "APPLE5K: root re-read raw result connector=%s link[%u] old_len=%u new_len=%u old_product=0x%04x new_product=0x%04x old_bytes8_23=%*ph new_bytes8_23=%*ph result=%s\n",
+		 primary->base.name, primary_link->link_index, old_len,
+		 sink->dc_edid.length, old_product, new_product,
+		 16, old_edid_bytes, 16, new_edid_bytes, reread_result);
 
 	/* Keep aconnector->drm_edid (the cache consumed by get_modes) coherent
 	 * with the freshly-read sink EDID. */
@@ -8254,7 +8510,13 @@ amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev)
 
 		drm_edid_free(primary->drm_edid);
 		primary->drm_edid = drm_edid_alloc(edid, sink->dc_edid.length);
+		mutex_lock(&dev->mode_config.mutex);
+		drm_edid_connector_update(&primary->base, primary->drm_edid);
+		mutex_unlock(&dev->mode_config.mutex);
 	}
+
+	amdgpu_dm_log_apple5k_connector_tile(primary,
+					      "root-post-reread");
 }
 
 struct dc_stream_state *
@@ -8377,8 +8639,16 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
 		return result;
 
 	if (amdgpu_dm_connector_is_tiled_slave_tile(aconnector) &&
-	    !amdgpu_dm_mode_matches_tile_size(connector, mode))
+	    !amdgpu_dm_mode_matches_tile_size(connector, mode)) {
+		drm_info(connector->dev,
+			 "APPLE5K: mode_valid slave reject connector=%s link[%u] mode=\"%s\" %dx%d clock=%d tile_size=%ux%u result=%d\n",
+			 connector->name,
+			 aconnector->dc_link ? aconnector->dc_link->link_index : 0xffffffff,
+			 mode->name, mode->hdisplay, mode->vdisplay,
+			 mode->clock, connector->tile_h_size,
+			 connector->tile_v_size, MODE_PANEL);
 		return MODE_PANEL;
+	}
 
 	/*
 	 * Only run this the first time mode_valid is called to initilialize
@@ -8415,6 +8685,19 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
 	}
 
 fail:
+	if (amdgpu_dm_connector_has_tiled_patch(aconnector))
+		drm_info(connector->dev,
+			 "APPLE5K: mode_valid connector=%s link[%u] mode=\"%s\" %dx%d@%d clock=%d tile_match=%d has_tile=%d result=%d reported_rate=%d reported_lanes=%d verified_rate=%d verified_lanes=%d\n",
+			 connector->name,
+			 aconnector->dc_link ? aconnector->dc_link->link_index : 0xffffffff,
+			 mode->name, mode->hdisplay, mode->vdisplay,
+			 drm_mode_vrefresh(mode), mode->clock,
+			 amdgpu_dm_mode_matches_tile_size(connector, mode),
+			 connector->has_tile, result,
+			 aconnector->dc_link ? aconnector->dc_link->reported_link_cap.link_rate : 0,
+			 aconnector->dc_link ? aconnector->dc_link->reported_link_cap.lane_count : 0,
+			 aconnector->dc_link ? aconnector->dc_link->verified_link_cap.link_rate : 0,
+			 aconnector->dc_link ? aconnector->dc_link->verified_link_cap.lane_count : 0);
 	/* TODO: error handling*/
 	return result;
 }
@@ -9124,6 +9407,9 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 	}
 
 	amdgpu_dm_make_tile_mode_preferred(connector);
+	amdgpu_dm_log_apple5k_modes(connector, "get-modes");
+	amdgpu_dm_log_apple5k_connector_tile(amdgpu_dm_connector,
+					      "get-modes");
 
 	amdgpu_dm_fbc_init(connector);
 
@@ -10763,9 +11049,11 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 	}
 
 	dm_enable_per_frame_crtc_master_sync(dc_state);
+	amdgpu_dm_log_apple5k_dc_streams(dev, dc_state, "commit-after-sync");
 	mutex_lock(&dm->dc_lock);
 	dc_exit_ips_for_hw_access(dm->dc);
 	WARN_ON(!dc_commit_streams(dm->dc, &params));
+	amdgpu_dm_log_apple5k_dc_streams(dev, dc_state, "commit-after-dc");
 
 	/* Allow idle optimization when vblank count is 0 for display off */
 	if ((dm->active_vblank_irq_count == 0) && amdgpu_dm_is_headless(dm->adev))
@@ -13746,6 +14034,8 @@ void amdgpu_dm_trigger_timing_sync(struct drm_device *dev)
 				adev->dm.force_timing_sync;
 
 		dm_enable_per_frame_crtc_master_sync(dc->current_state);
+		amdgpu_dm_log_apple5k_dc_streams(dev, dc->current_state,
+						  "manual-trigger-sync");
 		dc_trigger_sync(dc, dc->current_state);
 	}
 	mutex_unlock(&adev->dm.dc_lock);
