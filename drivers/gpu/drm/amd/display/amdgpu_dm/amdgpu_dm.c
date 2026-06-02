@@ -8152,6 +8152,58 @@ amdgpu_dm_connector_has_tiled_patch(
 	       amdgpu_dm_connector_has_tiled_slave_patch(aconnector);
 }
 
+static const char *amdgpu_dm_apple5k_color_space_name(enum dc_color_space color_space)
+{
+	switch (color_space) {
+	case COLOR_SPACE_UNKNOWN:
+		return "UNKNOWN";
+	case COLOR_SPACE_SRGB:
+		return "SRGB";
+	case COLOR_SPACE_XR_RGB:
+		return "XR_RGB";
+	case COLOR_SPACE_SRGB_LIMITED:
+		return "SRGB_LIMITED";
+	case COLOR_SPACE_MSREF_SCRGB:
+		return "MSREF_SCRGB";
+	case COLOR_SPACE_YCBCR601:
+		return "YCBCR601";
+	case COLOR_SPACE_YCBCR709:
+		return "YCBCR709";
+	case COLOR_SPACE_XV_YCC_709:
+		return "XV_YCC_709";
+	case COLOR_SPACE_XV_YCC_601:
+		return "XV_YCC_601";
+	case COLOR_SPACE_YCBCR601_LIMITED:
+		return "YCBCR601_LIMITED";
+	case COLOR_SPACE_YCBCR709_LIMITED:
+		return "YCBCR709_LIMITED";
+	case COLOR_SPACE_2020_RGB_FULLRANGE:
+		return "2020_RGB_FULLRANGE";
+	case COLOR_SPACE_2020_RGB_LIMITEDRANGE:
+		return "2020_RGB_LIMITEDRANGE";
+	case COLOR_SPACE_2020_YCBCR_LIMITED:
+		return "2020_YCBCR_LIMITED";
+	case COLOR_SPACE_2020_YCBCR_FULL:
+		return "2020_YCBCR_FULL";
+	case COLOR_SPACE_ADOBERGB:
+		return "ADOBERGB";
+	case COLOR_SPACE_DCIP3:
+		return "DCIP3";
+	case COLOR_SPACE_DISPLAYNATIVE:
+		return "DISPLAYNATIVE";
+	case COLOR_SPACE_DOLBYVISION:
+		return "DOLBYVISION";
+	case COLOR_SPACE_APPCTRL:
+		return "APPCTRL";
+	case COLOR_SPACE_CUSTOMPOINTS:
+		return "CUSTOMPOINTS";
+	case COLOR_SPACE_YCBCR709_BLACK:
+		return "YCBCR709_BLACK";
+	default:
+		return "unknown";
+	}
+}
+
 static void amdgpu_dm_log_apple5k_probe_identity(struct amdgpu_device *adev)
 {
 	struct drm_device *dev = adev_to_drm(adev);
@@ -8303,11 +8355,16 @@ static void amdgpu_dm_log_apple5k_dc_streams(struct drm_device *dev,
 			continue;
 
 		drm_info(dev,
-			 "APPLE5K: stream[%u] stage=%s link[%u] signal=%d timing=%ux%u total=%ux%u pixclk_100hz=%u src=%d,%d %dx%d dst=%d,%d %dx%d sync_enabled=%d master_link[%d] event=%d delay=%d\n",
+			 "APPLE5K: stream[%u] stage=%s link[%u] signal=%d timing=%ux%u total=%ux%u pixclk_100hz=%u pixel_encoding=%s color_depth=%s output_bpc=%d dc_colorspace=%s(%d) src=%d,%d %dx%d dst=%d,%d %dx%d sync_enabled=%d master_link[%d] event=%d delay=%d\n",
 			 i, stage ? stage : "unknown", link->link_index,
 			 stream->signal, stream->timing.h_addressable,
 			 stream->timing.v_addressable, stream->timing.h_total,
 			 stream->timing.v_total, stream->timing.pix_clk_100hz,
+			 dc_pixel_encoding_to_str(stream->timing.pixel_encoding),
+			 dc_color_depth_to_str(stream->timing.display_color_depth),
+			 convert_dc_color_depth_into_bpc(stream->timing.display_color_depth),
+			 amdgpu_dm_apple5k_color_space_name(stream->output_color_space),
+			 stream->output_color_space,
 			 stream->src.x, stream->src.y, stream->src.width,
 			 stream->src.height, stream->dst.x, stream->dst.y,
 			 stream->dst.width, stream->dst.height,
@@ -8316,6 +8373,55 @@ static void amdgpu_dm_log_apple5k_dc_streams(struct drm_device *dev,
 			 stream->triggered_crtc_reset.event,
 			 stream->triggered_crtc_reset.delay);
 	}
+}
+
+static void amdgpu_dm_log_apple5k_stream_color(
+		struct drm_connector *connector,
+		const struct drm_display_mode *drm_mode,
+		const struct dc_stream_state *stream,
+		const struct drm_connector_state *drm_state,
+		int requested_bpc,
+		enum dc_status dc_result,
+		const char *stage)
+{
+	struct amdgpu_dm_connector *aconnector;
+	const struct dc_link *link;
+
+	if (!connector || !stream ||
+	    connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK)
+		return;
+
+	aconnector = to_amdgpu_dm_connector(connector);
+	if (!amdgpu_dm_connector_has_tiled_patch(aconnector))
+		return;
+
+	link = aconnector->dc_link;
+	drm_info(connector->dev,
+		 "APPLE5K: color stream stage=%s connector=%s link[%u] link_signal=%d stream_signal=%d mode=\"%s\" timing=%ux%u total=%ux%u pixclk_100hz=%u requested_bpc=%d drm_max_bpc=%d drm_max_requested_bpc=%d edid_bpc=%u color_formats=0x%x ycbcr420_allowed=%d force_yuv422=%d force_yuv420=%d drm_colorspace=%s(%d) dc_colorspace=%s(%d) pixel_encoding=%s color_depth=%s output_bpc=%d status=%s(%d)\n",
+		 stage ? stage : "unknown", connector->name,
+		 link ? link->link_index : 0xffffffff,
+		 link ? link->connector_signal : SIGNAL_TYPE_NONE,
+		 stream->signal,
+		 drm_mode ? drm_mode->name : "unknown",
+		 stream->timing.h_addressable, stream->timing.v_addressable,
+		 stream->timing.h_total, stream->timing.v_total,
+		 stream->timing.pix_clk_100hz,
+		 requested_bpc,
+		 drm_state ? (int)drm_state->max_bpc : -1,
+		 drm_state ? (int)drm_state->max_requested_bpc : -1,
+		 connector->display_info.bpc,
+		 connector->display_info.color_formats,
+		 connector->ycbcr_420_allowed,
+		 aconnector->force_yuv422_output,
+		 aconnector->force_yuv420_output,
+		 drm_state ? drm_get_colorspace_name(drm_state->colorspace) : "none",
+		 drm_state ? drm_state->colorspace : -1,
+		 amdgpu_dm_apple5k_color_space_name(stream->output_color_space),
+		 stream->output_color_space,
+		 dc_pixel_encoding_to_str(stream->timing.pixel_encoding),
+		 dc_color_depth_to_str(stream->timing.display_color_depth),
+		 convert_dc_color_depth_into_bpc(stream->timing.display_color_depth),
+		 dc_status_to_str(dc_result), dc_result);
 }
 
 static bool
@@ -8573,10 +8679,17 @@ create_validate_stream_for_sink(struct drm_connector *connector,
 				      dc_pixel_encoding_to_str(stream->timing.pixel_encoding),
 				      dc_color_depth_to_str(stream->timing.display_color_depth),
 				      dc_status_to_str(dc_result));
+			amdgpu_dm_log_apple5k_stream_color(connector, drm_mode, stream,
+							   drm_state, requested_bpc,
+							   dc_result, "validate-pruned");
 
 			dc_stream_release(stream);
 			stream = NULL;
 			requested_bpc -= 2; /* lower bpc to retry validation */
+		} else {
+			amdgpu_dm_log_apple5k_stream_color(connector, drm_mode, stream,
+							   drm_state, requested_bpc,
+							   dc_result, "validate-ok");
 		}
 
 	} while (stream == NULL && requested_bpc >= bpc_limit);
