@@ -226,6 +226,8 @@ static void apply_edid_quirks(struct drm_device *dev,
 	 * Apple 27" 5K dual-tile internal panel (iMac15,1 / 17,1 / 18,3 / 19,1 / 20,x / iMacPro1,1).
 	 * Older family: AE01 root-compat, AE02 tile identity.
 	 * iMac17,1 family: AE05 root-compat, AE06 tile identity.
+	 * iMac18,3 family: AE11 root-compat, AE12 tile identity; AE13 is the
+	 * DisplayID tiled-display product ID, not a base EDID panel ID.
 	 * iMac Pro family: AE1D root-compat, AE1E tile identity.
 	 * Newer family: AE25 root-compat, AE26 tile identity.
 	 * 2020 family: AE31 root-compat, AE32 tile identity; AE33 is the
@@ -237,6 +239,8 @@ static void apply_edid_quirks(struct drm_device *dev,
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE02):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE05):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE06):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE11):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE12):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE1D):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE1E):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE25):
