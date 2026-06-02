@@ -223,14 +223,17 @@ static void apply_edid_quirks(struct drm_device *dev,
 		edid_caps->panel_patch.disable_colorimetry = true;
 		break;
 	/*
-	 * Apple 27" 5K dual-tile internal panel (iMac15,1 / 17,1 / 18,3 / 19,1).
+	 * Apple 27" 5K dual-tile internal panel (iMac15,1 / 17,1 / 18,3 / 19,1 / iMacPro1,1).
 	 * Older family: AE01 root-compat, AE02 tile identity.
+	 * iMac Pro family: AE1D root-compat, AE1E tile identity.
 	 * Newer family: AE25 root-compat, AE26 tile identity.
 	 * Role discrimination is by connector_signal (eDP=root, DP=slave) — not by
 	 * panel-id alone, since the primary can flip after the wake.
 	 */
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE01):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE02):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE1D):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE1E):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE25):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE26):
 		if (connector_signal == SIGNAL_TYPE_EDP) {
