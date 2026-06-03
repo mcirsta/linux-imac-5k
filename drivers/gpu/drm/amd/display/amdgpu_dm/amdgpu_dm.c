@@ -8318,6 +8318,36 @@ static void amdgpu_dm_log_apple5k_modes(struct drm_connector *connector,
 		 connector->tile_v_size);
 }
 
+static const char * const amdgpu_dm_apple5k_drm_colorspace_names[] = {
+	[DRM_MODE_COLORIMETRY_DEFAULT] = "Default",
+	[DRM_MODE_COLORIMETRY_SMPTE_170M_YCC] = "SMPTE_170M_YCC",
+	[DRM_MODE_COLORIMETRY_BT709_YCC] = "BT709_YCC",
+	[DRM_MODE_COLORIMETRY_XVYCC_601] = "XVYCC_601",
+	[DRM_MODE_COLORIMETRY_XVYCC_709] = "XVYCC_709",
+	[DRM_MODE_COLORIMETRY_SYCC_601] = "SYCC_601",
+	[DRM_MODE_COLORIMETRY_OPYCC_601] = "opYCC_601",
+	[DRM_MODE_COLORIMETRY_OPRGB] = "opRGB",
+	[DRM_MODE_COLORIMETRY_BT2020_CYCC] = "BT2020_CYCC",
+	[DRM_MODE_COLORIMETRY_BT2020_RGB] = "BT2020_RGB",
+	[DRM_MODE_COLORIMETRY_BT2020_YCC] = "BT2020_YCC",
+	[DRM_MODE_COLORIMETRY_DCI_P3_RGB_D65] = "DCI-P3_RGB_D65",
+	[DRM_MODE_COLORIMETRY_DCI_P3_RGB_THEATER] = "DCI-P3_RGB_Theater",
+	[DRM_MODE_COLORIMETRY_RGB_WIDE_FIXED] = "RGB_WIDE_FIXED",
+	[DRM_MODE_COLORIMETRY_RGB_WIDE_FLOAT] = "RGB_WIDE_FLOAT",
+	[DRM_MODE_COLORIMETRY_BT601_YCC] = "BT601_YCC",
+};
+
+static const char *
+amdgpu_dm_apple5k_drm_colorspace_name(enum drm_colorspace colorspace)
+{
+	if ((unsigned int)colorspace <
+	    ARRAY_SIZE(amdgpu_dm_apple5k_drm_colorspace_names) &&
+	    amdgpu_dm_apple5k_drm_colorspace_names[colorspace])
+		return amdgpu_dm_apple5k_drm_colorspace_names[colorspace];
+
+	return "(null)";
+}
+
 static void amdgpu_dm_log_apple5k_dc_streams(struct drm_device *dev,
 					     const struct dc_state *dc_state,
 					     const char *stage)
@@ -8385,6 +8415,7 @@ static void amdgpu_dm_log_apple5k_stream_color(
 		const char *stage)
 {
 	struct amdgpu_dm_connector *aconnector;
+	const char *drm_colorspace_name = "none";
 	const struct dc_link *link;
 
 	if (!connector || !stream ||
@@ -8396,6 +8427,10 @@ static void amdgpu_dm_log_apple5k_stream_color(
 		return;
 
 	link = aconnector->dc_link;
+	if (drm_state)
+		drm_colorspace_name =
+			amdgpu_dm_apple5k_drm_colorspace_name(drm_state->colorspace);
+
 	drm_info(connector->dev,
 		 "APPLE5K: color stream stage=%s connector=%s link[%u] link_signal=%d stream_signal=%d mode=\"%s\" timing=%ux%u total=%ux%u pixclk_100hz=%u requested_bpc=%d drm_max_bpc=%d drm_max_requested_bpc=%d edid_bpc=%u color_formats=0x%x ycbcr420_allowed=%d force_yuv422=%d force_yuv420=%d drm_colorspace=%s(%d) dc_colorspace=%s(%d) pixel_encoding=%s color_depth=%s output_bpc=%d status=%s(%d)\n",
 		 stage ? stage : "unknown", connector->name,
@@ -8414,7 +8449,7 @@ static void amdgpu_dm_log_apple5k_stream_color(
 		 connector->ycbcr_420_allowed,
 		 aconnector->force_yuv422_output,
 		 aconnector->force_yuv420_output,
-		 drm_state ? drm_get_colorspace_name(drm_state->colorspace) : "none",
+		 drm_colorspace_name,
 		 drm_state ? drm_state->colorspace : -1,
 		 amdgpu_dm_apple5k_color_space_name(stream->output_color_space),
 		 stream->output_color_space,
