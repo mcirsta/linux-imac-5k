@@ -8460,6 +8460,117 @@ static void amdgpu_dm_log_apple5k_stream_color(
 }
 
 static bool
+amdgpu_dm_stream_has_apple5k_patch(const struct dc_stream_state *stream)
+{
+	const struct dc_link *link = stream ? stream->link : NULL;
+
+	return link &&
+	       (dc_link_has_tiled_root_panel_patch(link) ||
+		dc_link_has_tiled_slave_panel_patch(link));
+}
+
+static const char *amdgpu_dm_apple5k_plane_type_name(enum drm_plane_type type)
+{
+	switch (type) {
+	case DRM_PLANE_TYPE_OVERLAY:
+		return "overlay";
+	case DRM_PLANE_TYPE_PRIMARY:
+		return "primary";
+	case DRM_PLANE_TYPE_CURSOR:
+		return "cursor";
+	default:
+		return "unknown";
+	}
+}
+
+static void amdgpu_dm_log_apple5k_plane_state(
+		struct drm_device *dev,
+		const char *stage,
+		const struct dm_crtc_state *dm_crtc_state,
+		const struct drm_crtc *crtc,
+		const struct drm_plane *plane,
+		const struct drm_plane_state *old_state,
+		const struct drm_plane_state *new_state,
+		const struct dc_plane_state *dc_plane)
+{
+	const struct dc_stream_state *stream;
+	const struct dc_link *link;
+	const struct drm_framebuffer *fb;
+	const struct drm_framebuffer *old_fb;
+	uint32_t format = 0;
+	uint64_t modifier = 0;
+	unsigned int fb_id = 0;
+	unsigned int old_fb_id = 0;
+	unsigned int fb_width = 0;
+	unsigned int fb_height = 0;
+
+	if (!dev || !dm_crtc_state || !new_state)
+		return;
+
+	stream = dm_crtc_state->stream;
+	if (!amdgpu_dm_stream_has_apple5k_patch(stream))
+		return;
+
+	link = stream->link;
+	fb = new_state->fb;
+	old_fb = old_state ? old_state->fb : NULL;
+
+	if (fb) {
+		fb_id = fb->base.id;
+		fb_width = fb->width;
+		fb_height = fb->height;
+		format = fb->format ? fb->format->format : 0;
+		modifier = fb->modifier;
+	}
+
+	if (old_fb)
+		old_fb_id = old_fb->base.id;
+
+	drm_info(dev,
+		 "APPLE5K: plane state stage=%s link[%u] signal=%d stream_timing=%ux%u stream_src=%d,%d %dx%d stream_dst=%d,%d %dx%d crtc=%s(%u) crtc_mode=%ux%u active_planes=%u update_type=%d plane=%s(%u) type=%s zpos=%u normalized_zpos=%u fb=%u old_fb=%u fb_size=%ux%u fb_format=0x%08x modifier=0x%016llx drm_src_fixed=%u,%u %ux%u drm_src=%u,%u %ux%u drm_dst=%d,%d %ux%u dc_src=%d,%d %dx%d dc_dst=%d,%d %dx%d dc_clip=%d,%d %dx%d dc_format=%d dc_rotation=%d dc_layer=%d dc_visible=%d rotation=0x%x alpha=0x%x blend=%u\n",
+		 stage ? stage : "unknown", link->link_index, stream->signal,
+		 stream->timing.h_addressable, stream->timing.v_addressable,
+		 stream->src.x, stream->src.y, stream->src.width,
+		 stream->src.height, stream->dst.x, stream->dst.y,
+		 stream->dst.width, stream->dst.height,
+		 crtc && crtc->name ? crtc->name : "none",
+		 crtc ? crtc->base.id : 0,
+		 (unsigned int)dm_crtc_state->base.mode.hdisplay,
+		 (unsigned int)dm_crtc_state->base.mode.vdisplay,
+		 dm_crtc_state->active_planes, dm_crtc_state->update_type,
+		 plane && plane->name ? plane->name : "none",
+		 plane ? plane->base.id : 0,
+		 plane ? amdgpu_dm_apple5k_plane_type_name(plane->type) : "none",
+		 new_state->zpos, new_state->normalized_zpos,
+		 fb_id, old_fb_id, fb_width, fb_height, format,
+		 (unsigned long long)modifier,
+		 new_state->src_x, new_state->src_y,
+		 new_state->src_w, new_state->src_h,
+		 new_state->src_x >> 16, new_state->src_y >> 16,
+		 new_state->src_w >> 16, new_state->src_h >> 16,
+		 new_state->crtc_x, new_state->crtc_y,
+		 new_state->crtc_w, new_state->crtc_h,
+		 dc_plane ? dc_plane->src_rect.x : 0,
+		 dc_plane ? dc_plane->src_rect.y : 0,
+		 dc_plane ? dc_plane->src_rect.width : 0,
+		 dc_plane ? dc_plane->src_rect.height : 0,
+		 dc_plane ? dc_plane->dst_rect.x : 0,
+		 dc_plane ? dc_plane->dst_rect.y : 0,
+		 dc_plane ? dc_plane->dst_rect.width : 0,
+		 dc_plane ? dc_plane->dst_rect.height : 0,
+		 dc_plane ? dc_plane->clip_rect.x : 0,
+		 dc_plane ? dc_plane->clip_rect.y : 0,
+		 dc_plane ? dc_plane->clip_rect.width : 0,
+		 dc_plane ? dc_plane->clip_rect.height : 0,
+		 dc_plane ? dc_plane->format : 0,
+		 dc_plane ? dc_plane->rotation : 0,
+		 dc_plane ? dc_plane->layer_index : 0,
+		 dc_plane ? dc_plane->visible : 0,
+		 new_state->rotation, (unsigned int)new_state->alpha,
+		 (unsigned int)new_state->pixel_blend_mode);
+}
+
+static bool
 amdgpu_dm_connector_is_tiled_slave_tile(
 		const struct amdgpu_dm_connector *aconnector)
 {
@@ -12713,6 +12824,15 @@ static int dm_update_plane_state(struct dc *dc,
 		if (!dm_old_crtc_state->stream)
 			return 0;
 
+		amdgpu_dm_log_apple5k_plane_state(old_plane_crtc->dev,
+						  "atomic-disable",
+						  dm_old_crtc_state,
+						  old_plane_crtc,
+						  plane,
+						  old_plane_state,
+						  new_plane_state,
+						  dm_old_plane_state->dc_state);
+
 		drm_dbg_atomic(old_plane_crtc->dev, "Disabling DRM plane: %d on DRM crtc %d\n",
 				plane->base.id, old_plane_crtc->base.id);
 
@@ -12778,6 +12898,15 @@ static int dm_update_plane_state(struct dc *dc,
 			dc_plane_state_release(dc_new_plane_state);
 			goto out;
 		}
+
+		amdgpu_dm_log_apple5k_plane_state(new_plane_crtc->dev,
+						  "atomic-enable",
+						  dm_new_crtc_state,
+						  new_plane_crtc,
+						  plane,
+						  old_plane_state,
+						  new_plane_state,
+						  dc_new_plane_state);
 
 		ret = dm_atomic_get_state(state, &dm_state);
 		if (ret) {
