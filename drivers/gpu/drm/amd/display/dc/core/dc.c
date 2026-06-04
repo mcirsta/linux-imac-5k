@@ -1623,6 +1623,75 @@ static void enable_timing_multisync(
 	}
 }
 
+static bool apple5k_stream_needs_tiled_pair_force_sync(
+		const struct dc_stream_state *stream)
+{
+	return stream &&
+	       dc_link_needs_tiled_pair_force_sync_group(stream->link);
+}
+
+static bool apple5k_streams_are_tiled_pair(
+		const struct dc_stream_state *stream1,
+		const struct dc_stream_state *stream2)
+{
+	const struct dc_link *link1 = stream1 ? stream1->link : NULL;
+	const struct dc_link *link2 = stream2 ? stream2->link : NULL;
+
+	if (!link1 || !link2 || link1 == link2)
+		return false;
+
+	if (!dc_link_needs_tiled_pair_force_sync_group(link1) &&
+	    !dc_link_needs_tiled_pair_force_sync_group(link2))
+		return false;
+
+	if (link1->tiled_peer != link2 && link2->tiled_peer != link1)
+		return false;
+
+	return (link1->connector_signal == SIGNAL_TYPE_EDP &&
+		link2->connector_signal == SIGNAL_TYPE_DISPLAY_PORT) ||
+	       (link1->connector_signal == SIGNAL_TYPE_DISPLAY_PORT &&
+		link2->connector_signal == SIGNAL_TYPE_EDP);
+}
+
+static bool apple5k_streams_syncable_as_tiled_pair(
+		struct dc_stream_state *stream1,
+		struct dc_stream_state *stream2)
+{
+	if (!apple5k_streams_are_tiled_pair(stream1, stream2))
+		return false;
+
+	if (stream1->timing.h_total != stream2->timing.h_total)
+		return false;
+
+	if (stream1->timing.v_total != stream2->timing.v_total)
+		return false;
+
+	if (stream1->timing.h_addressable != stream2->timing.h_addressable)
+		return false;
+
+	if (stream1->timing.v_addressable != stream2->timing.v_addressable)
+		return false;
+
+	if (stream1->timing.v_front_porch != stream2->timing.v_front_porch)
+		return false;
+
+	if (stream1->timing.pix_clk_100hz != stream2->timing.pix_clk_100hz)
+		return false;
+
+	if (stream1->clamping.c_depth != stream2->clamping.c_depth)
+		return false;
+
+	if (stream1->phy_pix_clk != stream2->phy_pix_clk &&
+	    (!dc_is_dp_signal(stream1->signal) ||
+	     !dc_is_dp_signal(stream2->signal)))
+		return false;
+
+	if (stream1->view_format != stream2->view_format)
+		return false;
+
+	return true;
+}
+
 static void program_timing_sync(
 		struct dc *dc,
 		struct dc_state *ctx)
@@ -1659,9 +1728,15 @@ static void program_timing_sync(
 		for (j = i + 1; j < pipe_count; j++) {
 			bool timing_sync = false;
 			bool vblank_sync = false;
+			bool apple5k_pair = false;
+			bool apple5k_force_sync = false;
 
 			if (!unsynced_pipes[j])
 				continue;
+
+			apple5k_pair = apple5k_streams_are_tiled_pair(
+					unsynced_pipes[j]->stream,
+					pipe_set[0]->stream);
 
 			if (sync_type != TIMING_SYNCHRONIZABLE &&
 			    dc->hwss.enable_vblanks_synchronization &&
@@ -1670,12 +1745,57 @@ static void program_timing_sync(
 						unsynced_pipes[j]->stream,
 						pipe_set[0]->stream);
 
-			if (sync_type != VBLANK_SYNCHRONIZABLE)
+			if (sync_type != VBLANK_SYNCHRONIZABLE) {
 				timing_sync = resource_are_streams_timing_synchronizable(
 						unsynced_pipes[j]->stream,
 						pipe_set[0]->stream);
 
-			if (sync_type != TIMING_SYNCHRONIZABLE &&
+				if (!timing_sync)
+					apple5k_force_sync =
+						apple5k_streams_syncable_as_tiled_pair(
+							unsynced_pipes[j]->stream,
+							pipe_set[0]->stream);
+			}
+
+			if (apple5k_pair) {
+				const struct dc_link *candidate_link =
+					unsynced_pipes[j]->stream->link;
+				const struct dc_link *base_link =
+					pipe_set[0]->stream->link;
+
+				DC_LOG_INFO("APPLE5K: timing-sync candidate pipe=%d/%d link[%u]/[%u] signal=%d/%d h=%u/%u v=%u/%u total=%ux%u/%ux%u pixclk=%u/%u phyclk=%d/%d ignore_msa=%u/%u vblank_ok=%u timing_ok=%u force_ok=%u current_sync_type=%d\n",
+					    unsynced_pipes[j]->pipe_idx,
+					    pipe_set[0]->pipe_idx,
+					    candidate_link->link_index,
+					    base_link->link_index,
+					    candidate_link->connector_signal,
+					    base_link->connector_signal,
+					    unsynced_pipes[j]->stream->timing.h_addressable,
+					    pipe_set[0]->stream->timing.h_addressable,
+					    unsynced_pipes[j]->stream->timing.v_addressable,
+					    pipe_set[0]->stream->timing.v_addressable,
+					    unsynced_pipes[j]->stream->timing.h_total,
+					    unsynced_pipes[j]->stream->timing.v_total,
+					    pipe_set[0]->stream->timing.h_total,
+					    pipe_set[0]->stream->timing.v_total,
+					    unsynced_pipes[j]->stream->timing.pix_clk_100hz,
+					    pipe_set[0]->stream->timing.pix_clk_100hz,
+					    unsynced_pipes[j]->stream->phy_pix_clk,
+					    pipe_set[0]->stream->phy_pix_clk,
+					    unsynced_pipes[j]->stream->ignore_msa_timing_param,
+					    pipe_set[0]->stream->ignore_msa_timing_param,
+					    vblank_sync, timing_sync,
+					    apple5k_force_sync, sync_type);
+			}
+
+			if (apple5k_pair &&
+			    sync_type != VBLANK_SYNCHRONIZABLE &&
+			    (timing_sync || apple5k_force_sync)) {
+				sync_type = TIMING_SYNCHRONIZABLE;
+				pipe_set[group_size] = unsynced_pipes[j];
+				unsynced_pipes[j] = NULL;
+				group_size++;
+			} else if (sync_type != TIMING_SYNCHRONIZABLE &&
 			    vblank_sync) {
 				sync_type = VBLANK_SYNCHRONIZABLE;
 				pipe_set[group_size] = unsynced_pipes[j];
@@ -1721,6 +1841,25 @@ static void program_timing_sync(
 				status->timing_sync_info.master = true;
 			else
 				status->timing_sync_info.master = false;
+
+			if (apple5k_stream_needs_tiled_pair_force_sync(pipe_set[k]->stream)) {
+				const struct dc_link *link = pipe_set[k]->stream->link;
+
+				DC_LOG_INFO("APPLE5K: timing-sync result pipe=%d link[%u] group_id=%d group_size=%d master=%u sync_type=%d force_group=%u ignore_msa=%u timing=%ux%u total=%ux%u pixclk=%u\n",
+					    pipe_set[k]->pipe_idx,
+					    link ? link->link_index : 0xffffffff,
+					    status->timing_sync_info.group_id,
+					    status->timing_sync_info.group_size,
+					    status->timing_sync_info.master,
+					    sync_type,
+					    dc_link_needs_tiled_pair_force_sync_group(link),
+					    pipe_set[k]->stream->ignore_msa_timing_param,
+					    pipe_set[k]->stream->timing.h_addressable,
+					    pipe_set[k]->stream->timing.v_addressable,
+					    pipe_set[k]->stream->timing.h_total,
+					    pipe_set[k]->stream->timing.v_total,
+					    pipe_set[k]->stream->timing.pix_clk_100hz);
+			}
 		}
 
 		/* remove any other unblanked pipes as they have already been synced */
@@ -1755,6 +1894,15 @@ static void program_timing_sync(
 		}
 
 		if (group_size > 1) {
+			if (apple5k_stream_needs_tiled_pair_force_sync(pipe_set[0]->stream) ||
+			    apple5k_stream_needs_tiled_pair_force_sync(pipe_set[1]->stream))
+				DC_LOG_INFO("APPLE5K: timing-sync apply group_index=%d final_group_size=%d sync_type=%d first_link[%u] second_link[%u]\n",
+					    group_index, group_size, sync_type,
+					    pipe_set[0]->stream && pipe_set[0]->stream->link ?
+						    pipe_set[0]->stream->link->link_index : 0xffffffff,
+					    pipe_set[1]->stream && pipe_set[1]->stream->link ?
+						    pipe_set[1]->stream->link->link_index : 0xffffffff);
+
 			if (sync_type == TIMING_SYNCHRONIZABLE) {
 				dc->hwss.enable_timing_synchronization(
 					dc, ctx, group_index, group_size, pipe_set);

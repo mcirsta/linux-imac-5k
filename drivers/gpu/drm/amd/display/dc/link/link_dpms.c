@@ -1097,10 +1097,15 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx)
 		struct dc_link *link = stream->link;
 		union down_spread_ctrl old_downspread;
 		union down_spread_ctrl new_downspread;
+		enum dc_status read_status;
+		enum dc_status write_status = DC_OK;
+		bool apple5k_link =
+			dc_link_needs_tiled_pair_force_sync_group(link) ||
+			dc_link_needs_tiled_stream_enable_latch(link);
 
 		memset(&old_downspread, 0, sizeof(old_downspread));
 
-		core_link_read_dpcd(link, DP_DOWNSPREAD_CTRL,
+		read_status = core_link_read_dpcd(link, DP_DOWNSPREAD_CTRL,
 				&old_downspread.raw, sizeof(old_downspread));
 
 		new_downspread.raw = old_downspread.raw;
@@ -1109,9 +1114,17 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx)
 				(stream->ignore_msa_timing_param) ? 1 : 0;
 
 		if (new_downspread.raw != old_downspread.raw) {
-			core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
+			write_status = core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
 				&new_downspread.raw, sizeof(new_downspread));
 		}
+
+		if (apple5k_link)
+			DC_LOG_INFO("APPLE5K: stream feature 0x107 link[%u] read_status=%d old=0x%02x new=0x%02x changed=%u write_status=%d ignore_msa=%u\n",
+				    link->link_index, read_status,
+				    old_downspread.raw, new_downspread.raw,
+				    new_downspread.raw != old_downspread.raw,
+				    write_status,
+				    stream->ignore_msa_timing_param);
 
 		dp_write_tiled_stream_enable_latch(link);
 	} else {
