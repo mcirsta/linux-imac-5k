@@ -497,6 +497,21 @@ static void dce110_stream_encoder_dp_set_stream_attribute(
 				hw_crtc_timing.h_addressable + hw_crtc_timing.h_border_right,
 				DP_MSA_VHEIGHT, hw_crtc_timing.v_border_top +
 				hw_crtc_timing.v_addressable + hw_crtc_timing.v_border_bottom);
+
+		/* APPLE5K P2 probe: per-tile DP MSA (engine 5=eDP/left, 4=DP/right).
+		 * A "stretched" tile shows a wrong hwidth/hstart vs the other tile. */
+		DC_LOG_INFO("APPLE5K-PROBE: MSA eng=%d enc=%d depth=%d cs=%d active=%ux%u total=%ux%u hstart=%u vstart=%u hwidth=%u vheight=%u hsync=%u vsync=%u misc0=0x%02x misc1=0x%02x\n",
+			    enc->id, hw_crtc_timing.pixel_encoding,
+			    hw_crtc_timing.display_color_depth, output_color_space,
+			    hw_crtc_timing.h_addressable, hw_crtc_timing.v_addressable,
+			    hw_crtc_timing.h_total, hw_crtc_timing.v_total,
+			    h_active_start, v_active_start,
+			    hw_crtc_timing.h_border_left + hw_crtc_timing.h_addressable +
+				    hw_crtc_timing.h_border_right,
+			    hw_crtc_timing.v_border_top + hw_crtc_timing.v_addressable +
+				    hw_crtc_timing.v_border_bottom,
+			    hw_crtc_timing.h_sync_width, hw_crtc_timing.v_sync_width,
+			    misc0, misc1);
 	}
 }
 
@@ -912,6 +927,12 @@ static void dce110_stream_encoder_dp_blank(
 	 * HBLANK and will result in a white line flash across the
 	 * screen on stream disable. */
 	REG_GET(DP_VID_STREAM_CNTL, DP_VID_STREAM_ENABLE, &reg1);
+
+	/* APPLE5K P1 probe: catch a tile being blanked. If the DP/right tile
+	 * (eng=4) gets blanked with no later unblank, that is the stretch. */
+	DC_LOG_INFO("APPLE5K-PROBE: dp_blank eng=%d was_enabled=%u\n",
+		    enc->id, reg1 & 0x1);
+
 	if ((reg1 & 0x1) == 0)
 		/*stream not enabled*/
 		return;
@@ -1007,6 +1028,16 @@ static void dce110_stream_encoder_dp_unblank(
 	*/
 
 	REG_UPDATE(DP_VID_STREAM_CNTL, DP_VID_STREAM_ENABLE, true);
+
+	/* APPLE5K P1 probe: confirm the stream actually latched enabled per tile. */
+	{
+		uint32_t reg_en = 0;
+
+		REG_GET(DP_VID_STREAM_CNTL, DP_VID_STREAM_ENABLE, &reg_en);
+		DC_LOG_INFO("APPLE5K-PROBE: dp_unblank eng=%d enable_readback=%u pixclk_100hz=%u link_rate=%d\n",
+			    enc->id, reg_en, param->timing.pix_clk_100hz,
+			    param->link_settings.link_rate);
+	}
 }
 
 static void dce110_stream_encoder_set_avmute(
