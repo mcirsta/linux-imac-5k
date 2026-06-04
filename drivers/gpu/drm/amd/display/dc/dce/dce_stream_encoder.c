@@ -292,6 +292,32 @@ static void dce110_stream_encoder_dp_set_stream_attribute(
 		hw_crtc_timing.v_front_porch /= 2;
 		hw_crtc_timing.v_sync_width /= 2;
 	}
+
+	/* APPLE5K P2 probe: per-tile geometry that determines DP MSA. Logged
+	 * unconditionally here because the in-HW MSA block below is gated on a
+	 * register that is not populated on every DCE ASIC (e.g. Polaris). For a
+	 * single-tile state, the panel stretches if hwidth/active is full-width
+	 * instead of the 2560 tile width. engine 5=eDP/left, 4=DP/right. */
+	h_blank = hw_crtc_timing.h_total - hw_crtc_timing.h_border_left -
+		  hw_crtc_timing.h_addressable - hw_crtc_timing.h_border_right;
+	h_back_porch = h_blank - hw_crtc_timing.h_front_porch -
+		       hw_crtc_timing.h_sync_width;
+	h_active_start = hw_crtc_timing.h_sync_width + h_back_porch;
+	v_active_start = hw_crtc_timing.v_total - hw_crtc_timing.v_border_top -
+			 hw_crtc_timing.v_addressable - hw_crtc_timing.v_border_bottom -
+			 hw_crtc_timing.v_front_porch;
+	DC_LOG_INFO("APPLE5K-PROBE: MSA eng=%d depth=%d cs=%d active=%ux%u total=%ux%u hstart=%u vstart=%u hwidth=%u vheight=%u hsync=%u vsync=%u front_porch=%u/%u\n",
+		    enc->id, hw_crtc_timing.display_color_depth, output_color_space,
+		    hw_crtc_timing.h_addressable, hw_crtc_timing.v_addressable,
+		    hw_crtc_timing.h_total, hw_crtc_timing.v_total,
+		    h_active_start, v_active_start,
+		    hw_crtc_timing.h_border_left + hw_crtc_timing.h_addressable +
+			    hw_crtc_timing.h_border_right,
+		    hw_crtc_timing.v_border_top + hw_crtc_timing.v_addressable +
+			    hw_crtc_timing.v_border_bottom,
+		    hw_crtc_timing.h_sync_width, hw_crtc_timing.v_sync_width,
+		    hw_crtc_timing.h_front_porch, hw_crtc_timing.v_front_porch);
+
 	/* set pixel encoding */
 	switch (hw_crtc_timing.pixel_encoding) {
 	case PIXEL_ENCODING_YCBCR422:
@@ -497,21 +523,6 @@ static void dce110_stream_encoder_dp_set_stream_attribute(
 				hw_crtc_timing.h_addressable + hw_crtc_timing.h_border_right,
 				DP_MSA_VHEIGHT, hw_crtc_timing.v_border_top +
 				hw_crtc_timing.v_addressable + hw_crtc_timing.v_border_bottom);
-
-		/* APPLE5K P2 probe: per-tile DP MSA (engine 5=eDP/left, 4=DP/right).
-		 * A "stretched" tile shows a wrong hwidth/hstart vs the other tile. */
-		DC_LOG_INFO("APPLE5K-PROBE: MSA eng=%d enc=%d depth=%d cs=%d active=%ux%u total=%ux%u hstart=%u vstart=%u hwidth=%u vheight=%u hsync=%u vsync=%u misc0=0x%02x misc1=0x%02x\n",
-			    enc->id, hw_crtc_timing.pixel_encoding,
-			    hw_crtc_timing.display_color_depth, output_color_space,
-			    hw_crtc_timing.h_addressable, hw_crtc_timing.v_addressable,
-			    hw_crtc_timing.h_total, hw_crtc_timing.v_total,
-			    h_active_start, v_active_start,
-			    hw_crtc_timing.h_border_left + hw_crtc_timing.h_addressable +
-				    hw_crtc_timing.h_border_right,
-			    hw_crtc_timing.v_border_top + hw_crtc_timing.v_addressable +
-				    hw_crtc_timing.v_border_bottom,
-			    hw_crtc_timing.h_sync_width, hw_crtc_timing.v_sync_width,
-			    misc0, misc1);
 	}
 }
 
