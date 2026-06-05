@@ -98,6 +98,42 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 		    link->local_sink);
 }
 
+/*
+ * APPLE5K sink-status probe: the source side (MSA, routing, latch) is proven
+ * identical between the working iMac19,1 and the failing iMacPro1,1, so read
+ * the PANEL side at stream enable. "Left tile stretched" = the panel composes
+ * only the eDP tile, so if the DP/slave tile's sink lanes are not symbol-locked
+ * / interlane-align not done, the panel never accepted that tile. Runs for both
+ * tiled links so the working vs broken machines can be diffed per tile.
+ */
+static void apple5k_log_sink_link_status(struct dc_link *link)
+{
+	uint8_t lane_status[4] = { 0 };	/* 0x202 0x203 0x204 0x205 */
+	uint8_t edp_cfg = 0;		/* 0x10A ASSR/panel-mode */
+	uint8_t lane_count = 0;		/* 0x101 lane count set */
+	uint8_t downspread = 0;		/* 0x107 MSA-ignore */
+	uint8_t latch[3] = { 0 };	/* 0x4F0 0x4F1 0x4F2 Apple-private */
+
+	if (!link || !link->local_sink ||
+	    (!dc_link_has_tiled_root_panel_patch(link) &&
+	     !dc_link_has_tiled_slave_panel_patch(link)))
+		return;
+
+	DC_LOGGER_INIT(link->ctx->logger);
+
+	core_link_read_dpcd(link, DP_LANE0_1_STATUS, lane_status, sizeof(lane_status));
+	core_link_read_dpcd(link, DP_EDP_CONFIGURATION_SET, &edp_cfg, sizeof(edp_cfg));
+	core_link_read_dpcd(link, DP_LANE_COUNT_SET, &lane_count, sizeof(lane_count));
+	core_link_read_dpcd(link, DP_DOWNSPREAD_CTRL, &downspread, sizeof(downspread));
+	core_link_read_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH - 1, latch, sizeof(latch));
+
+	DC_LOG_INFO("APPLE5K: sink-status link[%u] signal=%d lane01=0x%02x lane23=0x%02x align=0x%02x sink=0x%02x assr_0x10a=0x%02x lanes_0x101=%u msa_0x107=0x%02x latch_4f0_4f2=%02x %02x %02x\n",
+		    link->link_index, link->connector_signal,
+		    lane_status[0], lane_status[1], lane_status[2], lane_status[3],
+		    edp_cfg, lane_count & 0x1f, downspread,
+		    latch[0], latch[1], latch[2]);
+}
+
 void link_blank_all_dp_displays(struct dc *dc)
 {
 	unsigned int i;
@@ -1097,6 +1133,7 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx)
 		}
 
 		dp_write_tiled_stream_enable_latch(link);
+		apple5k_log_sink_link_status(link);
 	} else {
 		dm_helpers_mst_enable_stream_features(stream);
 	}
