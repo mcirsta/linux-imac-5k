@@ -194,7 +194,6 @@ struct dc_panel_patch {
 	unsigned int tiled_slave_root_wake;          /* DP slave: pulse root 0x4F1 before AUX */
 	unsigned int tiled_slave_source_table_rev;   /* DP slave: publish source-DPCD 0x310 = 04 1d 03 */
 	unsigned int tiled_root_force_edid_reread;   /* eDP root: re-read EDID after slave exposes tile metadata */
-	unsigned int tiled_pair_force_sync_group;    /* force timing-sync grouping for the tile pair */
 	unsigned int tiled_stream_enable_latch;      /* DP slave: 0x4F1=1 at stream-enable */
 };
 

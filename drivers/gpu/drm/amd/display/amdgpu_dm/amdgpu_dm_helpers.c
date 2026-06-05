@@ -249,18 +249,16 @@ static void apply_edid_quirks(struct drm_device *dev,
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE32):
 		if (connector_signal == SIGNAL_TYPE_EDP) {
 			edid_caps->panel_patch.tiled_root_force_edid_reread = 1;
-			edid_caps->panel_patch.tiled_pair_force_sync_group = 1;
 			edid_caps->panel_patch.prefer_tile_native_mode = 1;
 		} else if (connector_signal == SIGNAL_TYPE_DISPLAY_PORT) {
 			edid_caps->panel_patch.tiled_slave_root_wake = 1;
 			edid_caps->panel_patch.tiled_slave_source_table_rev = 1;
-			edid_caps->panel_patch.tiled_pair_force_sync_group = 1;
 			edid_caps->panel_patch.tiled_stream_enable_latch = 1;
 			edid_caps->panel_patch.aux_ready_before_link_training = 1;
 			edid_caps->panel_patch.prefer_tile_native_mode = 1;
 		}
 		drm_info(dev,
-			 "APPLE5K: panel match base=%s panel_id=0x%X signal=%d link[%u] name=\"%s\" ext=%u tags=%s flags root_reread=%u slave_wake=%u source_dpcd=%u force_sync=%u stream_latch=%u aux_ready=%u prefer_tile=%u\n",
+			 "APPLE5K: panel match base=%s panel_id=0x%X signal=%d link[%u] name=\"%s\" ext=%u tags=%s flags root_reread=%u slave_wake=%u source_dpcd=%u stream_latch=%u aux_ready=%u prefer_tile=%u\n",
 			 panel, panel_id, connector_signal,
 			 link ? link->link_index : 0xffffffff,
 			 edid_caps->display_name, edid->extensions,
@@ -268,7 +266,6 @@ static void apply_edid_quirks(struct drm_device *dev,
 			 edid_caps->panel_patch.tiled_root_force_edid_reread,
 			 edid_caps->panel_patch.tiled_slave_root_wake,
 			 edid_caps->panel_patch.tiled_slave_source_table_rev,
-			 edid_caps->panel_patch.tiled_pair_force_sync_group,
 			 edid_caps->panel_patch.tiled_stream_enable_latch,
 			 edid_caps->panel_patch.aux_ready_before_link_training,
 			 edid_caps->panel_patch.prefer_tile_native_mode);

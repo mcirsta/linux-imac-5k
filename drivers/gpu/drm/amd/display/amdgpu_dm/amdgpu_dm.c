@@ -8385,7 +8385,7 @@ static void amdgpu_dm_log_apple5k_dc_streams(struct drm_device *dev,
 			continue;
 
 		drm_info(dev,
-			 "APPLE5K: stream[%u] stage=%s link[%u] signal=%d timing=%ux%u total=%ux%u pixclk_100hz=%u pixel_encoding=%s color_depth=%s output_bpc=%d dc_colorspace=%s(%d) src=%d,%d %dx%d dst=%d,%d %dx%d ignore_msa=%d sync_enabled=%d master_link[%d] event=%d delay=%d\n",
+			 "APPLE5K: stream[%u] stage=%s link[%u] signal=%d timing=%ux%u total=%ux%u pixclk_100hz=%u pixel_encoding=%s color_depth=%s output_bpc=%d dc_colorspace=%s(%d) src=%d,%d %dx%d dst=%d,%d %dx%d sync_enabled=%d master_link[%d] event=%d delay=%d\n",
 			 i, stage ? stage : "unknown", link->link_index,
 			 stream->signal, stream->timing.h_addressable,
 			 stream->timing.v_addressable, stream->timing.h_total,
@@ -8398,7 +8398,6 @@ static void amdgpu_dm_log_apple5k_dc_streams(struct drm_device *dev,
 			 stream->src.x, stream->src.y, stream->src.width,
 			 stream->src.height, stream->dst.x, stream->dst.y,
 			 stream->dst.width, stream->dst.height,
-			 stream->ignore_msa_timing_param,
 			 stream->triggered_crtc_reset.enabled,
 			 master && master->link ? (int)master->link->link_index : -1,
 			 stream->triggered_crtc_reset.event,
@@ -12150,20 +12149,6 @@ static void get_freesync_config_for_crtc(
 		new_crtc_state->stream->freesync_on_desktop = false;
 	}
 out:
-	if (dc_link_needs_tiled_pair_force_sync_group(aconnector->dc_link) &&
-	    amdgpu_dm_mode_matches_tile_size(new_con_state->base.connector, mode)) {
-		drm_info(new_con_state->base.connector->dev,
-			 "APPLE5K: stream MSA-ignore connector=%s link[%u] mode=\"%s\" tile=%ux%u old=%u new=1 freesync_supported=%u\n",
-			 new_con_state->base.connector->name,
-			 aconnector->dc_link ? aconnector->dc_link->link_index : 0xffffffff,
-			 mode->name,
-			 new_con_state->base.connector->tile_h_size,
-			 new_con_state->base.connector->tile_v_size,
-			 new_crtc_state->stream->ignore_msa_timing_param,
-			 new_crtc_state->vrr_supported);
-		new_crtc_state->stream->ignore_msa_timing_param = true;
-	}
-
 	new_crtc_state->freesync_config = config;
 }
 
