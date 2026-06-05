@@ -2770,6 +2770,21 @@ static inline bool dc_link_needs_tiled_stream_enable_latch(const struct dc_link 
 	       patch->tiled_stream_enable_latch;
 }
 
+static inline bool dc_link_needs_tiled_pair_force_sync_group(const struct dc_link *link)
+{
+	const struct dc_panel_patch *patch;
+
+	if (!link)
+		return false;
+
+	patch = dc_link_get_panel_patch(link);
+	if (patch && patch->tiled_pair_force_sync_group)
+		return true;
+
+	patch = dc_link_get_panel_patch(link->tiled_peer);
+	return patch && patch->tiled_pair_force_sync_group;
+}
+
 static inline bool dc_link_prefers_tile_native_mode(const struct dc_link *link)
 {
 	const struct dc_panel_patch *patch = dc_link_get_panel_patch(link);

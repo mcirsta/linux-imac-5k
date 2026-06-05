@@ -1442,7 +1442,7 @@ static bool detect_link_and_local_sink(struct dc_link *link,
 
 		if (dc_link_has_tiled_root_panel_patch(link) ||
 		    dc_link_has_tiled_slave_panel_patch(link))
-			DC_LOG_INFO("APPLE5K: EDID read link[%u] status=%d length=%u base_bytes=%*ph ext=%u flags root=%u slave=%u source_dpcd=%u stream_latch=%u prefer_tile=%u reported_rate=%d reported_lanes=%d verified_rate=%d verified_lanes=%d\n",
+			DC_LOG_INFO("APPLE5K: EDID read link[%u] status=%d length=%u base_bytes=%*ph ext=%u flags root=%u slave=%u source_dpcd=%u force_sync=%u stream_latch=%u prefer_tile=%u reported_rate=%d reported_lanes=%d verified_rate=%d verified_lanes=%d\n",
 				    link->link_index, edid_status,
 				    sink->dc_edid.length, 16,
 				    sink->dc_edid.raw_edid + 8,
@@ -1450,6 +1450,7 @@ static bool detect_link_and_local_sink(struct dc_link *link,
 				    sink->edid_caps.panel_patch.tiled_root_force_edid_reread,
 				    sink->edid_caps.panel_patch.tiled_slave_root_wake,
 				    sink->edid_caps.panel_patch.tiled_slave_source_table_rev,
+				    sink->edid_caps.panel_patch.tiled_pair_force_sync_group,
 				    sink->edid_caps.panel_patch.tiled_stream_enable_latch,
 				    sink->edid_caps.panel_patch.prefer_tile_native_mode,
 				    link->reported_link_cap.link_rate,
