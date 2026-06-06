@@ -170,17 +170,12 @@ static bool dce_is_panel_powered_on(struct panel_cntl *panel_cntl)
 
 	powered_on = (pwr_seq_state == 1) || (dig_on == 1 && dig_on_ovrd == 1);
 
-	/*
-	 * APPLE5K: log the RAW 32-bit LVTMA power-sequencer registers as well as
-	 * the decoded fields, so an unexpected Vega bit layout or field-definition
-	 * mismatch is visible (not just the decoded view). On the iMacPro1,1
-	 * (DCE12/Vega) this reads "off" while the panel is lit, which makes
-	 * dce110_edp_power_control skip the panel power-off and leaves the tiled
-	 * TCON wedged in single-tile (stretched) mode.
-	 */
+	/* APPLE5K: expose both resolved MMIO addresses and raw register values. */
 	DC_LOG_HW_RESUME_S3(
-		"APPLE5K: LVTMA PWRSEQ_STATE=0x%08x PWRSEQ_CNTL=0x%08x target_state=%u DIGON=%u DIGON_OVRD=%u powered_on=%d\n",
-		REG_READ(PWRSEQ_STATE), REG_READ(PWRSEQ_CNTL),
+		"APPLE5K: panel regs PWRSEQ_STATE[0x%08x]=0x%08x PWRSEQ_CNTL[0x%08x]=0x%08x PWRSEQ_REF_DIV[0x%08x] BIOS_SCRATCH_2[0x%08x] target_state=%u DIGON=%u DIGON_OVRD=%u powered_on=%d\n",
+		REG(PWRSEQ_STATE), REG_READ(PWRSEQ_STATE),
+		REG(PWRSEQ_CNTL), REG_READ(PWRSEQ_CNTL),
+		REG(PWRSEQ_REF_DIV), REG(BIOS_SCRATCH_2),
 		pwr_seq_state, dig_on, dig_on_ovrd, powered_on);
 
 	return powered_on;

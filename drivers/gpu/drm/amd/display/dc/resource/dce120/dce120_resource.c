@@ -142,6 +142,21 @@ static const struct dce110_timing_generator_offsets dce120_tg_offsets[] = {
 	.reg_name = BASE(mm ## block ## id ## _ ## reg_name ## _BASE_IDX) + \
 					mm ## block ## id ## _ ## reg_name
 
+#define DCE120_PANEL_CNTL_SR(reg_name, block)\
+	.reg_name = BASE(mm ## block ## _ ## reg_name ## _BASE_IDX) + \
+					mm ## block ## _ ## reg_name
+
+#define DCE120_PANEL_CNTL_REG_LIST()\
+	DCE120_PANEL_CNTL_SR(PWRSEQ_CNTL, LVTMA), \
+	DCE120_PANEL_CNTL_SR(PWRSEQ_STATE, LVTMA), \
+	DCE120_PANEL_CNTL_SR(PWRSEQ_REF_DIV, LVTMA), \
+	SR(BL_PWM_CNTL), \
+	SR(BL_PWM_CNTL2), \
+	SR(BL_PWM_PERIOD_CNTL), \
+	SR(BL_PWM_GRP1_REG_LOCK), \
+	.BIOS_SCRATCH_2 = NBIO_BASE(mmBIOS_SCRATCH_2_BASE_IDX) + \
+					mmBIOS_SCRATCH_2
+
 /* MMHUB */
 #define MMHUB_BASE_INNER(seg) \
 	MMHUB_BASE__INST0_SEG ## seg
@@ -294,7 +309,7 @@ static const struct dce_stream_encoder_mask se_mask = {
 };
 
 static const struct dce_panel_cntl_registers panel_cntl_regs[] = {
-	{ DCE_PANEL_CNTL_REG_LIST() }
+	{ DCE120_PANEL_CNTL_REG_LIST() }
 };
 
 static const struct dce_panel_cntl_shift panel_cntl_shift = {
