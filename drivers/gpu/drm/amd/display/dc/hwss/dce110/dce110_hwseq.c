@@ -768,6 +768,7 @@ void dce110_edp_power_control(
 	struct bp_transmitter_control cntl = { 0 };
 	enum bp_result bp_result;
 	uint8_t pwrseq_instance;
+	bool panel_on, force_off, log_lvtma;
 
 
 	if (dal_graphics_object_id_get_connector_id(link->link_enc->connector)
@@ -778,8 +779,28 @@ void dce110_edp_power_control(
 
 	if (!link->panel_cntl)
 		return;
-	if (power_up !=
-		link->panel_cntl->funcs->is_panel_powered_on(link->panel_cntl)) {
+
+	/*
+	 * APPLE5K: the iMacPro1,1 (DCE12/Vega) eDP LVTMA power-sequencer reads as
+	 * powered-off even while the panel is lit, so the skip below never powers
+	 * the panel off and the tiled TCON is never reset -- it stays in the
+	 * stretched single-tile mode until a physical power-off. Force the OFF
+	 * request only, and only on the DCE12 Apple-5K tiled root link, so the
+	 * existing BIOS power-off / T12 wait / power-on sequence runs. The ON
+	 * request is left untouched (so the required power-on is never skipped),
+	 * and DCE<12 (incl. iMac19,1) and non-tiled panels are unaffected.
+	 */
+	log_lvtma = link->ctx->dce_version == DCE_VERSION_12_0 &&
+		    dc_link_has_tiled_root_panel_patch(link);
+	panel_on = link->panel_cntl->funcs->is_panel_powered_on(link->panel_cntl);
+	force_off = !power_up && log_lvtma;
+
+	if (force_off)
+		DC_LOG_HW_RESUME_S3(
+			"%s: APPLE5K: forcing Panel Power OFF on DCE12 tiled root (is_panel_powered_on=%d)\n",
+			__func__, panel_on);
+
+	if (power_up != panel_on || force_off) {
 
 		unsigned long long current_ts = dm_get_timestamp(ctx);
 		unsigned long long time_since_edp_poweroff_ms =
@@ -842,6 +863,11 @@ void dce110_edp_power_control(
 				"%s: BEGIN: Panel Power action: %s\n",
 				__func__, (power_up ? "On":"Off"));
 
+		/* APPLE5K: LVTMA readback just before the BIOS power command
+		 * (after any T12 wait) -- logs via is_panel_powered_on. */
+		if (log_lvtma)
+			(void)link->panel_cntl->funcs->is_panel_powered_on(link->panel_cntl);
+
 		cntl.action = power_up ?
 			TRANSMITTER_CONTROL_POWER_ON :
 			TRANSMITTER_CONTROL_POWER_OFF;
@@ -867,6 +893,12 @@ void dce110_edp_power_control(
 		}
 
 		bp_result = link_transmitter_control(ctx->dc_bios, &cntl);
+
+		/* APPLE5K: LVTMA readback after the BIOS power command --
+		 * bp_result only means the command was accepted, not that the
+		 * sequencer actually changed state. */
+		if (log_lvtma)
+			(void)link->panel_cntl->funcs->is_panel_powered_on(link->panel_cntl);
 
 		DC_LOG_HW_RESUME_S3(
 				"%s: END: Panel Power action: %s bp_result=%u\n",
