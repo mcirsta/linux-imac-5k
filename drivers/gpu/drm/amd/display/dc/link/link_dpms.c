@@ -1116,21 +1116,50 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx)
 		struct dc_link *link = stream->link;
 		union down_spread_ctrl old_downspread;
 		union down_spread_ctrl new_downspread;
+		/*
+		 * APPLE5K: on the iMacPro1,1 (DCE12/Vega) 5K tile pair, set DPCD
+		 * 0x107 bit 7 (IGNORE_MSA_TIMING_PARAM) directly, matching the Windows
+		 * DCE12 tile finalizer. Done here -- NOT via
+		 * stream->ignore_msa_timing_param -- so it does not flip the stream
+		 * flag that makes resource_are_streams_timing_synchronizable() bail;
+		 * i.e. DC's stock genlock of the two tiles is preserved. Gated to
+		 * DCE12 + Apple-5K tile so the working DCE<12 iMacs are untouched.
+		 */
+		bool apple5k_force_msa_ignore =
+			link->ctx->dce_version == DCE_VERSION_12_0 &&
+			(dc_link_has_tiled_root_panel_patch(link) ||
+			 dc_link_has_tiled_slave_panel_patch(link));
+		enum dc_status read_status;
+		enum dc_status write_status = DC_OK;
+		DC_LOGGER_INIT(link->ctx->logger);
 
 		memset(&old_downspread, 0, sizeof(old_downspread));
 
-		core_link_read_dpcd(link, DP_DOWNSPREAD_CTRL,
+		read_status = core_link_read_dpcd(link, DP_DOWNSPREAD_CTRL,
 				&old_downspread.raw, sizeof(old_downspread));
 
 		new_downspread.raw = old_downspread.raw;
 
 		new_downspread.bits.IGNORE_MSA_TIMING_PARAM =
-				(stream->ignore_msa_timing_param) ? 1 : 0;
+				(stream->ignore_msa_timing_param ||
+				 apple5k_force_msa_ignore) ? 1 : 0;
 
-		if (new_downspread.raw != old_downspread.raw) {
-			core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
+		/*
+		 * Only modify 0x107 when the read succeeded. If the AUX read failed,
+		 * old_downspread is still the zeroed value, so forcing the bit would
+		 * write 0x80 and clobber the downspread/SSC bits (0x10). AUX reads do
+		 * fail on this panel, so guard the read-modify-write on DC_OK.
+		 */
+		if (read_status == DC_OK && new_downspread.raw != old_downspread.raw) {
+			write_status = core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
 				&new_downspread.raw, sizeof(new_downspread));
 		}
+
+		if (apple5k_force_msa_ignore)
+			DC_LOG_INFO("APPLE5K: force MSA-ignore 0x107 link[%u] read_status=%d old=0x%02x new=0x%02x write_status=%d stream_ignore_msa=%u\n",
+				    link->link_index, read_status,
+				    old_downspread.raw, new_downspread.raw,
+				    write_status, stream->ignore_msa_timing_param);
 
 		dp_write_tiled_stream_enable_latch(link);
 		apple5k_log_sink_link_status(link);
