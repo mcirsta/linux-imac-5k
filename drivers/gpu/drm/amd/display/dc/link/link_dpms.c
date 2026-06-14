@@ -77,6 +77,39 @@
 #define PEAK_FACTOR_X1000 1006
 #define APPLE_5K_DPCD_PANEL_LATCH 0x4F1
 
+/*
+ * APPLE5K mode-bisection probe (read-only). See link_dpcd.h. Resolves the tiled
+ * ROOT (eDP) link from any tiled link and logs its 0x41C/0x425/0x4F1 mode
+ * triplet, tagged with `stage`, so a Polaris boot log shows exactly which enable
+ * step flips the panel compat->native (and a Vega log shows where it fails to).
+ */
+void link_apple_5k_log_panel_mode(struct dc_link *link, const char *stage)
+{
+	struct dc_link *root = NULL;
+	uint8_t r41c = 0, r425 = 0, r4f1 = 0;
+	enum dc_status s41c, s425, s4f1;
+
+	if (!link)
+		return;
+	if (dc_link_has_tiled_root_panel_patch(link))
+		root = link;
+	else if (link->tiled_peer &&
+		 dc_link_has_tiled_root_panel_patch(link->tiled_peer))
+		root = link->tiled_peer;
+	if (!root)
+		return;
+
+	DC_LOGGER_INIT(root->ctx->logger);
+	s41c = core_link_read_dpcd(root, 0x41C, &r41c, sizeof(r41c));
+	s425 = core_link_read_dpcd(root, 0x425, &r425, sizeof(r425));
+	s4f1 = core_link_read_dpcd(root, 0x4F1, &r4f1, sizeof(r4f1));
+	DC_LOG_INFO("APPLE5K-MODE stage=%s link[%u] root[%u] 0x41C=0x%02x(s=%d) 0x425=0x%02x(s=%d) 0x4F1=0x%02x(s=%d) -> %s\n",
+		    stage ? stage : "?", link->link_index, root->link_index,
+		    r41c, s41c, r425, s425, r4f1, s4f1,
+		    (s425 == DC_OK) ? ((r425 & 0x02) ? "COMPAT" : "NATIVE")
+				    : "0x425-NACK");
+}
+
 static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 {
 	uint8_t payload = 1;
@@ -89,6 +122,7 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 
 	DC_LOGGER_INIT(link->ctx->logger);
 
+	link_apple_5k_log_panel_mode(link, "stream-latch:pre");
 	status = core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
 				      &payload, sizeof(payload));
 	read_status = core_link_read_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
@@ -96,6 +130,7 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 	DC_LOG_INFO("APPLE5K: stream-enable latch 0x4F1 link[%u] status=%d value=0x%02x read_status=%d readback=0x%02x sink=%p\n",
 		    link->link_index, status, payload, read_status, readback,
 		    link->local_sink);
+	link_apple_5k_log_panel_mode(link, "stream-latch:post");
 }
 
 /*
@@ -2523,6 +2558,8 @@ void link_set_dpms_on(
 	DC_LOGGER_INIT(pipe_ctx->stream->ctx->logger);
 
 	ASSERT(is_master_pipe_for_link(link, pipe_ctx));
+
+	link_apple_5k_log_panel_mode(link, "dpms-on:entry");
 
 	if (dp_is_128b_132b_signal(pipe_ctx))
 		vpg = pipe_ctx->stream_res.hpo_dp_stream_enc->vpg;

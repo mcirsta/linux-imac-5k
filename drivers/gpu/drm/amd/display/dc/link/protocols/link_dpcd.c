@@ -256,10 +256,14 @@ enum dc_status core_link_write_dpcd(
 enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
 {
 	uint8_t payload = 1;
+	enum dc_status status;
 
 	if (!dc_link_has_tiled_root_panel_patch(root_link))
 		return DC_OK;
 
-	return core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
+	link_apple_5k_log_panel_mode(root_link, "root-latch-pulse:pre");
+	status = core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
 				    &payload, sizeof(payload));
+	link_apple_5k_log_panel_mode(root_link, "root-latch-pulse:post");
+	return status;
 }
