@@ -80,6 +80,14 @@
 struct link_service *link_create_link_service(void);
 void link_destroy_link_service(struct link_service **link_srv);
 
+/*
+ * APPLE5K read-only mode probe (defined in link/link_dpms.c). Declared on the
+ * link-service boundary so core (dc.c) can log the tiled-5K panel's native/compat
+ * mode (DPCD 0x41C/0x425/0x4F1) at the GSL/commit boundaries. No-op on NULL or
+ * non-tiled links; never writes.
+ */
+void link_apple_5k_log_panel_mode(struct dc_link *link, const char *stage);
+
 struct link_init_data {
 	const struct dc *dc;
 	struct dc_context *ctx; /* TODO: remove 'dal' when DC is complete. */

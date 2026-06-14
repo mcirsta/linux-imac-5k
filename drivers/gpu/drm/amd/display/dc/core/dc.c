@@ -1754,10 +1754,59 @@ static void program_timing_sync(
 			}
 		}
 
+		/*
+		 * APPLE5K T1: when this group involves a tiled-5K link, log how the two
+		 * tiles were grouped for GSL genlock. A tiled pipe ending up in a group
+		 * of size 1 means resource_are_streams_timing_synchronizable() split the
+		 * pair (e.g. ignore_msa_timing_param set) so GSL will NOT run on them and
+		 * the panel can never see the synchronized signal -> stays compat.
+		 */
+		{
+			bool group_has_tiled = false;
+			int t;
+
+			for (t = 0; t < group_size; t++) {
+				struct dc_link *tl = pipe_set[t]->stream->link;
+
+				if (dc_link_has_tiled_root_panel_patch(tl) ||
+				    dc_link_has_tiled_slave_panel_patch(tl)) {
+					group_has_tiled = true;
+					break;
+				}
+			}
+
+			if (group_has_tiled) {
+				DC_LOG_INFO("APPLE5K-SYNC group=%d size=%d sync_type=%d(%s) master_tg_inst=%u\n",
+					    num_group, group_size, sync_type,
+					    sync_type == TIMING_SYNCHRONIZABLE ? "TIMING" :
+					    sync_type == VBLANK_SYNCHRONIZABLE ? "VBLANK" :
+					    "NONE",
+					    pipe_set[0]->stream_res.tg->inst);
+				for (t = 0; t < group_size; t++) {
+					struct dc_stream_state *ps = pipe_set[t]->stream;
+
+					DC_LOG_INFO("APPLE5K-SYNC   member[%d] link[%d] signal=%d tg_inst=%u %ux%u total=%ux%u pixclk_100hz=%u ignore_msa=%u\n",
+						    t, ps->link ? (int)ps->link->link_index : -1,
+						    ps->signal, pipe_set[t]->stream_res.tg->inst,
+						    ps->timing.h_addressable, ps->timing.v_addressable,
+						    ps->timing.h_total, ps->timing.v_total,
+						    ps->timing.pix_clk_100hz,
+						    ps->ignore_msa_timing_param);
+				}
+			}
+		}
+
 		if (group_size > 1) {
 			if (sync_type == TIMING_SYNCHRONIZABLE) {
 				dc->hwss.enable_timing_synchronization(
 					dc, ctx, group_index, group_size, pipe_set);
+				/*
+				 * APPLE5K T2: read the tiled panel mode immediately after the
+				 * GSL genlock returns, to see whether the compat->native flip
+				 * lands at the lock itself or only later at scanout/commit.
+				 */
+				link_apple_5k_log_panel_mode(pipe_set[0]->stream->link,
+							     "gsl:post");
 			} else
 				if (sync_type == VBLANK_SYNCHRONIZABLE) {
 				dc->hwss.enable_vblanks_synchronization(
@@ -2487,6 +2536,18 @@ enum dc_status dc_commit_streams(struct dc *dc, struct dc_commit_streams_params 
 					status->is_abm_supported = true;
 			}
 		}
+	}
+
+	/*
+	 * APPLE5K T2: after the streams are committed (GSL genlock ran inside
+	 * dc_commit_state_no_check -> dc_trigger_sync -> program_timing_sync), read
+	 * the tiled-5K panel mode so the compat->native flip can be localized to the
+	 * commit/scanout window. No-op on non-tiled links.
+	 */
+	if (res == DC_OK) {
+		for (i = 0; i < params->stream_count; i++)
+			link_apple_5k_log_panel_mode(params->streams[i]->link,
+						     "commit:post");
 	}
 
 fail:
