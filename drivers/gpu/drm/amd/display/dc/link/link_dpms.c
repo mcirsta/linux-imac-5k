@@ -37,6 +37,7 @@
 
 #include <linux/dmi.h>
 
+#include "amdgpu.h"
 #include "link_dpms.h"
 #include "link_hwss.h"
 #include "link_validation.h"
@@ -77,9 +78,34 @@
 #define MAX_MTP_SLOT_COUNT 64
 #define LINK_TRAINING_ATTEMPTS 4
 #define PEAK_FACTOR_X1000 1006
+#define IMAC5K_WIN_PRIMARY_OBJECT_ID 0x3114
+#define IMAC5K_WIN_PRIMARY_DDC_HW_INST 3
 #define IMAC5K_WIN_SECONDARY_OBJECT_ID 0x3113
 #define IMAC5K_WIN_SECONDARY_DDC_HW_INST 2
 #define IMAC5K_DPCD_PANEL_LATCH 0x4F1
+
+static bool link_is_imac5k_primary_route(const struct dc_link *link)
+{
+	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
+	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1"))
+		return false;
+
+	if (!link || link->connector_signal != SIGNAL_TYPE_EDP)
+		return false;
+
+	if (dal_graphics_object_id_to_uint(link->link_id) !=
+	    IMAC5K_WIN_PRIMARY_OBJECT_ID)
+		return false;
+
+	if (link->ddc_hw_inst != IMAC5K_WIN_PRIMARY_DDC_HW_INST)
+		return false;
+
+	if (!link->link_enc ||
+	    link->link_enc->transmitter != TRANSMITTER_UNIPHY_C)
+		return false;
+
+	return true;
+}
 
 static bool link_is_imac5k_secondary_route(const struct dc_link *link)
 {
@@ -102,6 +128,49 @@ static bool link_is_imac5k_secondary_route(const struct dc_link *link)
 		return false;
 
 	return true;
+}
+
+static void imac5k_reboot_trace_pipe(const struct pipe_ctx *pipe_ctx,
+				     const char *stage)
+{
+	const struct dc_stream_state *stream;
+	const struct dc_link *link;
+	struct timing_generator *tg;
+	struct link_encoder *link_enc;
+	const char *role;
+	int tg_enabled = -1;
+	int dig_enabled = -1;
+
+	if (!amdgpu_imac5k_reboot_in_progress || !pipe_ctx || !pipe_ctx->stream ||
+	    !pipe_ctx->stream->sink)
+		return;
+
+	stream = pipe_ctx->stream;
+	link = stream->sink->link;
+	tg = pipe_ctx->stream_res.tg;
+	link_enc = link->link_enc;
+	if (link_is_imac5k_primary_route(link))
+		role = "root";
+	else if (link_is_imac5k_secondary_route(link))
+		role = "slave";
+	else
+		return;
+
+	if (tg && tg->funcs->is_tg_enabled)
+		tg_enabled = tg->funcs->is_tg_enabled(tg);
+	if (link_enc && link_enc->funcs->is_dig_enabled)
+		dig_enabled = link_enc->funcs->is_dig_enabled(link_enc);
+
+	pr_emerg("IMAC5K-REBOOT: dpms stage=%s role=%s pipe=%u link=%u object=0x%x signal=%d tg=%d tg_enabled=%d stream_enc=%d dig_enabled=%d rate=%d lanes=%d keep_rx=%d implicit_edp_skip=%d\n",
+		 stage, role, pipe_ctx->pipe_idx, link->link_index,
+		 dal_graphics_object_id_to_uint(link->link_id), stream->signal,
+		 pipe_ctx->stream_res.tg ? pipe_ctx->stream_res.tg->inst : -1,
+		 tg_enabled, pipe_ctx->stream_res.stream_enc ?
+		 pipe_ctx->stream_res.stream_enc->id : -1, dig_enabled,
+		 link->cur_link_settings.link_rate,
+		 link->cur_link_settings.lane_count,
+		 link->wa_flags.dp_keep_receiver_powered,
+		 link->skip_implict_edp_power_control);
 }
 
 static void imac5k_secondary_write_panel_latch(struct dc_link *link,
@@ -2381,6 +2450,7 @@ void link_set_dpms_off(struct pipe_ctx *pipe_ctx)
 	DC_LOGGER_INIT(pipe_ctx->stream->ctx->logger);
 
 	ASSERT(is_master_pipe_for_link(link, pipe_ctx));
+	imac5k_reboot_trace_pipe(pipe_ctx, "dpms-off-entry");
 
 	if (dp_is_128b_132b_signal(pipe_ctx))
 		vpg = pipe_ctx->stream_res.hpo_dp_stream_enc->vpg;
@@ -2404,7 +2474,9 @@ void link_set_dpms_off(struct pipe_ctx *pipe_ctx)
 	dc->hwss.disable_audio_stream(pipe_ctx);
 
 	update_psp_stream_config(pipe_ctx, true);
+	imac5k_reboot_trace_pipe(pipe_ctx, "before-stream-blank");
 	dc->hwss.blank_stream(pipe_ctx);
+	imac5k_reboot_trace_pipe(pipe_ctx, "after-stream-blank");
 
 	if (pipe_ctx->link_config.dp_tunnel_settings.should_use_dp_bw_allocation)
 		deallocate_usb4_bandwidth(pipe_ctx->stream);
@@ -2450,11 +2522,18 @@ void link_set_dpms_off(struct pipe_ctx *pipe_ctx)
 		 * state machine.
 		 * In DP2 or MST mode, our encoder will stay video active
 		 */
+		imac5k_reboot_trace_pipe(pipe_ctx, "before-link-disable");
 		disable_link(pipe_ctx->stream->link, &pipe_ctx->link_res, pipe_ctx->stream->signal);
+		imac5k_reboot_trace_pipe(pipe_ctx, "after-link-disable");
 		dc->hwss.disable_stream(pipe_ctx);
+		imac5k_reboot_trace_pipe(pipe_ctx, "after-stream-disable");
 	} else {
+		imac5k_reboot_trace_pipe(pipe_ctx, "before-stream-disable");
 		dc->hwss.disable_stream(pipe_ctx);
+		imac5k_reboot_trace_pipe(pipe_ctx, "after-stream-disable");
+		imac5k_reboot_trace_pipe(pipe_ctx, "before-link-disable");
 		disable_link(pipe_ctx->stream->link, &pipe_ctx->link_res, pipe_ctx->stream->signal);
+		imac5k_reboot_trace_pipe(pipe_ctx, "after-link-disable");
 	}
 	edp_set_panel_assr(link, pipe_ctx, &panel_mode_dp, false);
 
@@ -2477,6 +2556,8 @@ void link_set_dpms_off(struct pipe_ctx *pipe_ctx)
 		/* since current psp not loaded, we need to reset it to default */
 		link->panel_mode = panel_mode;
 	}
+
+	imac5k_reboot_trace_pipe(pipe_ctx, "dpms-off-exit");
 }
 
 void link_set_dpms_on(

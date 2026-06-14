@@ -30,6 +30,9 @@
  * link settings.
  */
 
+#include <linux/dmi.h>
+
+#include "amdgpu.h"
 #include "link_dp_phy.h"
 #include "link_dpcd.h"
 #include "link_dp_training.h"
@@ -38,17 +41,74 @@
 #include "resource.h"
 #include "link_enc_cfg.h"
 #include "atomfirmware.h"
+#include "grph_object_id.h"
 #define DC_LOGGER \
 	link->ctx->logger
 
+#define IMAC5K_REBOOT_ROOT_OBJECT_ID 0x3114
+#define IMAC5K_REBOOT_ROOT_DDC_HW_INST 3
+#define IMAC5K_REBOOT_SLAVE_OBJECT_ID 0x3113
+#define IMAC5K_REBOOT_SLAVE_DDC_HW_INST 2
+
+static const char *imac5k_reboot_link_role(const struct dc_link *link)
+{
+	unsigned int object_id;
+
+	if (!amdgpu_imac5k_reboot_in_progress ||
+	    !dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
+	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1") || !link)
+		return NULL;
+
+	object_id = dal_graphics_object_id_to_uint(link->link_id);
+	if (link->connector_signal == SIGNAL_TYPE_EDP &&
+	    object_id == IMAC5K_REBOOT_ROOT_OBJECT_ID &&
+	    link->ddc_hw_inst == IMAC5K_REBOOT_ROOT_DDC_HW_INST &&
+	    link->link_enc &&
+	    link->link_enc->transmitter == TRANSMITTER_UNIPHY_C)
+		return "root";
+
+	if (link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT &&
+	    object_id == IMAC5K_REBOOT_SLAVE_OBJECT_ID &&
+	    link->ddc_hw_inst == IMAC5K_REBOOT_SLAVE_DDC_HW_INST &&
+	    link->link_enc &&
+	    link->link_enc->transmitter == TRANSMITTER_UNIPHY_D)
+		return "slave";
+
+	return NULL;
+}
+
 void dpcd_write_rx_power_ctrl(struct dc_link *link, bool on)
 {
+	const char *role = imac5k_reboot_link_role(link);
 	uint8_t state;
 
 	state = on ? DP_POWER_STATE_D0 : DP_POWER_STATE_D3;
 
-	if (link->sync_lt_in_progress)
+	if (link->sync_lt_in_progress) {
+		if (role)
+			pr_emerg("IMAC5K-REBOOT: rx-power role=%s link=%u request=%02x skipped=sync-lt\n",
+				 role, link->link_index, state);
 		return;
+	}
+
+	if (role) {
+		uint8_t before = 0;
+		uint8_t after = 0;
+		enum dc_status before_status;
+		enum dc_status write_status;
+		enum dc_status after_status;
+
+		before_status = core_link_read_dpcd(link, DP_SET_POWER, &before,
+						    sizeof(before));
+		write_status = core_link_write_dpcd(link, DP_SET_POWER, &state,
+						    sizeof(state));
+		after_status = core_link_read_dpcd(link, DP_SET_POWER, &after,
+						   sizeof(after));
+		pr_emerg("IMAC5K-REBOOT: rx-power role=%s link=%u request=%02x before_status=%d before=%02x write_status=%d after_status=%d after=%02x\n",
+			 role, link->link_index, state, before_status, before,
+			 write_status, after_status, after);
+		return;
+	}
 
 	core_link_write_dpcd(link, DP_SET_POWER, &state,
 						 sizeof(state));
@@ -73,19 +133,36 @@ void dp_disable_link_phy(struct dc_link *link,
 		enum signal_type signal)
 {
 	struct dc  *dc = link->ctx->dc;
+	const char *role = imac5k_reboot_link_role(link);
+	bool send_d3 = !link->wa_flags.dp_keep_receiver_powered &&
+		       !link->skip_implict_edp_power_control &&
+		       link->type != dc_connection_none;
 
-	if (!link->wa_flags.dp_keep_receiver_powered &&
-			!link->skip_implict_edp_power_control &&
-			link->type != dc_connection_none)
+	if (role)
+		pr_emerg("IMAC5K-REBOOT: phy-disable entry role=%s link=%u signal=%d send_d3=%d keep_rx=%d implicit_edp_skip=%d type=%d rate=%d lanes=%d\n",
+			 role, link->link_index, signal, send_d3,
+			 link->wa_flags.dp_keep_receiver_powered,
+			 link->skip_implict_edp_power_control, link->type,
+			 link->cur_link_settings.link_rate,
+			 link->cur_link_settings.lane_count);
+
+	if (send_d3)
 		dpcd_write_rx_power_ctrl(link, false);
 
 	dc->hwss.disable_link_output(link, link_res, signal);
+	if (role)
+		pr_emerg("IMAC5K-REBOOT: phy-disable output-disabled role=%s link=%u signal=%d\n",
+			 role, link->link_index, signal);
 	/* Clear current link setting.*/
 	memset(&link->cur_link_settings, 0,
 			sizeof(link->cur_link_settings));
 
 	if (dc->clk_mgr->funcs->notify_link_rate_change)
 		dc->clk_mgr->funcs->notify_link_rate_change(dc->clk_mgr, link);
+
+	if (role)
+		pr_emerg("IMAC5K-REBOOT: phy-disable exit role=%s link=%u\n",
+			 role, link->link_index);
 }
 
 static inline bool is_immediate_downstream(struct dc_link *link, uint32_t offset)
@@ -207,4 +284,3 @@ void dp_set_fec_enable(struct dc_link *link, const struct link_resource *link_re
 		}
 	}
 }
-

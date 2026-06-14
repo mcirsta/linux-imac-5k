@@ -35,9 +35,11 @@
 #include <linux/cc_platform.h>
 #include <linux/console.h>
 #include <linux/dynamic_debug.h>
+#include <linux/dmi.h>
 #include <linux/module.h>
 #include <linux/mmu_notifier.h>
 #include <linux/pm_runtime.h>
+#include <linux/reboot.h>
 #include <linux/suspend.h>
 #include <linux/vga_switcheroo.h>
 
@@ -223,6 +225,8 @@ uint amdgpu_dc_debug_mask;
 uint amdgpu_dc_visual_confirm;
 int amdgpu_imac5k_force_genlock = 1;
 int amdgpu_imac5k_force_primary_master;
+int amdgpu_imac5k_reboot_handoff;
+bool amdgpu_imac5k_reboot_in_progress;
 int amdgpu_async_gfx_ring = 1;
 int amdgpu_mcbp = -1;
 int amdgpu_discovery = -1;
@@ -910,6 +914,10 @@ module_param_named(imac5k_force_genlock, amdgpu_imac5k_force_genlock, int, 0444)
 MODULE_PARM_DESC(imac5k_force_primary_master,
 	"Force the iMac19,1 primary tile (eDP / 0x3114) to be the timing-sync master/anchor instead of DC's first-unblanked-pipe default (0 = off (default), 1 = on). Only takes effect alongside imac5k_force_genlock when the 5K tile pair is grouped.");
 module_param_named(imac5k_force_primary_master, amdgpu_imac5k_force_primary_master, int, 0444);
+
+MODULE_PARM_DESC(imac5k_reboot_handoff,
+	"Trace/experiment for the exact active iMac19,1 5K pair during restart (0 = log only (default), 1 = preserve receiver D0, 2 = write root DPCD 0x4F1=0 before normal teardown).");
+module_param_named(imac5k_reboot_handoff, amdgpu_imac5k_reboot_handoff, int, 0444);
 
 /**
  * DOC: abmlevel (uint)
@@ -2599,13 +2607,26 @@ amdgpu_pci_shutdown(struct pci_dev *pdev)
 {
 	struct drm_device *dev = pci_get_drvdata(pdev);
 	struct amdgpu_device *adev = drm_to_adev(dev);
+	bool trace_imac19_restart = amdgpu_imac5k_reboot_in_progress;
+	int r;
 
-	if (amdgpu_ras_intr_triggered())
+	if (trace_imac19_restart)
+		pr_emerg("IMAC5K-REBOOT: pci-shutdown entry mode=%d in_suspend=%d in_s4=%d\n",
+			 amdgpu_imac5k_reboot_handoff, adev->in_suspend,
+			 adev->in_s4);
+
+	if (amdgpu_ras_intr_triggered()) {
+		if (trace_imac19_restart)
+			pr_emerg("IMAC5K-REBOOT: pci-shutdown skipped: RAS interrupt triggered\n");
 		return;
+	}
 
 	/* device maybe not resumed here, return immediately in this case */
-	if (adev->in_s4 && adev->in_suspend)
+	if (adev->in_s4 && adev->in_suspend) {
+		if (trace_imac19_restart)
+			pr_emerg("IMAC5K-REBOOT: pci-shutdown skipped: already suspended for S4\n");
 		return;
+	}
 
 	/* if we are running in a VM, make sure the device
 	 * torn down properly on reboot/shutdown.
@@ -2615,8 +2636,14 @@ amdgpu_pci_shutdown(struct pci_dev *pdev)
 	if (!amdgpu_passthrough(adev))
 		adev->mp1_state = PP_MP1_STATE_UNLOAD;
 	amdgpu_device_prepare(dev);
-	amdgpu_device_suspend(dev, true);
+	r = amdgpu_device_suspend(dev, true);
+	if (trace_imac19_restart)
+		pr_emerg("IMAC5K-REBOOT: pci-shutdown suspend-complete status=%d in_suspend=%d\n",
+			 r, adev->in_suspend);
 	adev->mp1_state = PP_MP1_STATE_NONE;
+
+	if (trace_imac19_restart)
+		pr_emerg("IMAC5K-REBOOT: pci-shutdown exit\n");
 }
 
 static int amdgpu_pmops_prepare(struct device *dev)
@@ -3187,6 +3214,25 @@ static struct pci_driver amdgpu_kms_pci_driver = {
 	.dev_groups = amdgpu_sysfs_groups,
 };
 
+static int amdgpu_imac5k_reboot_notify(struct notifier_block *nb,
+				       unsigned long action, void *data)
+{
+	amdgpu_imac5k_reboot_in_progress =
+		action == SYS_RESTART &&
+		dmi_match(DMI_SYS_VENDOR, "Apple Inc.") &&
+		dmi_match(DMI_PRODUCT_NAME, "iMac19,1");
+
+	if (amdgpu_imac5k_reboot_in_progress)
+		pr_emerg("IMAC5K-REBOOT: restart notifier armed mode=%d\n",
+			 amdgpu_imac5k_reboot_handoff);
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block amdgpu_imac5k_reboot_nb = {
+	.notifier_call = amdgpu_imac5k_reboot_notify,
+};
+
 static int __init amdgpu_init(void)
 {
 	int r;
@@ -3211,6 +3257,11 @@ static int __init amdgpu_init(void)
 			"reporting any bugs unrelated to overdrive.\n");
 	}
 
+	r = register_reboot_notifier(&amdgpu_imac5k_reboot_nb);
+	if (r)
+		pr_warn("failed to register iMac19,1 reboot trace notifier: %d\n",
+			r);
+
 	/* let modprobe override vga console setting */
 	return pci_register_driver(&amdgpu_kms_pci_driver);
 
@@ -3223,6 +3274,7 @@ error_sync:
 
 static void __exit amdgpu_exit(void)
 {
+	unregister_reboot_notifier(&amdgpu_imac5k_reboot_nb);
 	amdgpu_amdkfd_fini();
 	pci_unregister_driver(&amdgpu_kms_pci_driver);
 	amdgpu_unregister_atpx_handler();

@@ -3201,10 +3201,266 @@ static void dm_destroy_cached_state(struct amdgpu_device *adev)
 	dm->cached_state = NULL;
 }
 
+#define IMAC19_REBOOT_ROOT_OBJECT_ID 0x3114
+#define IMAC19_REBOOT_ROOT_DDC_HW_INST 3
+#define IMAC19_REBOOT_SLAVE_OBJECT_ID 0x3113
+#define IMAC19_REBOOT_SLAVE_DDC_HW_INST 2
+#define IMAC19_REBOOT_TILE_H_ACTIVE 2560
+#define IMAC19_REBOOT_TILE_V_ACTIVE 2880
+#define IMAC19_REBOOT_DPCD_PANEL_LATCH 0x4F1
+
+static const char *imac19_reboot_link_role(const struct dc_link *link)
+{
+	unsigned int object_id;
+
+	if (!link)
+		return NULL;
+
+	object_id = dal_graphics_object_id_to_uint(link->link_id);
+
+	if (link->connector_signal == SIGNAL_TYPE_EDP &&
+	    object_id == IMAC19_REBOOT_ROOT_OBJECT_ID &&
+	    link->ddc_hw_inst == IMAC19_REBOOT_ROOT_DDC_HW_INST &&
+	    link->link_enc &&
+	    link->link_enc->transmitter == TRANSMITTER_UNIPHY_C)
+		return "root";
+
+	if (link->connector_signal == SIGNAL_TYPE_DISPLAY_PORT &&
+	    object_id == IMAC19_REBOOT_SLAVE_OBJECT_ID &&
+	    link->ddc_hw_inst == IMAC19_REBOOT_SLAVE_DDC_HW_INST &&
+	    link->link_enc &&
+	    link->link_enc->transmitter == TRANSMITTER_UNIPHY_D)
+		return "slave";
+
+	return NULL;
+}
+
+static bool imac19_reboot_trace_active(void)
+{
+	return amdgpu_imac5k_reboot_in_progress &&
+	       dmi_match(DMI_SYS_VENDOR, "Apple Inc.") &&
+	       dmi_match(DMI_PRODUCT_NAME, "iMac19,1");
+}
+
+static void imac19_reboot_find_pair(struct dc *dc, struct dc_link **root,
+				    struct dc_link **slave)
+{
+	unsigned int i;
+
+	*root = NULL;
+	*slave = NULL;
+
+	for (i = 0; i < dc->link_count; i++) {
+		const char *role = imac19_reboot_link_role(dc->links[i]);
+
+		if (!role)
+			continue;
+		if (!strcmp(role, "root"))
+			*root = dc->links[i];
+		else
+			*slave = dc->links[i];
+	}
+}
+
+static bool imac19_reboot_pair_is_active(struct dc *dc,
+					 const struct dc_link *root,
+					 const struct dc_link *slave)
+{
+	bool root_active = false;
+	bool slave_active = false;
+	unsigned int i;
+
+	if (!root || !slave || !root->local_sink || !slave->local_sink ||
+	    !dc->current_state)
+		return false;
+
+	for (i = 0; i < MAX_PIPES; i++) {
+		const struct pipe_ctx *pipe =
+			&dc->current_state->res_ctx.pipe_ctx[i];
+		const struct dc_stream_state *stream = pipe->stream;
+
+		if (!stream || !stream->sink ||
+		    stream->timing.h_addressable != IMAC19_REBOOT_TILE_H_ACTIVE ||
+		    stream->timing.v_addressable != IMAC19_REBOOT_TILE_V_ACTIVE)
+			continue;
+
+		if (stream->sink->link == root)
+			root_active = true;
+		else if (stream->sink->link == slave)
+			slave_active = true;
+	}
+
+	return root_active && slave_active;
+}
+
+static void imac19_reboot_snapshot_link(struct dc_link *link,
+					const char *role, const char *stage,
+					bool read_dpcd)
+{
+	uint8_t dpcd_100[11] = { 0 };
+	uint8_t dpcd_111 = 0;
+	uint8_t dpcd_202[6] = { 0 };
+	uint8_t dpcd_300[16] = { 0 };
+	uint8_t dpcd_310[8] = { 0 };
+	uint8_t dpcd_4f0[3] = { 0 };
+	uint8_t dpcd_600 = 0;
+	enum dc_status status_100 = DC_ERROR_UNEXPECTED;
+	enum dc_status status_111 = DC_ERROR_UNEXPECTED;
+	enum dc_status status_202 = DC_ERROR_UNEXPECTED;
+	enum dc_status status_300 = DC_ERROR_UNEXPECTED;
+	enum dc_status status_310 = DC_ERROR_UNEXPECTED;
+	enum dc_status status_4f0 = DC_ERROR_UNEXPECTED;
+	enum dc_status status_600 = DC_ERROR_UNEXPECTED;
+
+	if (read_dpcd && link->ddc) {
+		status_100 = core_link_read_dpcd(link, 0x100, dpcd_100,
+						sizeof(dpcd_100));
+		status_111 = core_link_read_dpcd(link, 0x111, &dpcd_111,
+						sizeof(dpcd_111));
+		status_202 = core_link_read_dpcd(link, 0x202, dpcd_202,
+						sizeof(dpcd_202));
+		status_300 = core_link_read_dpcd(link, 0x300, dpcd_300,
+						sizeof(dpcd_300));
+		status_310 = core_link_read_dpcd(link, 0x310, dpcd_310,
+						sizeof(dpcd_310));
+		status_4f0 = core_link_read_dpcd(link, 0x4F0, dpcd_4f0,
+						sizeof(dpcd_4f0));
+		status_600 = core_link_read_dpcd(link, DP_SET_POWER, &dpcd_600,
+						sizeof(dpcd_600));
+	}
+
+	pr_emerg("IMAC5K-REBOOT: link stage=%s role=%s link=%u object=0x%x signal=%d ddc_hw=%u aux=%d sink=%d type=%d rate=%d lanes=%d spread=%d keep_rx=%d implicit_edp_skip=%d\n",
+		 stage, role, link->link_index,
+		 dal_graphics_object_id_to_uint(link->link_id),
+		 link->connector_signal, link->ddc_hw_inst, link->aux_mode,
+		 !!link->local_sink, link->type, link->cur_link_settings.link_rate,
+		 link->cur_link_settings.lane_count,
+		 link->cur_link_settings.link_spread,
+		 link->wa_flags.dp_keep_receiver_powered,
+		 link->skip_implict_edp_power_control);
+	if (!read_dpcd) {
+		pr_emerg("IMAC5K-REBOOT: dpcd stage=%s role=%s skipped=post-teardown\n",
+			 stage, role);
+		return;
+	}
+	pr_emerg("IMAC5K-REBOOT: dpcd stage=%s role=%s s100=%d 100=%*ph s111=%d 111=%02x s202=%d 202=%*ph s4f0=%d 4f0=%*ph s600=%d 600=%02x\n",
+		 stage, role, status_100, (int)sizeof(dpcd_100), dpcd_100,
+		 status_111, dpcd_111, status_202, (int)sizeof(dpcd_202),
+		 dpcd_202, status_4f0, (int)sizeof(dpcd_4f0), dpcd_4f0,
+		 status_600, dpcd_600);
+	pr_emerg("IMAC5K-REBOOT: dpcd-source stage=%s role=%s s300=%d 300=%*ph s310=%d 310=%*ph\n",
+		 stage, role, status_300, (int)sizeof(dpcd_300), dpcd_300,
+		 status_310, (int)sizeof(dpcd_310), dpcd_310);
+}
+
+static void imac19_reboot_snapshot(struct amdgpu_display_manager *dm,
+				   const char *stage, bool read_dpcd)
+{
+	struct dc *dc = dm->dc;
+	struct dc_link *root;
+	struct dc_link *slave;
+	bool pair_active;
+	unsigned int i;
+
+	imac19_reboot_find_pair(dc, &root, &slave);
+	pair_active = imac19_reboot_pair_is_active(dc, root, slave);
+
+	pr_emerg("IMAC5K-REBOOT: snapshot stage=%s mode=%d streams=%u root=%d slave=%d active_pair=%d\n",
+		 stage, amdgpu_imac5k_reboot_handoff,
+		 dc->current_state ? dc->current_state->stream_count : 0,
+		 !!root, !!slave, pair_active);
+
+	if (dc->current_state) {
+		for (i = 0; i < MAX_PIPES; i++) {
+			struct pipe_ctx *pipe =
+				&dc->current_state->res_ctx.pipe_ctx[i];
+			struct dc_stream_state *stream = pipe->stream;
+			struct dc_link *link;
+			struct timing_generator *tg;
+			struct link_encoder *link_enc;
+			const char *role;
+			int tg_enabled = -1;
+			int dig_enabled = -1;
+
+			if (!stream || !stream->sink)
+				continue;
+			link = stream->sink->link;
+			tg = pipe->stream_res.tg;
+			link_enc = link->link_enc;
+			role = imac19_reboot_link_role(link);
+			if (!role)
+				continue;
+
+			if (tg && tg->funcs->is_tg_enabled)
+				tg_enabled = tg->funcs->is_tg_enabled(tg);
+			if (link_enc && link_enc->funcs->is_dig_enabled)
+				dig_enabled = link_enc->funcs->is_dig_enabled(link_enc);
+
+			pr_emerg("IMAC5K-REBOOT: pipe stage=%s role=%s pipe=%u tg=%d tg_enabled=%d stream_enc=%d dig_enabled=%d dpms_off=%d timing=%ux%u total=%ux%u pixclk_100hz=%u\n",
+				 stage, role, pipe->pipe_idx,
+				 pipe->stream_res.tg ?
+				 pipe->stream_res.tg->inst : -1,
+				 tg_enabled, pipe->stream_res.stream_enc ?
+				 pipe->stream_res.stream_enc->id : -1,
+				 dig_enabled, stream->dpms_off,
+				 stream->timing.h_addressable,
+				 stream->timing.v_addressable,
+				 stream->timing.h_total,
+				 stream->timing.v_total,
+				 stream->timing.pix_clk_100hz);
+		}
+	}
+
+	if (root)
+		imac19_reboot_snapshot_link(root, "root", stage, read_dpcd);
+	if (slave)
+		imac19_reboot_snapshot_link(slave, "slave", stage, read_dpcd);
+}
+
+static void imac19_reboot_prepare_handoff(struct amdgpu_display_manager *dm)
+{
+	struct dc_link *root;
+	struct dc_link *slave;
+	uint8_t payload = 0;
+	uint8_t readback = 0;
+	enum dc_status write_status;
+	enum dc_status read_status;
+
+	imac19_reboot_find_pair(dm->dc, &root, &slave);
+	if (!imac19_reboot_pair_is_active(dm->dc, root, slave)) {
+		pr_emerg("IMAC5K-REBOOT: handoff action skipped: exact active 5K pair not found\n");
+		return;
+	}
+
+	switch (amdgpu_imac5k_reboot_handoff) {
+	case 1:
+		root->wa_flags.dp_keep_receiver_powered = true;
+		slave->wa_flags.dp_keep_receiver_powered = true;
+		pr_emerg("IMAC5K-REBOOT: handoff preserve-rx enabled on root link=%u and slave link=%u\n",
+			 root->link_index, slave->link_index);
+		break;
+	case 2:
+		write_status = core_link_write_dpcd(root,
+						   IMAC19_REBOOT_DPCD_PANEL_LATCH,
+						   &payload, sizeof(payload));
+		read_status = core_link_read_dpcd(root,
+						  IMAC19_REBOOT_DPCD_PANEL_LATCH,
+						  &readback, sizeof(readback));
+		pr_emerg("IMAC5K-REBOOT: handoff firmware-reset root link=%u write_4f1=0 status=%d read_status=%d readback=%02x\n",
+			 root->link_index, write_status, read_status, readback);
+		usleep_range(10000, 11000);
+		break;
+	default:
+		pr_emerg("IMAC5K-REBOOT: handoff log-only; normal teardown unchanged\n");
+		break;
+	}
+}
+
 static int dm_suspend(struct amdgpu_ip_block *ip_block)
 {
 	struct amdgpu_device *adev = ip_block->adev;
 	struct amdgpu_display_manager *dm = &adev->dm;
+	bool imac19_reboot_trace = imac19_reboot_trace_active();
 
 	if (amdgpu_in_reset(adev)) {
 		enum dc_status res;
@@ -3231,9 +3487,19 @@ static int dm_suspend(struct amdgpu_ip_block *ip_block)
 		return 0;
 	}
 
+	if (imac19_reboot_trace) {
+		imac19_reboot_snapshot(dm, "reboot-handoff-entry", true);
+		imac19_reboot_prepare_handoff(dm);
+		imac19_reboot_snapshot(dm, "before-atomic-suspend", true);
+	}
+
 	if (!adev->dm.cached_state) {
 		int r = dm_cache_state(adev);
 
+		if (imac19_reboot_trace)
+			imac19_reboot_snapshot(dm, r ?
+					       "atomic-suspend-failed" :
+					       "after-atomic-suspend", r != 0);
 		if (r)
 			return r;
 	}
@@ -3246,7 +3512,11 @@ static int dm_suspend(struct amdgpu_ip_block *ip_block)
 
 	hpd_rx_irq_work_suspend(dm);
 
+	if (imac19_reboot_trace)
+		imac19_reboot_snapshot(dm, "before-dc-d3", false);
 	dc_set_power_state(dm->dc, DC_ACPI_CM_POWER_STATE_D3);
+	if (imac19_reboot_trace)
+		imac19_reboot_snapshot(dm, "after-dc-d3", false);
 
 	if (dm->dc->caps.ips_support && adev->in_s0ix)
 		dc_allow_idle_optimizations(dm->dc, true);
