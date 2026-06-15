@@ -1784,6 +1784,8 @@ static void program_timing_sync(
 					    pipe_set[0]->stream_res.tg->inst);
 				for (t = 0; t < group_size; t++) {
 					struct dc_stream_state *ps = pipe_set[t]->stream;
+					struct clock_source *cs = pipe_set[t]->clock_source;
+					struct pll_settings *pll = &pipe_set[t]->pll_settings;
 
 					DC_LOG_INFO("APPLE5K-SYNC   member[%d] link[%d] signal=%d tg_inst=%u %ux%u total=%ux%u pixclk_100hz=%u ignore_msa=%u\n",
 						    t, ps->link ? (int)ps->link->link_index : -1,
@@ -1792,6 +1794,23 @@ static void program_timing_sync(
 						    ps->timing.h_total, ps->timing.v_total,
 						    ps->timing.pix_clk_100hz,
 						    ps->ignore_msa_timing_param);
+					/*
+					 * APPLE5K T5: pixel-coherence probe. GSL aligns the two
+					 * tiles at frame start (vsync), but the panel may only flip
+					 * to native if the two tiles are pixel-clock coherent. Log
+					 * each tile's clock-source id and actual PLL programming: if
+					 * the two members use different clk_src_id, or differ in
+					 * actual_pix_clk/vco/dividers, they are NOT pixel-locked and
+					 * the panel can reject the genlocked signal as native.
+					 */
+					DC_LOG_INFO("APPLE5K-CLK    member[%d] link[%d] clk_src_id=%d dp_clk_src=%d actual_pix_clk_100hz=%u vco=%u ref_div=%u fb_div=%u frac_fb=%u post_div=%u ss_pct=%u\n",
+						    t, ps->link ? (int)ps->link->link_index : -1,
+						    cs ? (int)cs->id : -1,
+						    cs ? (int)cs->dp_clk_src : -1,
+						    pll->actual_pix_clk_100hz, pll->vco_freq,
+						    pll->reference_divider, pll->feedback_divider,
+						    pll->fract_feedback_divider,
+						    pll->pix_clk_post_divider, pll->ss_percentage);
 				}
 			}
 		}
