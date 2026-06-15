@@ -131,6 +131,19 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 		    link->link_index, status, payload, read_status, readback,
 		    link->local_sink);
 	link_apple_5k_log_panel_mode(link, "stream-latch:post");
+
+	/*
+	 * Combined dual-tile enable has resolved (both tiles trained + the slave
+	 * stream-enable latch written). Clear the root's arming flag so a subsequent
+	 * genuine power-off disarms (0x4F1=0) instead of being suppressed. If we
+	 * reached native the latch stays at 1 (the firmware keeps it); we only stop
+	 * SUPPRESSING power-offs from here.
+	 */
+	if (dc_link_has_tiled_root_panel_patch(link))
+		link->apple5k_arming = false;
+	else if (link->tiled_peer &&
+		 dc_link_has_tiled_root_panel_patch(link->tiled_peer))
+		link->tiled_peer->apple5k_arming = false;
 }
 
 /*

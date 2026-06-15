@@ -1751,6 +1751,15 @@ struct dc_scratch_space {
 	 * panel-patch.
 	 */
 	struct dc_link *tiled_peer;
+
+	/*
+	 * APPLE5K: true while the tiled-root 0x4F1 latch is armed and the combined
+	 * dual-tile enable has not yet resolved. While set, the eDP power-off guard
+	 * KEEPS the panel powered (the firmware never power-cycles between arm and
+	 * enable; doing so jams the Pro TCON into stuck-compat). Set at the root
+	 * latch arm, cleared at the slave stream-enable latch (enable resolved).
+	 */
+	bool apple5k_arming;
 };
 
 struct dc {

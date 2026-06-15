@@ -34,6 +34,11 @@
 #include <drm/display/drm_dp_helper.h>
 #include "dm_helpers.h"
 
+#define DC_LOGGER \
+	dc_logger
+#define DC_LOGGER_INIT(logger) \
+	struct dal_logger *dc_logger = logger
+
 #define END_ADDRESS(start, size) (start + size - 1)
 #define ADDRESS_RANGE_SIZE(start, end) (end - start + 1)
 struct dpcd_address_range {
@@ -264,6 +269,46 @@ enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
 	link_apple_5k_log_panel_mode(root_link, "root-latch-pulse:pre");
 	status = core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
 				    &payload, sizeof(payload));
+	/*
+	 * Latch is now armed for the combined dual-tile enable. Mark arming so the
+	 * eDP power-off guard keeps the panel powered until the enable resolves
+	 * (the firmware never power-cycles the panel between arm and enable).
+	 */
+	root_link->apple5k_arming = true;
 	link_apple_5k_log_panel_mode(root_link, "root-latch-pulse:post");
 	return status;
+}
+
+bool link_apple_5k_edp_power_off_guard(struct dc_link *link)
+{
+	uint8_t off = 0;
+	DC_LOGGER_INIT(link ? link->ctx->logger : NULL);
+
+	/* Only the Apple 5K tiled root (eDP) panel is affected. */
+	if (!dc_link_has_tiled_root_panel_patch(link))
+		return false;
+
+	if (link->apple5k_arming) {
+		/*
+		 * Mid arm->enable: keep the panel powered (skip the power-off). Powering
+		 * eDP VDD off while 0x4F1 is armed jams the Pro TCON into stuck-compat
+		 * (survives warm reboot). The firmware keeps the panel powered-but-
+		 * blanked through the combined enable; mirror that here.
+		 */
+		DC_LOG_INFO("APPLE5K: SKIP eDP power-OFF link[%u] (0x4F1 latch armed) to avoid TCON wedge\n",
+			    link->link_index);
+		return true;
+	}
+
+	/*
+	 * Genuine power-off and we are NOT mid-arm: disarm the latch first (write
+	 * 0x4F1=0, the firmware's teardown action) so the panel powers off in its
+	 * quiet base/compat state and is cleanly re-armable next enable. Never leave
+	 * an armed latch across a power-off.
+	 */
+	(void)core_link_write_dpcd(link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
+				   &off, sizeof(off));
+	DC_LOG_INFO("APPLE5K: disarm 0x4F1=0 link[%u] before eDP power-OFF\n",
+		    link->link_index);
+	return false;
 }

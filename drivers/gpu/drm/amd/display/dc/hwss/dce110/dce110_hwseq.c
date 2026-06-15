@@ -780,6 +780,16 @@ void dce110_edp_power_control(
 	if (!link->panel_cntl)
 		return;
 
+	/*
+	 * APPLE5K: on a power-OFF, consult the tiled-root guard. While the 0x4F1
+	 * latch is armed for the combined dual-tile enable it returns true and we
+	 * MUST keep the panel powered (powering off while armed wedges the Pro TCON
+	 * into stuck-compat). Otherwise the guard has already disarmed (0x4F1=0) and
+	 * we proceed with the power-off on a quiet base panel.
+	 */
+	if (!power_up && link_apple_5k_edp_power_off_guard(link))
+		return;
+
 	log_lvtma = link->ctx->dce_version == DCE_VERSION_12_0 &&
 		    dc_link_has_tiled_root_panel_patch(link);
 	panel_on = link->panel_cntl->funcs->is_panel_powered_on(link->panel_cntl);

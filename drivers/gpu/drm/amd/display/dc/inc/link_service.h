@@ -88,6 +88,19 @@ void link_destroy_link_service(struct link_service **link_srv);
  */
 void link_apple_5k_log_panel_mode(struct dc_link *link, const char *stage);
 
+/*
+ * APPLE5K eDP power-off guard (defined in link/protocols/link_dpcd.c). Called by
+ * the hwseq just before an eDP VDD power-OFF. On the Apple 5K tiled root:
+ *  - returns true (caller must SKIP the power-off) while the 0x4F1 latch is armed
+ *    for the combined dual-tile enable — the firmware never power-cycles between
+ *    arm and enable, and doing so wedges the Pro TCON into stuck-compat;
+ *  - otherwise DISARMS the latch (writes 0x4F1=0, the firmware's teardown action)
+ *    and returns false so the caller proceeds with the power-off on a quiet base
+ *    panel.
+ * Returns false (normal power-off) for any non-tiled / non-Apple eDP.
+ */
+bool link_apple_5k_edp_power_off_guard(struct dc_link *link);
+
 struct link_init_data {
 	const struct dc *dc;
 	struct dc_context *ctx; /* TODO: remove 'dal' when DC is complete. */
