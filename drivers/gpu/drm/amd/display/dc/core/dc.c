@@ -1826,6 +1826,65 @@ static void program_timing_sync(
 				 */
 				link_apple_5k_log_panel_mode(pipe_set[0]->stream->link,
 							     "gsl:post");
+				/*
+				 * APPLE5K OTG-COHERENCE: 0x425 stays COMPAT on
+				 * DCE12/Vega although the GSL group, clocks and
+				 * timing are byte-identical to DCE11.2/Polaris
+				 * (which flips NATIVE). COMPAT means the panel sees
+				 * the two tiles as NOT pixel-coherent. GSL aligns
+				 * frame phase across the two OTGs; if it really
+				 * locked, the timing generators scan out in lockstep
+				 * and the per-tile (vcount,hcount) read back-to-back
+				 * shows a STABLE, near-constant inter-tile offset.
+				 * Sample both pipes' live OTG line/frame counters in
+				 * a short burst right after the trigger so we can
+				 * compare the inter-tile phase offset Vega-vs-Polaris:
+				 * a large or wandering (v1-v0) on Vega = GSL did not
+				 * phase-align the pipes on DCE12 (the real bug); a
+				 * stable small offset on both = coherence is fine and
+				 * the COMPAT verdict comes from something else (enable
+				 * ordering / stream packets).
+				 */
+				{
+					int s, t;
+					bool has_tiled = false;
+
+					for (t = 0; t < group_size; t++) {
+						struct dc_link *tl =
+							pipe_set[t]->stream->link;
+
+						if (dc_link_has_tiled_root_panel_patch(tl) ||
+						    dc_link_has_tiled_slave_panel_patch(tl)) {
+							has_tiled = true;
+							break;
+						}
+					}
+
+					for (s = 0; has_tiled && s < 12; s++) {
+						for (t = 0; t < group_size; t++) {
+							struct timing_generator *tg =
+								pipe_set[t]->stream_res.tg;
+							struct dc_stream_state *ps =
+								pipe_set[t]->stream;
+							struct crtc_position pos = {0};
+							uint32_t fc = 0;
+
+							if (tg->funcs->get_position)
+								tg->funcs->get_position(tg, &pos);
+							if (tg->funcs->get_frame_count)
+								fc = tg->funcs->get_frame_count(tg);
+
+							DC_LOG_INFO("APPLE5K-OTG    sample[%d] member[%d] link[%d] tg_inst=%u frame=%u vcount=%d hcount=%d nominal_v=%d\n",
+								    s, t,
+								    ps->link ? (int)ps->link->link_index : -1,
+								    tg->inst, fc,
+								    pos.vertical_count,
+								    pos.horizontal_count,
+								    pos.nominal_vcount);
+						}
+						udelay(120);
+					}
+				}
 			} else
 				if (sync_type == VBLANK_SYNCHRONIZABLE) {
 				dc->hwss.enable_vblanks_synchronization(
