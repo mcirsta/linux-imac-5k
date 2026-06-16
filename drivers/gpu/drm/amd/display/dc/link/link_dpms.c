@@ -378,14 +378,21 @@ static bool apple5k_pipe_is_blanked(struct pipe_ctx *pipe_ctx)
 	return false;
 }
 
-static bool apple5k_state_has_complete_pair(struct dc_state *state,
-					    struct dc_link *root)
+static bool apple5k_state_get_pair_pipes(struct dc_state *state,
+					 struct dc_link *root,
+					 struct pipe_ctx **root_pipe_out,
+					 struct pipe_ctx **slave_pipe_out)
 {
-	bool has_root = false;
-	bool has_slave = false;
+	struct pipe_ctx *root_pipe = NULL;
+	struct pipe_ctx *slave_pipe = NULL;
 	struct dc_stream_state *root_stream = NULL;
 	struct dc_stream_state *slave_stream = NULL;
 	int i;
+
+	if (root_pipe_out)
+		*root_pipe_out = NULL;
+	if (slave_pipe_out)
+		*slave_pipe_out = NULL;
 
 	if (!state || !dc_link_has_tiled_root_panel_patch(root))
 		return false;
@@ -399,23 +406,33 @@ static bool apple5k_state_has_complete_pair(struct dc_state *state,
 
 		link = pipe->stream->link;
 		if (link == root && dc_link_has_tiled_root_panel_patch(link)) {
-			has_root = true;
+			root_pipe = pipe;
 			root_stream = pipe->stream;
 		} else if (apple5k_root_for_link(link) == root &&
 			   dc_link_has_tiled_slave_panel_patch(link)) {
-			has_slave = true;
+			slave_pipe = pipe;
 			slave_stream = pipe->stream;
 		}
 	}
 
-	return has_root && has_slave &&
-	       resource_are_streams_timing_synchronizable(root_stream,
-							 slave_stream);
+	if (!root_pipe || !slave_pipe ||
+	    !resource_are_streams_timing_synchronizable(root_stream,
+						       slave_stream))
+		return false;
+
+	if (root_pipe_out)
+		*root_pipe_out = root_pipe;
+	if (slave_pipe_out)
+		*slave_pipe_out = slave_pipe;
+
+	return true;
 }
 
 static bool apple5k_should_coordinate_pipe(struct dc_state *state,
 					   struct pipe_ctx *pipe_ctx)
 {
+	struct pipe_ctx *root_pipe = NULL;
+	struct pipe_ctx *slave_pipe = NULL;
 	struct dc_link *root;
 
 	if (amdgpu_apple5k_coordinated_enable <= 0 ||
@@ -423,7 +440,15 @@ static bool apple5k_should_coordinate_pipe(struct dc_state *state,
 		return false;
 
 	root = apple5k_root_for_link(pipe_ctx->stream->link);
-	return apple5k_state_has_complete_pair(state, root);
+	if (!apple5k_state_get_pair_pipes(state, root, &root_pipe, &slave_pipe))
+		return false;
+
+	/*
+	 * Partial slave retrains are stable on the legacy path; only hold both
+	 * tiles for the GSL drain when the pair is actually blanked together.
+	 */
+	return apple5k_pipe_is_blanked(root_pipe) &&
+	       apple5k_pipe_is_blanked(slave_pipe);
 }
 
 static void apple5k_run_stream_latch_and_status(struct dc_link *link)
@@ -478,13 +503,6 @@ void link_apple_5k_coordinated_enable(struct dc *dc, int group_size,
 	slave_blank = apple5k_pipe_is_blanked(slave_pipe);
 	dc_logger = root_link->ctx->logger;
 
-	if (!root_blank || !slave_blank) {
-		DC_LOG_INFO("APPLE5K-UNBLANK coordinated skip root_link[%u] slave_link[%u] root_blank=%d slave_blank=%d reason=already-live\n",
-			    root_link->link_index, slave_link->link_index,
-			    root_blank, slave_blank);
-		return;
-	}
-
 	read_status = core_link_read_dpcd(root_link, APPLE_5K_DPCD_PANEL_LATCH,
 					  &latch, sizeof(latch));
 	if (read_status != DC_OK || latch != 1) {
@@ -499,17 +517,28 @@ void link_apple_5k_coordinated_enable(struct dc *dc, int group_size,
 			    root_link->link_index, read_status, latch);
 	}
 
+	if (!root_blank && !slave_blank) {
+		DC_LOG_INFO("APPLE5K-UNBLANK coordinated refresh root_link[%u] slave_link[%u] root_blank=%d slave_blank=%d reason=already-live\n",
+			    root_link->link_index, slave_link->link_index,
+			    root_blank, slave_blank);
+		apple5k_run_stream_latch_and_status(root_link);
+		apple5k_run_stream_latch_and_status(slave_link);
+		return;
+	}
+
 	DC_LOG_INFO("APPLE5K-UNBLANK coordinated start root_link[%u] slave_link[%u] root_tg=%u slave_tg=%u root_blank=%d slave_blank=%d\n",
 		    root_link->link_index, slave_link->link_index,
 		    root_pipe->stream_res.tg->inst, slave_pipe->stream_res.tg->inst,
 		    root_blank, slave_blank);
 
 	start_ns = ktime_get_ns();
-	dc->hwss.unblank_stream(root_pipe,
-		&root_pipe->stream->link->cur_link_settings);
+	if (root_blank)
+		dc->hwss.unblank_stream(root_pipe,
+			&root_pipe->stream->link->cur_link_settings);
 	mid_ns = ktime_get_ns();
-	dc->hwss.unblank_stream(slave_pipe,
-		&slave_pipe->stream->link->cur_link_settings);
+	if (slave_blank)
+		dc->hwss.unblank_stream(slave_pipe,
+			&slave_pipe->stream->link->cur_link_settings);
 	end_ns = ktime_get_ns();
 
 	DC_LOG_INFO("APPLE5K-UNBLANK coordinated done root_link[%u] slave_link[%u] gap_ns=%llu total_ns=%llu root_blank_after=%d slave_blank_after=%d\n",
