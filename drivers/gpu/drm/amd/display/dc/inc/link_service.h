@@ -83,10 +83,20 @@ void link_destroy_link_service(struct link_service **link_srv);
 /*
  * APPLE5K read-only mode probe (defined in link/link_dpms.c). Declared on the
  * link-service boundary so core (dc.c) can log the tiled-5K panel's native/compat
- * mode (DPCD 0x41C/0x425/0x4F1) at the GSL/commit boundaries. No-op on NULL or
- * non-tiled links; never writes.
+ * mode/status (DPCD 0x41C/0x41F/0x423/0x425/0x42F/0x4F1) at the
+ * GSL/commit boundaries. No-op on NULL or non-tiled links; never writes.
  */
 void link_apple_5k_log_panel_mode(struct dc_link *link, const char *stage);
+
+/*
+ * APPLE5K coordinated enable drain (defined in link/link_dpms.c). Called by
+ * core timing sync after GSL forms the two-tile group. If the group is an Apple
+ * 5K pair and per-pipe DPMS deferred unblank, this opens the root+slave pixel
+ * gates back-to-back and then runs the final stream latch/status probe. No-op
+ * for all other groups.
+ */
+void link_apple_5k_coordinated_enable(struct dc *dc, int group_size,
+				      struct pipe_ctx *pipe_set[]);
 
 /*
  * APPLE5K eDP power-off guard (defined in link/protocols/link_dpcd.c). Called by

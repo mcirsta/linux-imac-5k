@@ -1819,6 +1819,8 @@ static void program_timing_sync(
 			if (sync_type == TIMING_SYNCHRONIZABLE) {
 				dc->hwss.enable_timing_synchronization(
 					dc, ctx, group_index, group_size, pipe_set);
+				link_apple_5k_coordinated_enable(
+					dc, group_size, pipe_set);
 				/*
 				 * APPLE5K T2: read the tiled panel mode immediately after the
 				 * GSL genlock returns, to see whether the compat->native flip

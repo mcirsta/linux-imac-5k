@@ -206,6 +206,7 @@ extern uint amdgpu_dc_feature_mask;
 extern uint amdgpu_freesync_vid_mode;
 extern uint amdgpu_dc_debug_mask;
 extern uint amdgpu_dc_visual_confirm;
+extern int amdgpu_apple5k_coordinated_enable;
 extern int amdgpu_dm_abm_level;
 extern int amdgpu_backlight;
 extern int amdgpu_damage_clips;

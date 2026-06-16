@@ -261,10 +261,30 @@ enum dc_status core_link_write_dpcd(
 enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
 {
 	uint8_t payload = 1;
+	uint8_t readback = 0;
 	enum dc_status status;
+	enum dc_status read_status;
+
+	DC_LOGGER_INIT(root_link ? root_link->ctx->logger : NULL);
 
 	if (!dc_link_has_tiled_root_panel_patch(root_link))
 		return DC_OK;
+
+	if (root_link->apple5k_arming) {
+		read_status = core_link_read_dpcd(root_link,
+						  APPLE_5K_DPCD_ROOT_PANEL_LATCH,
+						  &readback, sizeof(readback));
+		if (read_status == DC_OK && readback == 1) {
+			DC_LOG_INFO("APPLE5K: root wake 0x4F1 skip already-armed root_link[%u] readback=0x%02x\n",
+				    root_link->link_index, readback);
+			link_apple_5k_log_panel_mode(root_link,
+						     "root-latch-pulse:skip");
+			return DC_OK;
+		}
+
+		DC_LOG_INFO("APPLE5K: root wake 0x4F1 re-arm root_link[%u] read_status=%d readback=0x%02x\n",
+			    root_link->link_index, read_status, readback);
+	}
 
 	link_apple_5k_log_panel_mode(root_link, "root-latch-pulse:pre");
 	status = core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,

@@ -58,6 +58,7 @@
 #include "atomfirmware.h"
 #include "vpg.h"
 #include "grph_object_id.h"
+#include <linux/ktime.h>
 
 #define DC_LOGGER \
 	dc_logger
@@ -77,17 +78,19 @@
 #define PEAK_FACTOR_X1000 1006
 #define APPLE_5K_DPCD_PANEL_LATCH 0x4F1
 
+extern int amdgpu_apple5k_coordinated_enable;
+
 /*
  * APPLE5K mode-bisection probe (read-only). See link_dpcd.h. Resolves the tiled
- * ROOT (eDP) link from any tiled link and logs its 0x41C/0x425/0x4F1 mode
- * triplet, tagged with `stage`, so a Polaris boot log shows exactly which enable
- * step flips the panel compat->native (and a Vega log shows where it fails to).
+ * ROOT (eDP) link from any tiled link and logs its Apple-private status bytes,
+ * tagged with `stage`, so a Polaris boot log shows exactly which enable step
+ * flips the panel compat->native (and a Vega log shows where it fails to).
  */
 void link_apple_5k_log_panel_mode(struct dc_link *link, const char *stage)
 {
 	struct dc_link *root = NULL;
-	uint8_t r41c = 0, r425 = 0, r4f1 = 0;
-	enum dc_status s41c, s425, s4f1;
+	uint8_t r41c = 0, r41f = 0, r423 = 0, r425 = 0, r42f = 0, r4f1 = 0;
+	enum dc_status s41c, s41f, s423, s425, s42f, s4f1;
 
 	if (!link)
 		return;
@@ -101,11 +104,16 @@ void link_apple_5k_log_panel_mode(struct dc_link *link, const char *stage)
 
 	DC_LOGGER_INIT(root->ctx->logger);
 	s41c = core_link_read_dpcd(root, 0x41C, &r41c, sizeof(r41c));
+	s41f = core_link_read_dpcd(root, 0x41F, &r41f, sizeof(r41f));
+	s423 = core_link_read_dpcd(root, 0x423, &r423, sizeof(r423));
 	s425 = core_link_read_dpcd(root, 0x425, &r425, sizeof(r425));
+	s42f = core_link_read_dpcd(root, 0x42F, &r42f, sizeof(r42f));
 	s4f1 = core_link_read_dpcd(root, 0x4F1, &r4f1, sizeof(r4f1));
-	DC_LOG_INFO("APPLE5K-MODE stage=%s link[%u] root[%u] 0x41C=0x%02x(s=%d) 0x425=0x%02x(s=%d) 0x4F1=0x%02x(s=%d) -> %s\n",
+	DC_LOG_INFO("APPLE5K-MODE stage=%s link[%u] root[%u] 0x41C=0x%02x(s=%d) 0x41F=0x%02x(s=%d) 0x423=0x%02x(s=%d,b2=%u) 0x425=0x%02x(s=%d) 0x42F=0x%02x(s=%d) 0x4F1=0x%02x(s=%d) -> %s\n",
 		    stage ? stage : "?", link->link_index, root->link_index,
-		    r41c, s41c, r425, s425, r4f1, s4f1,
+		    r41c, s41c, r41f, s41f, r423, s423,
+		    (s423 == DC_OK) ? ((r423 >> 2) & 1) : 0,
+		    r425, s425, r42f, s42f, r4f1, s4f1,
 		    (s425 == DC_OK) ? ((r425 & 0x02) ? "COMPAT" : "NATIVE")
 				    : "0x425-NACK");
 }
@@ -328,6 +336,196 @@ void link_get_master_pipes_with_dpms_on(const struct dc_link *link,
 			pipes[(*count)++] = pipe;
 		}
 	}
+}
+
+static struct dc_link *apple5k_root_for_link(struct dc_link *link)
+{
+	if (dc_link_has_tiled_root_panel_patch(link))
+		return link;
+
+	if (dc_link_has_tiled_slave_panel_patch(link) &&
+	    dc_link_has_tiled_root_panel_patch(link->tiled_peer))
+		return link->tiled_peer;
+
+	return NULL;
+}
+
+static bool apple5k_is_tile(struct dc_link *link)
+{
+	return apple5k_root_for_link(link) != NULL;
+}
+
+static bool apple5k_pipe_is_tile(struct pipe_ctx *pipe_ctx)
+{
+	return pipe_ctx && pipe_ctx->stream &&
+	       apple5k_is_tile(pipe_ctx->stream->link);
+}
+
+static bool apple5k_pipe_is_blanked(struct pipe_ctx *pipe_ctx)
+{
+	if (!pipe_ctx || !pipe_ctx->stream_res.tg)
+		return false;
+
+	if (pipe_ctx->stream_res.opp &&
+	    pipe_ctx->stream_res.opp->funcs->dpg_is_blanked)
+		return pipe_ctx->stream_res.opp->funcs->dpg_is_blanked(
+				pipe_ctx->stream_res.opp);
+
+	if (pipe_ctx->stream_res.tg->funcs->is_blanked)
+		return pipe_ctx->stream_res.tg->funcs->is_blanked(
+				pipe_ctx->stream_res.tg);
+
+	return false;
+}
+
+static bool apple5k_state_has_complete_pair(struct dc_state *state,
+					    struct dc_link *root)
+{
+	bool has_root = false;
+	bool has_slave = false;
+	struct dc_stream_state *root_stream = NULL;
+	struct dc_stream_state *slave_stream = NULL;
+	int i;
+
+	if (!state || !dc_link_has_tiled_root_panel_patch(root))
+		return false;
+
+	for (i = 0; i < MAX_PIPES; i++) {
+		struct pipe_ctx *pipe = &state->res_ctx.pipe_ctx[i];
+		struct dc_link *link;
+
+		if (!pipe->stream || pipe->top_pipe || pipe->prev_odm_pipe)
+			continue;
+
+		link = pipe->stream->link;
+		if (link == root && dc_link_has_tiled_root_panel_patch(link)) {
+			has_root = true;
+			root_stream = pipe->stream;
+		} else if (apple5k_root_for_link(link) == root &&
+			   dc_link_has_tiled_slave_panel_patch(link)) {
+			has_slave = true;
+			slave_stream = pipe->stream;
+		}
+	}
+
+	return has_root && has_slave &&
+	       resource_are_streams_timing_synchronizable(root_stream,
+							 slave_stream);
+}
+
+static bool apple5k_should_coordinate_pipe(struct dc_state *state,
+					   struct pipe_ctx *pipe_ctx)
+{
+	struct dc_link *root;
+
+	if (amdgpu_apple5k_coordinated_enable <= 0 ||
+	    !apple5k_pipe_is_tile(pipe_ctx))
+		return false;
+
+	root = apple5k_root_for_link(pipe_ctx->stream->link);
+	return apple5k_state_has_complete_pair(state, root);
+}
+
+static void apple5k_run_stream_latch_and_status(struct dc_link *link)
+{
+	dp_write_tiled_stream_enable_latch(link);
+	apple5k_log_sink_link_status(link);
+}
+
+void link_apple_5k_coordinated_enable(struct dc *dc, int group_size,
+				      struct pipe_ctx *pipe_set[])
+{
+	struct pipe_ctx *root_pipe = NULL;
+	struct pipe_ctx *slave_pipe = NULL;
+	struct dc_link *root_link;
+	struct dc_link *slave_link;
+	enum dc_status read_status;
+	uint8_t latch = 0;
+	bool root_blank;
+	bool slave_blank;
+	struct dal_logger *dc_logger;
+	u64 start_ns;
+	u64 mid_ns;
+	u64 end_ns;
+	int i;
+
+	if (!dc || !pipe_set || amdgpu_apple5k_coordinated_enable <= 0)
+		return;
+
+	for (i = 0; i < group_size; i++) {
+		struct pipe_ctx *pipe = pipe_set[i];
+		struct dc_link *link;
+
+		if (!pipe || !pipe->stream)
+			continue;
+
+		link = pipe->stream->link;
+		if (!apple5k_is_tile(link))
+			continue;
+
+		if (dc_link_has_tiled_root_panel_patch(link))
+			root_pipe = pipe;
+		else if (dc_link_has_tiled_slave_panel_patch(link))
+			slave_pipe = pipe;
+	}
+
+	if (!root_pipe || !slave_pipe)
+		return;
+
+	root_link = root_pipe->stream->link;
+	slave_link = slave_pipe->stream->link;
+	root_blank = apple5k_pipe_is_blanked(root_pipe);
+	slave_blank = apple5k_pipe_is_blanked(slave_pipe);
+	dc_logger = root_link->ctx->logger;
+
+	if (!root_blank || !slave_blank) {
+		DC_LOG_INFO("APPLE5K-UNBLANK coordinated skip root_link[%u] slave_link[%u] root_blank=%d slave_blank=%d reason=already-live\n",
+			    root_link->link_index, slave_link->link_index,
+			    root_blank, slave_blank);
+		return;
+	}
+
+	read_status = core_link_read_dpcd(root_link, APPLE_5K_DPCD_PANEL_LATCH,
+					  &latch, sizeof(latch));
+	if (read_status != DC_OK || latch != 1) {
+		enum dc_status arm_status =
+			link_apple_5k_root_panel_latch_pulse(root_link);
+
+		DC_LOG_INFO("APPLE5K-ARM-COUNT coordinated enable-arm root_link[%u] prior_read_status=%d prior_4f1=0x%02x write_status=%d\n",
+			    root_link->link_index, read_status, latch, arm_status);
+	} else {
+		root_link->apple5k_arming = true;
+		DC_LOG_INFO("APPLE5K-ARM-COUNT coordinated enable-arm root_link[%u] already_armed read_status=%d 4f1=0x%02x\n",
+			    root_link->link_index, read_status, latch);
+	}
+
+	DC_LOG_INFO("APPLE5K-UNBLANK coordinated start root_link[%u] slave_link[%u] root_tg=%u slave_tg=%u root_blank=%d slave_blank=%d\n",
+		    root_link->link_index, slave_link->link_index,
+		    root_pipe->stream_res.tg->inst, slave_pipe->stream_res.tg->inst,
+		    root_blank, slave_blank);
+
+	start_ns = ktime_get_ns();
+	dc->hwss.unblank_stream(root_pipe,
+		&root_pipe->stream->link->cur_link_settings);
+	mid_ns = ktime_get_ns();
+	dc->hwss.unblank_stream(slave_pipe,
+		&slave_pipe->stream->link->cur_link_settings);
+	end_ns = ktime_get_ns();
+
+	DC_LOG_INFO("APPLE5K-UNBLANK coordinated done root_link[%u] slave_link[%u] gap_ns=%llu total_ns=%llu root_blank_after=%d slave_blank_after=%d\n",
+		    root_link->link_index, slave_link->link_index,
+		    (unsigned long long)(mid_ns - start_ns),
+		    (unsigned long long)(end_ns - start_ns),
+		    apple5k_pipe_is_blanked(root_pipe),
+		    apple5k_pipe_is_blanked(slave_pipe));
+
+	if (root_pipe->stream->sink_patches.delay_ignore_msa > 0)
+		msleep(root_pipe->stream->sink_patches.delay_ignore_msa);
+	if (slave_pipe->stream->sink_patches.delay_ignore_msa > 0)
+		msleep(slave_pipe->stream->sink_patches.delay_ignore_msa);
+
+	apple5k_run_stream_latch_and_status(root_link);
+	apple5k_run_stream_latch_and_status(slave_link);
 }
 
 static bool get_ext_hdmi_settings(struct pipe_ctx *pipe_ctx,
@@ -1156,7 +1354,8 @@ bool link_update_dsc_config(struct pipe_ctx *pipe_ctx)
 	return true;
 }
 
-static void enable_stream_features(struct pipe_ctx *pipe_ctx)
+static void enable_stream_features(struct pipe_ctx *pipe_ctx,
+				   bool defer_apple5k_latch)
 {
 	struct dc_stream_state *stream = pipe_ctx->stream;
 
@@ -1209,8 +1408,11 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx)
 				    old_downspread.raw, new_downspread.raw,
 				    write_status, stream->ignore_msa_timing_param);
 
-		dp_write_tiled_stream_enable_latch(link);
-		apple5k_log_sink_link_status(link);
+		if (defer_apple5k_latch && apple5k_is_tile(link))
+			DC_LOG_INFO("APPLE5K: defer stream-latch/status link[%u] until coordinated unblank\n",
+				    link->link_index);
+		else
+			apple5k_run_stream_latch_and_status(link);
 	} else {
 		dm_helpers_mst_enable_stream_features(stream);
 	}
@@ -2632,7 +2834,7 @@ void link_set_dpms_on(
 
 		/* Still enable stream features & audio on seamless boot for DP external displays */
 		if (pipe_ctx->stream->signal == SIGNAL_TYPE_DISPLAY_PORT) {
-			enable_stream_features(pipe_ctx);
+			enable_stream_features(pipe_ctx, false);
 			dc->hwss.enable_audio_stream(pipe_ctx);
 		}
 
@@ -2759,14 +2961,23 @@ void link_set_dpms_on(
 			link->is_display_mux_present)
 		msleep(20);
 
-	dc->hwss.unblank_stream(pipe_ctx,
-		&pipe_ctx->stream->link->cur_link_settings);
+	if (apple5k_should_coordinate_pipe(state, pipe_ctx)) {
+		DC_LOG_INFO("APPLE5K-UNBLANK defer link[%u] role=%s tg_inst=%u until GSL coordinated enable\n",
+			    link->link_index,
+			    dc_link_has_tiled_root_panel_patch(link) ? "root" : "slave",
+			    pipe_ctx->stream_res.tg->inst);
+		if (dc_is_dp_signal(pipe_ctx->stream->signal))
+			enable_stream_features(pipe_ctx, true);
+	} else {
+		dc->hwss.unblank_stream(pipe_ctx,
+			&pipe_ctx->stream->link->cur_link_settings);
 
-	if (stream->sink_patches.delay_ignore_msa > 0)
-		msleep(stream->sink_patches.delay_ignore_msa);
+		if (stream->sink_patches.delay_ignore_msa > 0)
+			msleep(stream->sink_patches.delay_ignore_msa);
 
-	if (dc_is_dp_signal(pipe_ctx->stream->signal))
-		enable_stream_features(pipe_ctx);
+		if (dc_is_dp_signal(pipe_ctx->stream->signal))
+			enable_stream_features(pipe_ctx, false);
+	}
 	update_psp_stream_config(pipe_ctx, false);
 
 	dc->hwss.enable_audio_stream(pipe_ctx);
