@@ -507,6 +507,13 @@ void link_apple_5k_finalize_tiled_pair(struct dc *dc, int group_size,
 	slave_blank = apple5k_pipe_is_blanked(slave_pipe);
 	dc_logger = root_link->ctx->logger;
 
+	if (!root_blank || !slave_blank) {
+		DC_LOG_INFO("APPLE5K-UNBLANK pair-finalizer skip root_link[%u] slave_link[%u] root_blank=%d slave_blank=%d reason=not-deferred-pair\n",
+			    root_link->link_index, slave_link->link_index,
+			    root_blank, slave_blank);
+		return;
+	}
+
 	read_status = core_link_read_dpcd(root_link, APPLE_5K_DPCD_PANEL_LATCH,
 					  &latch, sizeof(latch));
 	if (read_status != DC_OK || latch != 1) {
@@ -519,15 +526,6 @@ void link_apple_5k_finalize_tiled_pair(struct dc *dc, int group_size,
 		root_link->apple5k_arming = true;
 		DC_LOG_INFO("APPLE5K-ARM-COUNT pair-finalizer arm root_link[%u] already_armed read_status=%d 4f1=0x%02x\n",
 			    root_link->link_index, read_status, latch);
-	}
-
-	if (!root_blank && !slave_blank) {
-		DC_LOG_INFO("APPLE5K-UNBLANK pair-finalizer refresh root_link[%u] slave_link[%u] root_blank=%d slave_blank=%d reason=already-live\n",
-			    root_link->link_index, slave_link->link_index,
-			    root_blank, slave_blank);
-		apple5k_latch_stream_and_log_status(root_link);
-		apple5k_latch_stream_and_log_status(slave_link);
-		return;
 	}
 
 	DC_LOG_INFO("APPLE5K-UNBLANK pair-finalizer start root_link[%u] slave_link[%u] root_tg=%u slave_tg=%u root_blank=%d slave_blank=%d\n",
