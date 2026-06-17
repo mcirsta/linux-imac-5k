@@ -89,14 +89,12 @@ void link_destroy_link_service(struct link_service **link_srv);
 void link_apple_5k_log_panel_mode(struct dc_link *link, const char *stage);
 
 /*
- * APPLE5K coordinated enable drain (defined in link/link_dpms.c). Called by
- * core timing sync after GSL forms the two-tile group. If the group is an Apple
- * 5K pair and per-pipe DPMS deferred unblank, this opens the root+slave pixel
- * gates back-to-back and then runs the final stream latch/status probe. No-op
- * for all other groups.
+ * APPLE5K tiled-pair finalizer (defined in link/link_dpms.c). Called after DC
+ * accepts the root+slave timing group, mirroring the Windows shape where the
+ * pair-level side effect happens late instead of from each independent stream.
  */
-void link_apple_5k_coordinated_enable(struct dc *dc, int group_size,
-				      struct pipe_ctx *pipe_set[]);
+void link_apple_5k_finalize_tiled_pair(struct dc *dc, int group_size,
+				       struct pipe_ctx *pipe_set[]);
 
 /*
  * APPLE5K eDP power-off guard (defined in link/protocols/link_dpcd.c). Called by

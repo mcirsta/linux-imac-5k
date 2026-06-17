@@ -222,6 +222,7 @@ uint amdgpu_dc_feature_mask = 2;
 uint amdgpu_dc_debug_mask;
 uint amdgpu_dc_visual_confirm;
 int amdgpu_apple5k_coordinated_enable = 1;
+int amdgpu_apple5k_dce12_force_msa_ignore;
 int amdgpu_async_gfx_ring = 1;
 int amdgpu_mcbp = -1;
 int amdgpu_discovery = -1;
@@ -905,6 +906,11 @@ module_param_named(visualconfirm, amdgpu_dc_visual_confirm, uint, 0444);
 MODULE_PARM_DESC(apple5k_coordinated_enable,
 		 "Apple 5K tiled panel coordinated blanked enable (0 = off, 1 = on (default))");
 module_param_named(apple5k_coordinated_enable, amdgpu_apple5k_coordinated_enable, int, 0444);
+
+MODULE_PARM_DESC(apple5k_dce12_force_msa_ignore,
+		 "Apple 5K DCE12 tiled panel force DPCD 0x107 bit 7 (0 = off (default), 1 = on)");
+module_param_named(apple5k_dce12_force_msa_ignore,
+		   amdgpu_apple5k_dce12_force_msa_ignore, int, 0444);
 
 /**
  * DOC: abmlevel (uint)

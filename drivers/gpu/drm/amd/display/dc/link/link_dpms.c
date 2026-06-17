@@ -79,6 +79,7 @@
 #define APPLE_5K_DPCD_PANEL_LATCH 0x4F1
 
 extern int amdgpu_apple5k_coordinated_enable;
+extern int amdgpu_apple5k_dce12_force_msa_ignore;
 
 /*
  * APPLE5K mode-bisection probe (read-only). See link_dpcd.h. Resolves the tiled
@@ -378,10 +379,10 @@ static bool apple5k_pipe_is_blanked(struct pipe_ctx *pipe_ctx)
 	return false;
 }
 
-static bool apple5k_state_get_pair_pipes(struct dc_state *state,
-					 struct dc_link *root,
-					 struct pipe_ctx **root_pipe_out,
-					 struct pipe_ctx **slave_pipe_out)
+static bool apple5k_state_get_timing_pair(struct dc_state *state,
+					  struct dc_link *root,
+					  struct pipe_ctx **root_pipe_out,
+					  struct pipe_ctx **slave_pipe_out)
 {
 	struct pipe_ctx *root_pipe = NULL;
 	struct pipe_ctx *slave_pipe = NULL;
@@ -428,8 +429,8 @@ static bool apple5k_state_get_pair_pipes(struct dc_state *state,
 	return true;
 }
 
-static bool apple5k_should_coordinate_pipe(struct dc_state *state,
-					   struct pipe_ctx *pipe_ctx)
+static bool apple5k_should_defer_pair_finalizer(struct dc_state *state,
+						struct pipe_ctx *pipe_ctx)
 {
 	struct pipe_ctx *root_pipe = NULL;
 	struct pipe_ctx *slave_pipe = NULL;
@@ -440,7 +441,7 @@ static bool apple5k_should_coordinate_pipe(struct dc_state *state,
 		return false;
 
 	root = apple5k_root_for_link(pipe_ctx->stream->link);
-	if (!apple5k_state_get_pair_pipes(state, root, &root_pipe, &slave_pipe))
+	if (!apple5k_state_get_timing_pair(state, root, &root_pipe, &slave_pipe))
 		return false;
 
 	/*
@@ -451,14 +452,14 @@ static bool apple5k_should_coordinate_pipe(struct dc_state *state,
 	       apple5k_pipe_is_blanked(slave_pipe);
 }
 
-static void apple5k_run_stream_latch_and_status(struct dc_link *link)
+static void apple5k_latch_stream_and_log_status(struct dc_link *link)
 {
 	dp_write_tiled_stream_enable_latch(link);
 	apple5k_log_sink_link_status(link);
 }
 
-void link_apple_5k_coordinated_enable(struct dc *dc, int group_size,
-				      struct pipe_ctx *pipe_set[])
+void link_apple_5k_finalize_tiled_pair(struct dc *dc, int group_size,
+				       struct pipe_ctx *pipe_set[])
 {
 	struct pipe_ctx *root_pipe = NULL;
 	struct pipe_ctx *slave_pipe = NULL;
@@ -496,6 +497,9 @@ void link_apple_5k_coordinated_enable(struct dc *dc, int group_size,
 
 	if (!root_pipe || !slave_pipe)
 		return;
+	if (!resource_are_streams_timing_synchronizable(root_pipe->stream,
+						       slave_pipe->stream))
+		return;
 
 	root_link = root_pipe->stream->link;
 	slave_link = slave_pipe->stream->link;
@@ -509,24 +513,24 @@ void link_apple_5k_coordinated_enable(struct dc *dc, int group_size,
 		enum dc_status arm_status =
 			link_apple_5k_root_panel_latch_pulse(root_link);
 
-		DC_LOG_INFO("APPLE5K-ARM-COUNT coordinated enable-arm root_link[%u] prior_read_status=%d prior_4f1=0x%02x write_status=%d\n",
+		DC_LOG_INFO("APPLE5K-ARM-COUNT pair-finalizer arm root_link[%u] prior_read_status=%d prior_4f1=0x%02x write_status=%d\n",
 			    root_link->link_index, read_status, latch, arm_status);
 	} else {
 		root_link->apple5k_arming = true;
-		DC_LOG_INFO("APPLE5K-ARM-COUNT coordinated enable-arm root_link[%u] already_armed read_status=%d 4f1=0x%02x\n",
+		DC_LOG_INFO("APPLE5K-ARM-COUNT pair-finalizer arm root_link[%u] already_armed read_status=%d 4f1=0x%02x\n",
 			    root_link->link_index, read_status, latch);
 	}
 
 	if (!root_blank && !slave_blank) {
-		DC_LOG_INFO("APPLE5K-UNBLANK coordinated refresh root_link[%u] slave_link[%u] root_blank=%d slave_blank=%d reason=already-live\n",
+		DC_LOG_INFO("APPLE5K-UNBLANK pair-finalizer refresh root_link[%u] slave_link[%u] root_blank=%d slave_blank=%d reason=already-live\n",
 			    root_link->link_index, slave_link->link_index,
 			    root_blank, slave_blank);
-		apple5k_run_stream_latch_and_status(root_link);
-		apple5k_run_stream_latch_and_status(slave_link);
+		apple5k_latch_stream_and_log_status(root_link);
+		apple5k_latch_stream_and_log_status(slave_link);
 		return;
 	}
 
-	DC_LOG_INFO("APPLE5K-UNBLANK coordinated start root_link[%u] slave_link[%u] root_tg=%u slave_tg=%u root_blank=%d slave_blank=%d\n",
+	DC_LOG_INFO("APPLE5K-UNBLANK pair-finalizer start root_link[%u] slave_link[%u] root_tg=%u slave_tg=%u root_blank=%d slave_blank=%d\n",
 		    root_link->link_index, slave_link->link_index,
 		    root_pipe->stream_res.tg->inst, slave_pipe->stream_res.tg->inst,
 		    root_blank, slave_blank);
@@ -541,7 +545,7 @@ void link_apple_5k_coordinated_enable(struct dc *dc, int group_size,
 			&slave_pipe->stream->link->cur_link_settings);
 	end_ns = ktime_get_ns();
 
-	DC_LOG_INFO("APPLE5K-UNBLANK coordinated done root_link[%u] slave_link[%u] gap_ns=%llu total_ns=%llu root_blank_after=%d slave_blank_after=%d\n",
+	DC_LOG_INFO("APPLE5K-UNBLANK pair-finalizer done root_link[%u] slave_link[%u] gap_ns=%llu total_ns=%llu root_blank_after=%d slave_blank_after=%d\n",
 		    root_link->link_index, slave_link->link_index,
 		    (unsigned long long)(mid_ns - start_ns),
 		    (unsigned long long)(end_ns - start_ns),
@@ -553,8 +557,8 @@ void link_apple_5k_coordinated_enable(struct dc *dc, int group_size,
 	if (slave_pipe->stream->sink_patches.delay_ignore_msa > 0)
 		msleep(slave_pipe->stream->sink_patches.delay_ignore_msa);
 
-	apple5k_run_stream_latch_and_status(root_link);
-	apple5k_run_stream_latch_and_status(slave_link);
+	apple5k_latch_stream_and_log_status(root_link);
+	apple5k_latch_stream_and_log_status(slave_link);
 }
 
 static bool get_ext_hdmi_settings(struct pipe_ctx *pipe_ctx,
@@ -1383,6 +1387,57 @@ bool link_update_dsc_config(struct pipe_ctx *pipe_ctx)
 	return true;
 }
 
+static void program_msa_timing_ignore(struct dc_stream_state *stream)
+{
+	struct dc_link *link = stream->link;
+	union down_spread_ctrl old_downspread;
+	union down_spread_ctrl new_downspread;
+	bool apple5k_dce12_tile;
+	bool apple5k_force_msa_ignore;
+	enum dc_status read_status;
+	enum dc_status write_status = DC_OK;
+	bool wrote_downspread = false;
+
+	if (!link)
+		return;
+
+	/*
+	 * Optional Apple 5K/DCE12 A/B: force sink DPCD 0x107[7] without
+	 * setting stream->ignore_msa_timing_param, so DC's timing-sync grouping
+	 * still matches the normal Windows-shaped pair flow. Default is off.
+	 */
+	apple5k_dce12_tile = link->ctx->dce_version == DCE_VERSION_12_0 &&
+		apple5k_is_tile(link);
+	apple5k_force_msa_ignore = apple5k_dce12_tile &&
+		amdgpu_apple5k_dce12_force_msa_ignore > 0;
+
+	DC_LOGGER_INIT(link->ctx->logger);
+
+	memset(&old_downspread, 0, sizeof(old_downspread));
+
+	read_status = core_link_read_dpcd(link, DP_DOWNSPREAD_CTRL,
+			&old_downspread.raw, sizeof(old_downspread));
+
+	new_downspread.raw = old_downspread.raw;
+	new_downspread.bits.IGNORE_MSA_TIMING_PARAM =
+			(stream->ignore_msa_timing_param ||
+			 apple5k_force_msa_ignore) ? 1 : 0;
+
+	/* Preserve SSC/downspread bits; never synthesize 0x80 after a failed read. */
+	if (read_status == DC_OK && new_downspread.raw != old_downspread.raw) {
+		wrote_downspread = true;
+		write_status = core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
+			&new_downspread.raw, sizeof(new_downspread));
+	}
+
+	if (apple5k_dce12_tile)
+		DC_LOG_INFO("APPLE5K: DCE12 MSA-ignore 0x107 link[%u] force=%d read_status=%d old=0x%02x new=0x%02x write=%d write_status=%d stream_ignore_msa=%u\n",
+			    link->link_index, apple5k_force_msa_ignore,
+			    read_status, old_downspread.raw, new_downspread.raw,
+			    wrote_downspread, write_status,
+			    stream->ignore_msa_timing_param);
+}
+
 static void enable_stream_features(struct pipe_ctx *pipe_ctx,
 				   bool defer_apple5k_latch)
 {
@@ -1390,58 +1445,14 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx,
 
 	if (pipe_ctx->stream->signal != SIGNAL_TYPE_DISPLAY_PORT_MST) {
 		struct dc_link *link = stream->link;
-		union down_spread_ctrl old_downspread;
-		union down_spread_ctrl new_downspread;
-		/*
-		 * APPLE5K: on the iMacPro1,1 (DCE12/Vega) 5K tile pair, set DPCD
-		 * 0x107 bit 7 (IGNORE_MSA_TIMING_PARAM) directly, matching the Windows
-		 * DCE12 tile finalizer. Done here -- NOT via
-		 * stream->ignore_msa_timing_param -- so it does not flip the stream
-		 * flag that makes resource_are_streams_timing_synchronizable() bail;
-		 * i.e. DC's stock genlock of the two tiles is preserved. Gated to
-		 * DCE12 + Apple-5K tile so the working DCE<12 iMacs are untouched.
-		 */
-		bool apple5k_force_msa_ignore =
-			link->ctx->dce_version == DCE_VERSION_12_0 &&
-			(dc_link_has_tiled_root_panel_patch(link) ||
-			 dc_link_has_tiled_slave_panel_patch(link));
-		enum dc_status read_status;
-		enum dc_status write_status = DC_OK;
-		DC_LOGGER_INIT(link->ctx->logger);
 
-		memset(&old_downspread, 0, sizeof(old_downspread));
-
-		read_status = core_link_read_dpcd(link, DP_DOWNSPREAD_CTRL,
-				&old_downspread.raw, sizeof(old_downspread));
-
-		new_downspread.raw = old_downspread.raw;
-
-		new_downspread.bits.IGNORE_MSA_TIMING_PARAM =
-				(stream->ignore_msa_timing_param ||
-				 apple5k_force_msa_ignore) ? 1 : 0;
-
-		/*
-		 * Only modify 0x107 when the read succeeded. If the AUX read failed,
-		 * old_downspread is still the zeroed value, so forcing the bit would
-		 * write 0x80 and clobber the downspread/SSC bits (0x10). AUX reads do
-		 * fail on this panel, so guard the read-modify-write on DC_OK.
-		 */
-		if (read_status == DC_OK && new_downspread.raw != old_downspread.raw) {
-			write_status = core_link_write_dpcd(link, DP_DOWNSPREAD_CTRL,
-				&new_downspread.raw, sizeof(new_downspread));
-		}
-
-		if (apple5k_force_msa_ignore)
-			DC_LOG_INFO("APPLE5K: force MSA-ignore 0x107 link[%u] read_status=%d old=0x%02x new=0x%02x write_status=%d stream_ignore_msa=%u\n",
-				    link->link_index, read_status,
-				    old_downspread.raw, new_downspread.raw,
-				    write_status, stream->ignore_msa_timing_param);
+		program_msa_timing_ignore(stream);
 
 		if (defer_apple5k_latch && apple5k_is_tile(link))
-			DC_LOG_INFO("APPLE5K: defer stream-latch/status link[%u] until coordinated unblank\n",
+			DC_LOG_INFO("APPLE5K: defer stream-latch/status link[%u] until pair finalizer\n",
 				    link->link_index);
 		else
-			apple5k_run_stream_latch_and_status(link);
+			apple5k_latch_stream_and_log_status(link);
 	} else {
 		dm_helpers_mst_enable_stream_features(stream);
 	}
@@ -2990,8 +3001,8 @@ void link_set_dpms_on(
 			link->is_display_mux_present)
 		msleep(20);
 
-	if (apple5k_should_coordinate_pipe(state, pipe_ctx)) {
-		DC_LOG_INFO("APPLE5K-UNBLANK defer link[%u] role=%s tg_inst=%u until GSL coordinated enable\n",
+	if (apple5k_should_defer_pair_finalizer(state, pipe_ctx)) {
+		DC_LOG_INFO("APPLE5K-UNBLANK defer link[%u] role=%s tg_inst=%u until GSL pair finalizer\n",
 			    link->link_index,
 			    dc_link_has_tiled_root_panel_patch(link) ? "root" : "slave",
 			    pipe_ctx->stream_res.tg->inst);

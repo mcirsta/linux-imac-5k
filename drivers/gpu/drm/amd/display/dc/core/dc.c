@@ -1754,12 +1754,8 @@ static void program_timing_sync(
 			}
 		}
 
-		/*
-		 * APPLE5K T1: when this group involves a tiled-5K link, log how the two
-		 * tiles were grouped for GSL genlock. A tiled pipe ending up in a group
-		 * of size 1 means resource_are_streams_timing_synchronizable() split the
-		 * pair (e.g. ignore_msa_timing_param set) so GSL will NOT run on them and
-		 * the panel can never see the synchronized signal -> stays compat.
+		/* Keep the Apple 5K timing-group witnesses until Vega accepts the
+		 * slave tile or the missing finalizer is understood.
 		 */
 		{
 			bool group_has_tiled = false;
@@ -1794,15 +1790,7 @@ static void program_timing_sync(
 						    ps->timing.h_total, ps->timing.v_total,
 						    ps->timing.pix_clk_100hz,
 						    ps->ignore_msa_timing_param);
-					/*
-					 * APPLE5K T5: pixel-coherence probe. GSL aligns the two
-					 * tiles at frame start (vsync), but the panel may only flip
-					 * to native if the two tiles are pixel-clock coherent. Log
-					 * each tile's clock-source id and actual PLL programming: if
-					 * the two members use different clk_src_id, or differ in
-					 * actual_pix_clk/vco/dividers, they are NOT pixel-locked and
-					 * the panel can reject the genlocked signal as native.
-					 */
+					/* Clock/PLL witness for the tiled pair. */
 					DC_LOG_INFO("APPLE5K-CLK    member[%d] link[%d] clk_src_id=%d dp_clk_src=%d actual_pix_clk_100hz=%u vco=%u ref_div=%u fb_div=%u frac_fb=%u post_div=%u ss_pct=%u\n",
 						    t, ps->link ? (int)ps->link->link_index : -1,
 						    cs ? (int)cs->id : -1,
@@ -1819,33 +1807,12 @@ static void program_timing_sync(
 			if (sync_type == TIMING_SYNCHRONIZABLE) {
 				dc->hwss.enable_timing_synchronization(
 					dc, ctx, group_index, group_size, pipe_set);
-				link_apple_5k_coordinated_enable(
+				link_apple_5k_finalize_tiled_pair(
 					dc, group_size, pipe_set);
-				/*
-				 * APPLE5K T2: read the tiled panel mode immediately after the
-				 * GSL genlock returns, to see whether the compat->native flip
-				 * lands at the lock itself or only later at scanout/commit.
-				 */
 				link_apple_5k_log_panel_mode(pipe_set[0]->stream->link,
 							     "gsl:post");
-				/*
-				 * APPLE5K OTG-COHERENCE: 0x425 stays COMPAT on
-				 * DCE12/Vega although the GSL group, clocks and
-				 * timing are byte-identical to DCE11.2/Polaris
-				 * (which flips NATIVE). COMPAT means the panel sees
-				 * the two tiles as NOT pixel-coherent. GSL aligns
-				 * frame phase across the two OTGs; if it really
-				 * locked, the timing generators scan out in lockstep
-				 * and the per-tile (vcount,hcount) read back-to-back
-				 * shows a STABLE, near-constant inter-tile offset.
-				 * Sample both pipes' live OTG line/frame counters in
-				 * a short burst right after the trigger so we can
-				 * compare the inter-tile phase offset Vega-vs-Polaris:
-				 * a large or wandering (v1-v0) on Vega = GSL did not
-				 * phase-align the pipes on DCE12 (the real bug); a
-				 * stable small offset on both = coherence is fine and
-				 * the COMPAT verdict comes from something else (enable
-				 * ordering / stream packets).
+				/* Short OTG burst: keep as a Vega-vs-Polaris
+				 * coherence witness, not as control flow.
 				 */
 				{
 					int s, t;
