@@ -1443,6 +1443,7 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx,
 
 	if (pipe_ctx->stream->signal != SIGNAL_TYPE_DISPLAY_PORT_MST) {
 		struct dc_link *link = stream->link;
+		DC_LOGGER_INIT(link->ctx->logger);
 
 		program_msa_timing_ignore(stream);
 
