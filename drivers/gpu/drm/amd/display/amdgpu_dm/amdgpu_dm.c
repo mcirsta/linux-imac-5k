@@ -13261,6 +13261,112 @@ static bool amdgpu_dm_crtc_mem_type_changed(struct drm_device *dev,
 	return false;
 }
 
+/*
+ * APPLE5K 1-tile/2-tile switch classification (read-only).
+ *
+ * KWin drives the tiled panel as one logical output and encodes a mode change
+ * as a plain atomic modeset on the two tile connectors (see
+ * Apple5K_OneTile_TwoTile_Switch_Kernel_Spec.md §2/§3.1). There is no Apple
+ * uAPI: the request is derived entirely from the new atomic state + the
+ * tiled-pair panel-id quirks.
+ *
+ *   2-tile (native 5K): both tile connectors enabled at the per-tile size.
+ *   1-tile (compat 4K): root enabled at a non-tile mode, slave disabled.
+ *
+ * This classifier is side-effect free (no AUX, no DPCD) so it is safe on the
+ * atomic_check fast path, including KWin's TEST_ONLY probe.
+ */
+enum apple5k_tile_request {
+	APPLE5K_TILE_REQ_NONE = 0,	/* tiled pair not part of this modeset */
+	APPLE5K_TILE_REQ_2TILE,		/* both tiles @ per-tile size (native) */
+	APPLE5K_TILE_REQ_1TILE,		/* root @ non-tile, slave off (compat) */
+	APPLE5K_TILE_REQ_OTHER,		/* pair touched, not a clean 1/2-tile */
+};
+
+static const char *apple5k_tile_request_name(enum apple5k_tile_request req)
+{
+	switch (req) {
+	case APPLE5K_TILE_REQ_2TILE:	return "2-tile";
+	case APPLE5K_TILE_REQ_1TILE:	return "1-tile";
+	case APPLE5K_TILE_REQ_OTHER:	return "other";
+	default:			return "none";
+	}
+}
+
+static enum apple5k_tile_request
+amdgpu_dm_apple5k_classify_tile_switch(struct drm_atomic_state *state,
+				       struct drm_connector **root_out,
+				       struct drm_connector **slave_out)
+{
+	struct drm_connector *connector;
+	struct drm_connector_state *new_con_state;
+	struct drm_connector *root_conn = NULL, *slave_conn = NULL;
+	struct drm_connector_state *root_cs = NULL, *slave_cs = NULL;
+	struct drm_crtc_state *root_crtc_state = NULL;
+	const struct drm_display_mode *root_mode = NULL;
+	bool root_enabled, slave_enabled, root_is_tile_size;
+	enum apple5k_tile_request req = APPLE5K_TILE_REQ_NONE;
+	int i;
+
+	if (root_out)
+		*root_out = NULL;
+	if (slave_out)
+		*slave_out = NULL;
+
+	for_each_new_connector_in_state(state, connector, new_con_state, i) {
+		struct amdgpu_dm_connector *aconn;
+
+		if (connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK)
+			continue;
+		aconn = to_amdgpu_dm_connector(connector);
+		if (amdgpu_dm_connector_has_tiled_root_patch(aconn)) {
+			root_conn = connector;
+			root_cs = new_con_state;
+		} else if (amdgpu_dm_connector_has_tiled_slave_patch(aconn)) {
+			slave_conn = connector;
+			slave_cs = new_con_state;
+		}
+	}
+
+	/* Need both tile connectors present in this commit to classify. */
+	if (!root_conn || !slave_conn)
+		return APPLE5K_TILE_REQ_NONE;
+
+	if (root_cs->crtc) {
+		root_crtc_state = drm_atomic_get_new_crtc_state(state, root_cs->crtc);
+		if (root_crtc_state && root_crtc_state->enable)
+			root_mode = &root_crtc_state->mode;
+	}
+
+	root_enabled = root_mode != NULL;
+	slave_enabled = slave_cs->crtc != NULL;
+	root_is_tile_size = amdgpu_dm_mode_matches_tile_size(root_conn, root_mode);
+
+	if (root_enabled && root_is_tile_size && slave_enabled)
+		req = APPLE5K_TILE_REQ_2TILE;
+	else if (root_enabled && !root_is_tile_size && !slave_enabled)
+		req = APPLE5K_TILE_REQ_1TILE;
+	else
+		req = APPLE5K_TILE_REQ_OTHER;
+
+	/* Only emit for the modeset that actually reshapes the pair. */
+	if (root_crtc_state && drm_atomic_crtc_needs_modeset(root_crtc_state))
+		drm_info(state->dev,
+			 "APPLE5K-SWITCH request=%s root=%s slave=%s root_mode=%dx%d tile_size=%ux%u\n",
+			 apple5k_tile_request_name(req),
+			 root_enabled ? "on" : "off",
+			 slave_enabled ? "on" : "off",
+			 root_mode ? root_mode->hdisplay : 0,
+			 root_mode ? root_mode->vdisplay : 0,
+			 root_conn->tile_h_size, root_conn->tile_v_size);
+
+	if (root_out)
+		*root_out = root_conn;
+	if (slave_out)
+		*slave_out = slave_conn;
+	return req;
+}
+
 /**
  * amdgpu_dm_atomic_check() - Atomic check implementation for AMDgpu DM.
  *
@@ -13314,6 +13420,14 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 		drm_dbg_atomic(dev, "drm_atomic_helper_check_modeset() failed\n");
 		goto fail;
 	}
+
+	/*
+	 * APPLE5K: classify the tiled-pair 1-tile/2-tile intent (read-only).
+	 * Slice 1 logs the recognized request only; the accept/reject verdict
+	 * (spec §3.4) and the compat direct-timing validation (§5) build on
+	 * this in later slices.
+	 */
+	amdgpu_dm_apple5k_classify_tile_switch(state, NULL, NULL);
 
 	/* Check connector changes */
 	for_each_oldnew_connector_in_state(state, connector, old_con_state, new_con_state, i) {
