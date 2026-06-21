@@ -8602,6 +8602,29 @@ amdgpu_dm_connector_is_tiled_slave_tile(
 	       (connector->tile_h_loc || connector->tile_v_loc);
 }
 
+/*
+ * Apple 27" 5K half-panel tile geometry. Each tile (one DP/eDP link) is
+ * 2560x2880; the pair composites 5120x2880. We know this from the panel-id
+ * quirk, before the tiled EDID latches connector->tile_h_size/tile_v_size.
+ */
+#define APPLE5K_TILE_WIDTH  2560
+#define APPLE5K_TILE_HEIGHT 2880
+
+static bool
+amdgpu_dm_apple5k_mode_is_slave_tile(const struct drm_connector *connector,
+				     const struct drm_display_mode *mode)
+{
+	/* Once the tiled EDID has latched, trust the connector tile size. */
+	if (connector->has_tile && connector->tile_h_size &&
+	    connector->tile_v_size)
+		return mode->hdisplay == connector->tile_h_size &&
+		       mode->vdisplay == connector->tile_v_size;
+
+	/* Before latch, the panel-id quirk still tells us the half-panel size. */
+	return mode->hdisplay == APPLE5K_TILE_WIDTH &&
+	       mode->vdisplay == APPLE5K_TILE_HEIGHT;
+}
+
 static bool
 amdgpu_dm_mode_matches_tile_size(const struct drm_connector *connector,
 				 const struct drm_display_mode *mode)
@@ -9696,6 +9719,47 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector)
 		if (encoder)
 			amdgpu_dm_connector_add_common_modes(encoder, connector);
 		amdgpu_dm_connector_add_freesync_modes(connector, drm_edid);
+	}
+
+	/*
+	 * APPLE5K §5.1: the tiled slave (DP-1) must NEVER advertise non-tile
+	 * modes -- not even transiently. It is never a standalone single-link
+	 * source (compat is root/eDP-only); its only valid mode is the
+	 * 2560x2880 half-panel tile. Strip everything else here, on every probe
+	 * from the very first, gated on the panel-id quirk (known immediately)
+	 * rather than on tile metadata (which only latches late). This stops any
+	 * compositor -- e.g. Mutter, which picks the tiled monitor's untiled
+	 * source by non-tile mode count -- from ever seeing DP-1 out-advertise
+	 * eDP-1 and selecting the wrong source / hiding the 4K compat mode.
+	 *
+	 * Guard: only strip when at least one tile mode is present, so a
+	 * degenerate pre-EDID state never leaves the connector with no modes.
+	 */
+	if (amdgpu_dm_connector_has_tiled_slave_patch(amdgpu_dm_connector)) {
+		struct drm_display_mode *mode, *tmp;
+		int kept = 0, stripped = 0;
+
+		list_for_each_entry(mode, &connector->probed_modes, head)
+			if (amdgpu_dm_apple5k_mode_is_slave_tile(connector, mode))
+				kept++;
+
+		if (kept) {
+			list_for_each_entry_safe(mode, tmp,
+						 &connector->probed_modes, head) {
+				if (amdgpu_dm_apple5k_mode_is_slave_tile(connector,
+									 mode))
+					continue;
+				list_del(&mode->head);
+				drm_mode_destroy(connector->dev, mode);
+				stripped++;
+			}
+			if (amdgpu_dm_connector->num_modes >= stripped)
+				amdgpu_dm_connector->num_modes -= stripped;
+		}
+
+		drm_info(connector->dev,
+			 "APPLE5K: slave mode strip connector=%s kept=%d stripped=%d\n",
+			 connector->name, kept, stripped);
 	}
 
 	amdgpu_dm_make_tile_mode_preferred(connector);
