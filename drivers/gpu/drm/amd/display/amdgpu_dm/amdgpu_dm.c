@@ -232,6 +232,8 @@ static int amdgpu_dm_connector_get_modes(struct drm_connector *connector);
 static bool amdgpu_dm_mode_matches_tile_size(
 		const struct drm_connector *connector,
 		const struct drm_display_mode *mode);
+static bool amdgpu_dm_connector_has_tiled_root_patch(
+		const struct amdgpu_dm_connector *aconnector);
 static void amdgpu_dm_log_apple5k_probe_identity(struct amdgpu_device *adev);
 static void amdgpu_dm_log_apple5k_connector_tile(
 		struct amdgpu_dm_connector *aconnector,
@@ -7340,6 +7342,19 @@ create_stream_for_sink(struct drm_connector *connector,
 		dc_sink_retain(sink);
 	}
 
+	/*
+	 * APPLE5K §5: keep the tiled root's compat (non-tile) modes on a direct
+	 * full-panel timing. Force scaling off so decide_crtc_timing_for_drm_
+	 * display_mode() does not copy the 2560x2880 tile preferred timing and
+	 * scale the 4K source onto it -- which fails bandwidth validation and
+	 * would wrongly prune the 1-tile mode. Defensive partner to the
+	 * dm_encoder_helper_atomic_check() guard.
+	 */
+	if (aconnector &&
+	    amdgpu_dm_connector_has_tiled_root_patch(aconnector) &&
+	    !amdgpu_dm_mode_matches_tile_size(connector, drm_mode))
+		scale = false;
+
 	stream = dc_create_stream_for_sink(sink);
 
 	if (stream == NULL) {
@@ -9161,6 +9176,24 @@ static int dm_encoder_helper_atomic_check(struct drm_encoder *encoder,
 		struct amdgpu_encoder *amdgpu_encoder = to_amdgpu_encoder(encoder);
 		struct drm_display_mode *native_mode = &amdgpu_encoder->native_mode;
 		enum drm_mode_status result;
+
+		/*
+		 * APPLE5K §5: the tiled root's non-tile modes are the compat-EDID
+		 * full-panel timings (4K / 3200x1800 / 2560x1440) that the panel
+		 * accepts directly once it is in COMPAT. Validate them as
+		 * native-to-compat -- do NOT enable RMX scaling, which would build
+		 * the stream on the 2560x2880 tile timing and fail
+		 * dce112_validate_bandwidth, wrongly rejecting the 1-tile request.
+		 * The per-tile 2560x2880 size keeps the normal (2-tile) path.
+		 */
+		if (amdgpu_dm_connector_has_tiled_root_patch(aconnector) &&
+		    !amdgpu_dm_mode_matches_tile_size(connector, adjusted_mode)) {
+			drm_dbg_driver(encoder->dev,
+				       "APPLE5K: root compat mode %dx%d@%dHz validated direct (no tile scaling)\n",
+				       adjusted_mode->hdisplay, adjusted_mode->vdisplay,
+				       drm_mode_vrefresh(adjusted_mode));
+			return 0;
+		}
 
 		result = drm_crtc_helper_mode_valid_fixed(encoder->crtc, adjusted_mode, native_mode);
 		if (result != MODE_OK && dm_new_connector_state->scaling == RMX_OFF) {
