@@ -1753,11 +1753,10 @@ struct dc_scratch_space {
 	struct dc_link *tiled_peer;
 
 	/*
-	 * APPLE5K: true while the tiled-root 0x4F1 latch is armed and the combined
-	 * dual-tile enable has not yet resolved. While set, the eDP power-off guard
-	 * KEEPS the panel powered (the firmware never power-cycles between arm and
-	 * enable; doing so jams the Pro TCON into stuck-compat). Set at the root
-	 * latch arm, cleared at the slave stream-enable latch (enable resolved).
+	 * APPLE5K: true only while the bounded native 5K enable transaction is
+	 * active in the paired DPMS finalizer. While set, the eDP power-off guard
+	 * keeps the panel powered, matching firmware's no-power-cycle arm->enable
+	 * invariant. Discovery/source-DPCD/training wake probes must not set this.
 	 */
 	bool apple5k_arming;
 };

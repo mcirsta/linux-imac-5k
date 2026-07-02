@@ -35,6 +35,7 @@
  * boundary between link and stream is not clearly defined.
  */
 
+#include "dm_services.h"
 #include "link_dpms.h"
 #include "link_hwss.h"
 #include "link_validation.h"
@@ -80,6 +81,76 @@
 
 extern int amdgpu_apple5k_coordinated_enable;
 extern int amdgpu_apple5k_dce12_force_msa_ignore;
+extern int amdgpu_apple5k_cold_boot;
+
+struct apple5k_panel_mode_status {
+	uint8_t r41c;
+	uint8_t r41f;
+	uint8_t r423;
+	uint8_t r425;
+	uint8_t r42f;
+	uint8_t r4f1;
+	enum dc_status s41c;
+	enum dc_status s41f;
+	enum dc_status s423;
+	enum dc_status s425;
+	enum dc_status s42f;
+	enum dc_status s4f1;
+};
+
+static struct dc_link *apple5k_root_for_link(struct dc_link *link)
+{
+	if (dc_link_has_tiled_root_panel_patch(link))
+		return link;
+
+	if (dc_link_has_tiled_slave_panel_patch(link) &&
+	    dc_link_has_tiled_root_panel_patch(link->tiled_peer))
+		return link->tiled_peer;
+
+	return NULL;
+}
+
+static bool apple5k_read_panel_mode_status(struct dc_link *root,
+					   struct apple5k_panel_mode_status *st)
+{
+	if (!st || !dc_link_has_tiled_root_panel_patch(root))
+		return false;
+
+	memset(st, 0, sizeof(*st));
+	st->s41c = core_link_read_dpcd(root, 0x41C, &st->r41c, sizeof(st->r41c));
+	st->s41f = core_link_read_dpcd(root, 0x41F, &st->r41f, sizeof(st->r41f));
+	st->s423 = core_link_read_dpcd(root, 0x423, &st->r423, sizeof(st->r423));
+	st->s425 = core_link_read_dpcd(root, 0x425, &st->r425, sizeof(st->r425));
+	st->s42f = core_link_read_dpcd(root, 0x42F, &st->r42f, sizeof(st->r42f));
+	st->s4f1 = core_link_read_dpcd(root, APPLE_5K_DPCD_PANEL_LATCH,
+				       &st->r4f1, sizeof(st->r4f1));
+	return true;
+}
+
+static bool apple5k_panel_status_is_native_good(
+		const struct apple5k_panel_mode_status *st)
+{
+	bool native_marker;
+	bool explicit_compat;
+
+	if (!st || st->s4f1 != DC_OK || st->r4f1 != 1)
+		return false;
+
+	native_marker = (st->s41c == DC_OK && st->r41c == 0x15) ||
+			(st->s425 == DC_OK && !(st->r425 & 0x02));
+	explicit_compat = st->s425 == DC_OK && (st->r425 & 0x02);
+
+	return native_marker && !explicit_compat;
+}
+
+static bool apple5k_panel_status_needs_base_clear(
+		const struct apple5k_panel_mode_status *st)
+{
+	return st &&
+	       ((st->s4f1 == DC_OK && st->r4f1 != 0) ||
+		(st->s41c == DC_OK && st->r41c == 0x15) ||
+		(st->s425 == DC_OK && (st->r425 & 0x02)));
+}
 
 /*
  * APPLE5K mode-bisection probe (read-only). See link_dpcd.h. Resolves the tiled
@@ -89,34 +160,379 @@ extern int amdgpu_apple5k_dce12_force_msa_ignore;
  */
 void link_apple_5k_log_panel_mode(struct dc_link *link, const char *stage)
 {
-	struct dc_link *root = NULL;
-	uint8_t r41c = 0, r41f = 0, r423 = 0, r425 = 0, r42f = 0, r4f1 = 0;
-	enum dc_status s41c, s41f, s423, s425, s42f, s4f1;
+	struct dc_link *root;
+	struct apple5k_panel_mode_status st;
 
 	if (!link)
 		return;
-	if (dc_link_has_tiled_root_panel_patch(link))
-		root = link;
-	else if (link->tiled_peer &&
-		 dc_link_has_tiled_root_panel_patch(link->tiled_peer))
-		root = link->tiled_peer;
+	root = apple5k_root_for_link(link);
 	if (!root)
 		return;
 
 	DC_LOGGER_INIT(root->ctx->logger);
-	s41c = core_link_read_dpcd(root, 0x41C, &r41c, sizeof(r41c));
-	s41f = core_link_read_dpcd(root, 0x41F, &r41f, sizeof(r41f));
-	s423 = core_link_read_dpcd(root, 0x423, &r423, sizeof(r423));
-	s425 = core_link_read_dpcd(root, 0x425, &r425, sizeof(r425));
-	s42f = core_link_read_dpcd(root, 0x42F, &r42f, sizeof(r42f));
-	s4f1 = core_link_read_dpcd(root, 0x4F1, &r4f1, sizeof(r4f1));
+	if (!apple5k_read_panel_mode_status(root, &st))
+		return;
+
 	DC_LOG_INFO("APPLE5K-MODE stage=%s link[%u] root[%u] 0x41C=0x%02x(s=%d) 0x41F=0x%02x(s=%d) 0x423=0x%02x(s=%d,b2=%u) 0x425=0x%02x(s=%d) 0x42F=0x%02x(s=%d) 0x4F1=0x%02x(s=%d) -> %s\n",
 		    stage ? stage : "?", link->link_index, root->link_index,
-		    r41c, s41c, r41f, s41f, r423, s423,
-		    (s423 == DC_OK) ? ((r423 >> 2) & 1) : 0,
-		    r425, s425, r42f, s42f, r4f1, s4f1,
-		    (s425 == DC_OK) ? ((r425 & 0x02) ? "COMPAT" : "NATIVE")
+		    st.r41c, st.s41c, st.r41f, st.s41f, st.r423, st.s423,
+		    (st.s423 == DC_OK) ? ((st.r423 >> 2) & 1) : 0,
+		    st.r425, st.s425, st.r42f, st.s42f, st.r4f1, st.s4f1,
+		    (st.s425 == DC_OK) ? ((st.r425 & 0x02) ? "COMPAT" : "NATIVE")
 				    : "0x425-NACK");
+}
+
+static enum dc_status apple5k_write_root_latch(struct dc_link *root,
+					       uint8_t value,
+					       const char *stage)
+{
+	uint8_t readback = 0;
+	enum dc_status status;
+	enum dc_status read_status;
+
+	if (!dc_link_has_tiled_root_panel_patch(root) || !root->local_sink)
+		return DC_ERROR_UNEXPECTED;
+
+	DC_LOGGER_INIT(root->ctx->logger);
+	link_apple_5k_log_panel_mode(root, stage);
+	status = core_link_write_dpcd(root, APPLE_5K_DPCD_PANEL_LATCH,
+				      &value, sizeof(value));
+	read_status = core_link_read_dpcd(root, APPLE_5K_DPCD_PANEL_LATCH,
+					  &readback, sizeof(readback));
+	DC_LOG_INFO("APPLE5K-TXN latch-write stage=%s root_link[%u] value=0x%02x status=%d read_status=%d readback=0x%02x transaction_active=%d\n",
+		    stage ? stage : "?", root->link_index, value, status,
+		    read_status, readback, root->apple5k_arming);
+
+	return status;
+}
+
+/*
+ * Firmware ready-gate (GopWaitForConnectorMaskReady). Both GOPs poll the HPD
+ * line-state register DC_GPIO_HPD_Y until the two tile HPD pads assert:
+ * root tile = HPD2 (0x100), sibling tile = HPD1 (0x1); bit layout is
+ * identical on DCE 11.2 and DCE 12. The absolute dword address is the
+ * firmware BAR byte offset >> 2 on both ASICs — the SOC15 split on Vega
+ * (DCE seg2 0x34C0 + mmDC_GPIO_HPD_Y 0x210D = 0x55CD) only changes how the
+ * named macros are organized, not the bus address dm_read_reg() takes.
+ */
+#define APPLE5K_READY_GATE_ROOT_HPD	0x100	/* DC_GPIO_HPD2_Y */
+#define APPLE5K_READY_GATE_SIBLING_HPD	0x001	/* DC_GPIO_HPD1_Y */
+
+static void apple5k_log_ready_gate(struct dc_link *root, const char *stage)
+{
+	uint32_t address;
+	uint32_t value;
+
+	if (!root)
+		return;
+
+	switch (root->ctx->dce_version) {
+	case DCE_VERSION_11_2:	/* Polaris GOP polls BAR byte 0x1223C */
+		address = 0x1223C >> 2;	/* mmDC_GPIO_HPD_Y (0x488F) */
+		break;
+	case DCE_VERSION_12_0:	/* Vega10 GOP polls BAR byte 0x15734 */
+		address = 0x15734 >> 2;	/* seg2 0x34C0 + 0x210D = 0x55CD */
+		break;
+	default:
+		return;
+	}
+
+	DC_LOGGER_INIT(root->ctx->logger);
+	value = dm_read_reg(root->ctx, address);
+	DC_LOG_INFO("APPLE5K-TXN ready-gate stage=%s addr=0x%05x DC_GPIO_HPD_Y=0x%08x root_hpd2=%u sibling_hpd1=%u\n",
+		    stage ? stage : "?", address, value,
+		    (value & APPLE5K_READY_GATE_ROOT_HPD) ? 1 : 0,
+		    (value & APPLE5K_READY_GATE_SIBLING_HPD) ? 1 : 0);
+}
+
+/*
+ * Depth-1 boot cold-down. On the no-iGPU iMacPro1,1 the firmware GOP drives
+ * the tiled panel through boot, so amdgpu binds to a HOT display engine —
+ * links trained and the panel session owned by firmware — while the iGPU
+ * iMacs (15,1–20,1) hand over a cold engine, the only base the coordinated
+ * native enable is proven on. Sanitize the Apple panel session over AUX
+ * before the stock boot blank/power-down tears the engine down, so the first
+ * 5K enable starts from the same cold base as an iGPU machine.
+ */
+bool link_apple_5k_wants_cold_boot(const struct dc *dc)
+{
+	unsigned int i;
+
+	if (amdgpu_apple5k_cold_boot <= 0 || !dc)
+		return false;
+
+	for (i = 0; i < dc->link_count; i++)
+		if (dc_link_has_tiled_root_panel_patch(dc->links[i]))
+			return true;
+
+	return false;
+}
+
+void link_apple_5k_boot_cold_down(struct dc *dc)
+{
+	struct dc_link *root = NULL;
+	struct dc_link *slave = NULL;
+	uint8_t power_state = DP_POWER_STATE_D3;
+	enum dc_status status;
+	unsigned int i;
+
+	if (!link_apple_5k_wants_cold_boot(dc))
+		return;
+
+	for (i = 0; i < dc->link_count; i++) {
+		if (dc_link_has_tiled_root_panel_patch(dc->links[i]))
+			root = dc->links[i];
+		else if (dc_link_has_tiled_slave_panel_patch(dc->links[i]))
+			slave = dc->links[i];
+	}
+	if (!root)
+		return;
+
+	DC_LOGGER_INIT(root->ctx->logger);
+	DC_LOG_INFO("APPLE5K-COLD boot cold-down root_link[%u] slave_link[%d]\n",
+		    root->link_index, slave ? (int)slave->link_index : -1);
+
+	apple5k_log_ready_gate(root, "cold-boot:pre");
+	link_apple_5k_log_panel_mode(root, "cold-boot:pre");
+
+	/* Disarm the panel latch to the quiet compat base while AUX is up. */
+	(void)apple5k_write_root_latch(root, 0, "cold-boot:disarm");
+	root->apple5k_arming = false;
+	msleep(10);
+
+	/*
+	 * Put the slave sink in D3 so it re-enters through the normal D0 wake
+	 * + link training instead of continuing the firmware session. The
+	 * root (eDP) is torn down by the stock backlight/VDD power-off that
+	 * follows in dce110_enable_accelerated_mode.
+	 */
+	if (slave && slave->local_sink) {
+		status = core_link_write_dpcd(slave, DP_SET_POWER,
+					      &power_state, sizeof(power_state));
+		DC_LOG_INFO("APPLE5K-COLD slave sink D3 slave_link[%u] status=%d\n",
+			    slave->link_index, status);
+	}
+
+	link_apple_5k_log_panel_mode(root, "cold-boot:done");
+	apple5k_log_ready_gate(root, "cold-boot:done");
+}
+
+static bool apple5k_begin_native_enable(struct dc_link *root,
+					struct dc_link *slave)
+{
+	struct apple5k_panel_mode_status st;
+	enum dc_status status;
+
+	if (!dc_link_has_tiled_root_panel_patch(root) ||
+	    !dc_link_has_tiled_slave_panel_patch(slave) ||
+	    !root->local_sink || !slave->local_sink)
+		return false;
+
+	DC_LOGGER_INIT(root->ctx->logger);
+
+	apple5k_log_ready_gate(root, "native-txn:pre");
+	link_apple_5k_log_panel_mode(root, "native-txn:pre");
+	if (apple5k_read_panel_mode_status(root, &st) &&
+	    apple5k_panel_status_needs_base_clear(&st)) {
+		status = apple5k_write_root_latch(root, 0,
+						  "native-txn:clear-stale");
+		msleep(10);
+		link_apple_5k_log_panel_mode(root,
+					     "native-txn:after-clear");
+		if (status != DC_OK)
+			DC_LOG_INFO("APPLE5K-TXN clear-stale failed root_link[%u] status=%d\n",
+				    root->link_index, status);
+	}
+
+	status = apple5k_write_root_latch(root, 1, "native-txn:arm");
+	if (status != DC_OK) {
+		root->apple5k_arming = false;
+		DC_LOG_INFO("APPLE5K-TXN arm failed root_link[%u] slave_link[%u] status=%d\n",
+			    root->link_index, slave->link_index, status);
+		return false;
+	}
+
+	root->apple5k_arming = true;
+	msleep(10);
+	link_apple_5k_log_panel_mode(root, "native-txn:armed");
+	return true;
+}
+
+/*
+ * Log the sibling (slave) tile's DP link/lane status at the instant native is
+ * expected. If the slave silently dropped training, the root cannot hold
+ * native and today we would never see why. Lane-count aware so a healthy
+ * 2-lane link is not mis-reported as untrained.
+ */
+static void apple5k_log_slave_link_status(struct dc_link *slave,
+					  const char *stage)
+{
+	uint8_t l01 = 0, l23 = 0, align = 0;
+	enum dc_status s01, s23, sa;
+	unsigned int lane_count;
+	bool lanes_ok;
+
+	if (!slave || !slave->local_sink)
+		return;
+
+	DC_LOGGER_INIT(slave->ctx->logger);
+
+	lane_count = slave->cur_link_settings.lane_count;
+	s01 = core_link_read_dpcd(slave, 0x202, &l01, sizeof(l01));
+	s23 = core_link_read_dpcd(slave, 0x203, &l23, sizeof(l23));
+	sa  = core_link_read_dpcd(slave, 0x204, &align, sizeof(align));
+
+	/*
+	 * Per-lane status nibble = CR_DONE | CHANNEL_EQ | SYMBOL_LOCKED (0x7).
+	 * 0x202 holds lanes 0/1, 0x203 holds lanes 2/3, 0x204 bit0 = interlane
+	 * align done.
+	 */
+	lanes_ok = (sa == DC_OK) && (align & 0x01) && (s01 == DC_OK);
+	if (lane_count >= 1 && (l01 & 0x07) != 0x07)
+		lanes_ok = false;
+	if (lane_count >= 2 && ((l01 >> 4) & 0x07) != 0x07)
+		lanes_ok = false;
+	if (lane_count >= 3) {
+		if (s23 != DC_OK || (l23 & 0x07) != 0x07)
+			lanes_ok = false;
+		if (lane_count >= 4 && ((l23 >> 4) & 0x07) != 0x07)
+			lanes_ok = false;
+	}
+
+	DC_LOG_INFO("APPLE5K-TXN slave-link stage=%s slave_link[%u] lanes=%u 0x202=0x%02x(s=%d) 0x203=0x%02x(s=%d) 0x204=0x%02x(s=%d) trained=%d\n",
+		    stage ? stage : "?", slave->link_index, lane_count,
+		    l01, s01, l23, s23, align, sa, lanes_ok ? 1 : 0);
+}
+
+#define APPLE5K_NATIVE_POLL_INTERVAL_MS	2
+#define APPLE5K_NATIVE_POLL_TIMEOUT_MS	80
+
+static bool apple5k_finish_native_enable(struct dc_link *root,
+					 struct dc_link *slave,
+					 struct pipe_ctx *root_pipe,
+					 struct pipe_ctx *slave_pipe,
+					 bool transaction_started)
+{
+	struct apple5k_panel_mode_status st;
+	struct apple5k_panel_mode_status prev;
+	bool have_prev = false;
+	bool native_good = false;
+	ktime_t start;
+	ktime_t native_at = 0;
+	unsigned int polls = 0;
+	int elapsed_ms = 0;
+
+	if (!dc_link_has_tiled_root_panel_patch(root))
+		return false;
+
+	DC_LOGGER_INIT(root->ctx->logger);
+	memset(&prev, 0, sizeof(prev));
+
+	/*
+	 * Source-side snapshot: was each tile's OTG (CRTC master-enable)
+	 * actually running while we asked the panel to latch native? A panel
+	 * stuck in compat with both timing generators up points at a missing
+	 * source-signal step rather than a DPCD-sequencing problem.
+	 */
+	if (root_pipe && root_pipe->stream_res.tg &&
+	    root_pipe->stream_res.tg->funcs->is_tg_enabled &&
+	    slave_pipe && slave_pipe->stream_res.tg &&
+	    slave_pipe->stream_res.tg->funcs->is_tg_enabled) {
+		struct timing_generator *rtg = root_pipe->stream_res.tg;
+		struct timing_generator *stg = slave_pipe->stream_res.tg;
+
+		DC_LOG_INFO("APPLE5K-TXN otg-state root_tg=%u en=%d slave_tg=%u en=%d\n",
+			    rtg->inst, rtg->funcs->is_tg_enabled(rtg),
+			    stg->inst, stg->funcs->is_tg_enabled(stg));
+	}
+
+	apple5k_log_ready_gate(root, "native-txn:verify");
+	apple5k_log_slave_link_status(slave, "native-txn:verify");
+	link_apple_5k_log_panel_mode(root, "native-txn:verify");
+
+	/*
+	 * Poll the native verdict instead of sampling once: the firmware may
+	 * reflect native in 0x425/0x41C later than the arm settle. Log every
+	 * change of the (0x41C,0x425,0x4F1) tuple plus the time to first
+	 * native, so a slow convergence is distinguishable from "never".
+	 */
+	start = ktime_get();
+	for (;;) {
+		elapsed_ms = (int)ktime_ms_delta(ktime_get(), start);
+		polls++;
+		if (apple5k_read_panel_mode_status(root, &st)) {
+			if (!have_prev || st.r41c != prev.r41c ||
+			    st.r425 != prev.r425 || st.r4f1 != prev.r4f1) {
+				DC_LOG_INFO("APPLE5K-TXN native-poll #%u t=%dms 0x41C=0x%02x 0x425=0x%02x 0x4F1=0x%02x -> %s\n",
+					    polls, elapsed_ms, st.r41c, st.r425,
+					    st.r4f1,
+					    (st.s425 == DC_OK)
+						? ((st.r425 & 0x02) ? "COMPAT"
+								    : "NATIVE")
+						: "0x425-NACK");
+				prev = st;
+				have_prev = true;
+			}
+			if (apple5k_panel_status_is_native_good(&st)) {
+				native_good = true;
+				native_at = ktime_get();
+				break;
+			}
+		}
+		if (elapsed_ms >= APPLE5K_NATIVE_POLL_TIMEOUT_MS)
+			break;
+		msleep(APPLE5K_NATIVE_POLL_INTERVAL_MS);
+	}
+
+	DC_LOG_INFO("APPLE5K-TXN native-poll done root_link[%u] polls=%u native_good=%d time_to_native_ms=%d total_ms=%d\n",
+		    root->link_index, polls, native_good,
+		    native_good ? (int)ktime_ms_delta(native_at, start) : -1,
+		    (int)ktime_ms_delta(ktime_get(), start));
+
+	if (transaction_started && native_good) {
+		root->apple5k_arming = false;
+		DC_LOG_INFO("APPLE5K-TXN verified native root_link[%u] slave_link[%u]\n",
+			    root->link_index, slave ? slave->link_index : 0xffffffff);
+		return true;
+	}
+
+	DC_LOG_INFO("APPLE5K-TXN native verify failed root_link[%u] slave_link[%u] started=%d native_good=%d; disarming\n",
+		    root->link_index, slave ? slave->link_index : 0xffffffff,
+		    transaction_started, native_good);
+	(void)apple5k_write_root_latch(root, 0, "native-txn:fail-disarm");
+	msleep(10);
+	link_apple_5k_log_panel_mode(root, "native-txn:after-fail-disarm");
+	root->apple5k_arming = false;
+	return false;
+}
+
+static void apple5k_disarm_for_stream_disable(struct dc_link *link,
+					      const char *stage)
+{
+	struct dc_link *root = apple5k_root_for_link(link);
+	struct apple5k_panel_mode_status st;
+
+	if (!dc_link_has_tiled_root_panel_patch(root) || !root->local_sink)
+		return;
+
+	DC_LOGGER_INIT(root->ctx->logger);
+
+	if (root->apple5k_arming) {
+		DC_LOG_INFO("APPLE5K-TXN keep latch armed at %s root_link[%u] reason=native-transaction-active\n",
+			    stage ? stage : "?", root->link_index);
+		return;
+	}
+
+	if (apple5k_read_panel_mode_status(root, &st) &&
+	    st.s4f1 == DC_OK && st.r4f1 == 0) {
+		DC_LOG_INFO("APPLE5K-TXN disable cleanup skip root_link[%u] stage=%s reason=latch-already-zero\n",
+			    root->link_index, stage ? stage : "?");
+		return;
+	}
+
+	(void)apple5k_write_root_latch(root, 0, stage);
+	msleep(10);
+	link_apple_5k_log_panel_mode(root, "disable-cleanup:after-disarm");
 }
 
 static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
@@ -125,9 +541,16 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 	uint8_t readback = 0;
 	enum dc_status status;
 	enum dc_status read_status;
+	struct dc_link *root = apple5k_root_for_link(link);
 
 	if (!dc_link_needs_tiled_stream_enable_latch(link) || !link->local_sink)
 		return;
+	if (!root || !root->apple5k_arming) {
+		DC_LOGGER_INIT(link->ctx->logger);
+		DC_LOG_INFO("APPLE5K: stream-enable latch skipped link[%u] root_link[%d] reason=no-native-transaction\n",
+			    link->link_index, root ? (int)root->link_index : -1);
+		return;
+	}
 
 	DC_LOGGER_INIT(link->ctx->logger);
 
@@ -140,19 +563,6 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 		    link->link_index, status, payload, read_status, readback,
 		    link->local_sink);
 	link_apple_5k_log_panel_mode(link, "stream-latch:post");
-
-	/*
-	 * Combined dual-tile enable has resolved (both tiles trained + the slave
-	 * stream-enable latch written). Clear the root's arming flag so a subsequent
-	 * genuine power-off disarms (0x4F1=0) instead of being suppressed. If we
-	 * reached native the latch stays at 1 (the firmware keeps it); we only stop
-	 * SUPPRESSING power-offs from here.
-	 */
-	if (dc_link_has_tiled_root_panel_patch(link))
-		link->apple5k_arming = false;
-	else if (link->tiled_peer &&
-		 dc_link_has_tiled_root_panel_patch(link->tiled_peer))
-		link->tiled_peer->apple5k_arming = false;
 }
 
 /*
@@ -339,18 +749,6 @@ void link_get_master_pipes_with_dpms_on(const struct dc_link *link,
 	}
 }
 
-static struct dc_link *apple5k_root_for_link(struct dc_link *link)
-{
-	if (dc_link_has_tiled_root_panel_patch(link))
-		return link;
-
-	if (dc_link_has_tiled_slave_panel_patch(link) &&
-	    dc_link_has_tiled_root_panel_patch(link->tiled_peer))
-		return link->tiled_peer;
-
-	return NULL;
-}
-
 static bool apple5k_is_tile(struct dc_link *link)
 {
 	return apple5k_root_for_link(link) != NULL;
@@ -465,10 +863,9 @@ void link_apple_5k_finalize_tiled_pair(struct dc *dc, int group_size,
 	struct pipe_ctx *slave_pipe = NULL;
 	struct dc_link *root_link;
 	struct dc_link *slave_link;
-	enum dc_status read_status;
-	uint8_t latch = 0;
 	bool root_blank;
 	bool slave_blank;
+	bool transaction_started;
 	struct dal_logger *dc_logger;
 	u64 start_ns;
 	u64 mid_ns;
@@ -514,19 +911,10 @@ void link_apple_5k_finalize_tiled_pair(struct dc *dc, int group_size,
 		return;
 	}
 
-	read_status = core_link_read_dpcd(root_link, APPLE_5K_DPCD_PANEL_LATCH,
-					  &latch, sizeof(latch));
-	if (read_status != DC_OK || latch != 1) {
-		enum dc_status arm_status =
-			link_apple_5k_root_panel_latch_pulse(root_link);
-
-		DC_LOG_INFO("APPLE5K-ARM-COUNT pair-finalizer arm root_link[%u] prior_read_status=%d prior_4f1=0x%02x write_status=%d\n",
-			    root_link->link_index, read_status, latch, arm_status);
-	} else {
-		root_link->apple5k_arming = true;
-		DC_LOG_INFO("APPLE5K-ARM-COUNT pair-finalizer arm root_link[%u] already_armed read_status=%d 4f1=0x%02x\n",
-			    root_link->link_index, read_status, latch);
-	}
+	transaction_started = apple5k_begin_native_enable(root_link, slave_link);
+	DC_LOG_INFO("APPLE5K-TXN pair-finalizer begin root_link[%u] slave_link[%u] started=%d\n",
+		    root_link->link_index, slave_link->link_index,
+		    transaction_started);
 
 	DC_LOG_INFO("APPLE5K-UNBLANK pair-finalizer start root_link[%u] slave_link[%u] root_tg=%u slave_tg=%u root_blank=%d slave_blank=%d\n",
 		    root_link->link_index, slave_link->link_index,
@@ -557,6 +945,8 @@ void link_apple_5k_finalize_tiled_pair(struct dc *dc, int group_size,
 
 	apple5k_latch_stream_and_log_status(root_link);
 	apple5k_latch_stream_and_log_status(slave_link);
+	apple5k_finish_native_enable(root_link, slave_link,
+				     root_pipe, slave_pipe, transaction_started);
 }
 
 static bool get_ext_hdmi_settings(struct pipe_ctx *pipe_ctx,
@@ -2720,6 +3110,9 @@ void link_set_dpms_off(struct pipe_ctx *pipe_ctx)
 
 	update_psp_stream_config(pipe_ctx, true);
 	dc->hwss.blank_stream(pipe_ctx);
+	if (apple5k_is_tile(link))
+		apple5k_disarm_for_stream_disable(link,
+						  "dpms-off:blanked-disarm");
 
 	if (pipe_ctx->link_config.dp_tunnel_settings.should_use_dp_bw_allocation)
 		deallocate_usb4_bandwidth(pipe_ctx->stream);

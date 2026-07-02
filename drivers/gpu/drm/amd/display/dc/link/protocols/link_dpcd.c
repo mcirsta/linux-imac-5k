@@ -32,6 +32,7 @@
 
 #include "link_dpcd.h"
 #include <drm/display/drm_dp_helper.h>
+#include <linux/delay.h>
 #include "dm_helpers.h"
 
 #define DC_LOGGER \
@@ -254,8 +255,7 @@ enum dc_status core_link_write_dpcd(
 	return status;
 }
 
-/* Apple 5K dual-tile internal panel: DPCD 0x4F1 = root panel-latch.
- * Writing 1 wakes the panel; the slave's AUX comes up shortly after. */
+/* Apple 5K dual-tile internal panel: DPCD 0x4F1 = root panel latch. */
 #define APPLE_5K_DPCD_ROOT_PANEL_LATCH 0x4F1
 
 enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
@@ -270,31 +270,26 @@ enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
 	if (!dc_link_has_tiled_root_panel_patch(root_link))
 		return DC_OK;
 
-	if (root_link->apple5k_arming) {
-		read_status = core_link_read_dpcd(root_link,
-						  APPLE_5K_DPCD_ROOT_PANEL_LATCH,
-						  &readback, sizeof(readback));
-		if (read_status == DC_OK && readback == 1) {
-			DC_LOG_INFO("APPLE5K: root wake 0x4F1 skip already-armed root_link[%u] readback=0x%02x\n",
-				    root_link->link_index, readback);
-			link_apple_5k_log_panel_mode(root_link,
-						     "root-latch-pulse:skip");
-			return DC_OK;
-		}
-
-		DC_LOG_INFO("APPLE5K: root wake 0x4F1 re-arm root_link[%u] read_status=%d readback=0x%02x\n",
-			    root_link->link_index, read_status, readback);
+	read_status = core_link_read_dpcd(root_link,
+					  APPLE_5K_DPCD_ROOT_PANEL_LATCH,
+					  &readback, sizeof(readback));
+	if (read_status == DC_OK && readback == 1) {
+		DC_LOG_INFO("APPLE5K: root wake 0x4F1 skip already-set root_link[%u] readback=0x%02x transaction_active=%d\n",
+			    root_link->link_index, readback,
+			    root_link->apple5k_arming);
+		link_apple_5k_log_panel_mode(root_link,
+					     "root-latch-pulse:skip");
+		return DC_OK;
 	}
 
 	link_apple_5k_log_panel_mode(root_link, "root-latch-pulse:pre");
 	status = core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
 				    &payload, sizeof(payload));
 	/*
-	 * Latch is now armed for the combined dual-tile enable. Mark arming so the
-	 * eDP power-off guard keeps the panel powered until the enable resolves
-	 * (the firmware never power-cycles the panel between arm and enable).
+	 * This helper is still used by detection/source-DPCD/training wake probes.
+	 * Do not mark apple5k_arming here: that flag is now reserved for the bounded
+	 * paired native-enable transaction owned by link_apple_5k_finalize_tiled_pair().
 	 */
-	root_link->apple5k_arming = true;
 	link_apple_5k_log_panel_mode(root_link, "root-latch-pulse:post");
 	return status;
 }
@@ -326,8 +321,11 @@ bool link_apple_5k_edp_power_off_guard(struct dc_link *link)
 	 * quiet base/compat state and is cleanly re-armable next enable. Never leave
 	 * an armed latch across a power-off.
 	 */
+	link_apple_5k_log_panel_mode(link, "power-off:pre-disarm");
 	(void)core_link_write_dpcd(link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
 				   &off, sizeof(off));
+	msleep(10);
+	link_apple_5k_log_panel_mode(link, "power-off:post-disarm");
 	DC_LOG_INFO("APPLE5K: disarm 0x4F1=0 link[%u] before eDP power-OFF\n",
 		    link->link_index);
 	return false;

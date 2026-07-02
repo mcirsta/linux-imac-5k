@@ -92,6 +92,9 @@ void link_apple_5k_log_panel_mode(struct dc_link *link, const char *stage);
  * APPLE5K tiled-pair finalizer (defined in link/link_dpms.c). Called after DC
  * accepts the root+slave timing group, mirroring the Windows shape where the
  * pair-level side effect happens late instead of from each independent stream.
+ * This owns the bounded native transaction: stale clear, root 0x4F1 arm, 10 ms
+ * wait, paired unblank, late stream latch, verify native status, and failure
+ * disarm.
  */
 void link_apple_5k_finalize_tiled_pair(struct dc *dc, int group_size,
 				       struct pipe_ctx *pipe_set[]);
@@ -102,12 +105,25 @@ void link_apple_5k_finalize_tiled_pair(struct dc *dc, int group_size,
  *  - returns true (caller must SKIP the power-off) while the 0x4F1 latch is armed
  *    for the combined dual-tile enable — the firmware never power-cycles between
  *    arm and enable, and doing so wedges the Pro TCON into stuck-compat;
- *  - otherwise DISARMS the latch (writes 0x4F1=0, the firmware's teardown action)
- *    and returns false so the caller proceeds with the power-off on a quiet base
- *    panel.
+ *  - otherwise DISARMS the latch (writes 0x4F1=0 and waits 10 ms, the
+ *    firmware's teardown action) and returns false so the caller proceeds with
+ *    the power-off on a quiet base panel.
  * Returns false (normal power-off) for any non-tiled / non-Apple eDP.
  */
 bool link_apple_5k_edp_power_off_guard(struct dc_link *link);
+
+/*
+ * APPLE5K depth-1 boot cold-down (defined in link/link_dpms.c). On platforms
+ * where the firmware GOP drove the tiled panel through boot (no-iGPU
+ * iMacPro1,1), the hwseq boot path refuses fast-boot/seamless inheritance of
+ * that hot state and calls the cold-down before the full power-down: disarm
+ * the root 0x4F1 latch (+10 ms), put the slave sink in D3, and log the
+ * ready-gate/panel state, reducing the hot boot to the cold base the
+ * coordinated enable is proven on. Gated by the apple5k_cold_boot module
+ * parameter (default on) plus tiled-root presence.
+ */
+bool link_apple_5k_wants_cold_boot(const struct dc *dc);
+void link_apple_5k_boot_cold_down(struct dc *dc);
 
 struct link_init_data {
 	const struct dc *dc;

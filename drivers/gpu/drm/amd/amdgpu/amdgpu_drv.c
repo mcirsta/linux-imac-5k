@@ -223,6 +223,7 @@ uint amdgpu_dc_debug_mask;
 uint amdgpu_dc_visual_confirm;
 int amdgpu_apple5k_coordinated_enable = 1;
 int amdgpu_apple5k_dce12_force_msa_ignore;
+int amdgpu_apple5k_cold_boot = 1;
 int amdgpu_async_gfx_ring = 1;
 int amdgpu_mcbp = -1;
 int amdgpu_discovery = -1;
@@ -911,6 +912,10 @@ MODULE_PARM_DESC(apple5k_dce12_force_msa_ignore,
 		 "Apple 5K DCE12 tiled panel force DPCD 0x107 bit 7 (0 = off (default), 1 = on)");
 module_param_named(apple5k_dce12_force_msa_ignore,
 		   amdgpu_apple5k_dce12_force_msa_ignore, int, 0444);
+
+MODULE_PARM_DESC(apple5k_cold_boot,
+		 "Apple 5K tiled panel full display cold-down at boot before first enable (0 = inherit firmware state, 1 = cold-down (default))");
+module_param_named(apple5k_cold_boot, amdgpu_apple5k_cold_boot, int, 0444);
 
 /**
  * DOC: abmlevel (uint)

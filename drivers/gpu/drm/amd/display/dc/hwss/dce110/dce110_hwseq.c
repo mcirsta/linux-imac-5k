@@ -2015,6 +2015,27 @@ void dce110_enable_accelerated_mode(struct dc *dc, struct dc_state *context)
 	// the link via a DPCD SET_POWER write causes a brief flash
 	keep_edp_vdd_on |= dc->is_switch_in_progress_dest;
 
+	/* APPLE5K depth-1 cold boot: on a firmware-hot tiled panel (no-iGPU
+	 * platform, GOP drove the boot display) refuse fast-boot/seamless
+	 * inheritance of the GOP session and force the full power-down,
+	 * sanitizing the Apple panel latch over AUX first, so the native 5K
+	 * enable starts from the proven cold base.
+	 */
+	if (link_apple_5k_wants_cold_boot(dc)) {
+		if (can_apply_edp_fast_boot || can_apply_seamless_boot)
+			DC_LOG_INFO("APPLE5K-COLD overriding boot path fast_boot=%d seamless=%d -> forced cold\n",
+				    can_apply_edp_fast_boot,
+				    can_apply_seamless_boot);
+		can_apply_edp_fast_boot = false;
+		can_apply_seamless_boot = false;
+		keep_edp_vdd_on = false;
+		for (i = 0; i < context->stream_count; i++) {
+			context->streams[i]->apply_edp_fast_boot_optimization = false;
+			context->streams[i]->apply_seamless_boot_optimization = false;
+		}
+		link_apple_5k_boot_cold_down(dc);
+	}
+
 	if (!can_apply_edp_fast_boot && !can_apply_seamless_boot) {
 		if (edp_link_with_sink && !keep_edp_vdd_on) {
 			/*turn off backlight before DP_blank and encoder powered down*/

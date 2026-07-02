@@ -41,9 +41,10 @@ enum dc_status core_link_write_dpcd(
 		uint32_t size);
 
 /*
- * Pulse the Apple 5K root panel-latch DPCD (0x4F1 = 1). Used by the slave-side
- * pre-detect / source-DPCD / link-training paths to wake the panel before
- * touching the slave's AUX. Safe to call with NULL or non-root link — no-op.
+ * Pulse the Apple 5K root panel-latch DPCD (0x4F1 = 1) for discovery/wake
+ * probes. This does not mark the bounded native-enable transaction active; that
+ * ownership lives in the paired DPMS finalizer. Safe to call with NULL or
+ * non-root link — no-op.
  */
 enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link);
 
