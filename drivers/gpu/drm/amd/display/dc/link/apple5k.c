@@ -22,6 +22,7 @@ extern int amdgpu_apple5k_wake_mode;
 extern int amdgpu_apple5k_boot_mode;
 extern int amdgpu_apple5k_shutdown_mode;
 extern int amdgpu_apple5k_pair_order;
+extern int amdgpu_apple5k_discovery_mode;
 extern int amdgpu_apple5k_dce12_force_msa_ignore;
 extern uint amdgpu_apple5k_log_mask;
 
@@ -108,6 +109,7 @@ void link_apple5k_resolve_policy(struct dc *dc)
 	policy->boot_mode = APPLE5K_BOOT_INHERIT;
 	policy->shutdown_mode = APPLE5K_SHUTDOWN_STOCK;
 	policy->pair_order = APPLE5K_ORDER_ROOT_FIRST;
+	policy->discovery_mode = amdgpu_apple5k_discovery_mode;
 	policy->dce12_force_msa_ignore = false;
 	raw_log_mask = amdgpu_apple5k_log_mask;
 	policy->log_mask = raw_log_mask;
@@ -166,6 +168,11 @@ void link_apple5k_resolve_policy(struct dc *dc)
 		invalid_value = true;
 		policy->pair_order = APPLE5K_ORDER_ROOT_FIRST;
 	}
+	if (policy->discovery_mode < APPLE5K_DISCOVERY_DEFER ||
+	    policy->discovery_mode > APPLE5K_DISCOVERY_BOUNDED) {
+		invalid_value = true;
+		policy->discovery_mode = APPLE5K_DISCOVERY_BOUNDED;
+	}
 
 	if (policy->pair_mode == APPLE5K_PAIR_TRANSACTIONAL)
 		policy->wake_mode = APPLE5K_WAKE_SCOPED;
@@ -196,10 +203,11 @@ void link_apple5k_resolve_policy(struct dc *dc)
 		if (invalid_value)
 			DC_LOG_ERROR("APPLE5K-POLICY invalid custom field or combination; "
 				     "using safe effective values\n");
-		DC_LOG_INFO("APPLE5K-POLICY profile=%d enabled=%d pair=%d wake=%d boot=%d shutdown=%d order=%d msa_ignore=%d log_mask=0x%x\n",
+		DC_LOG_INFO("APPLE5K-POLICY profile=%d enabled=%d pair=%d wake=%d boot=%d shutdown=%d order=%d discovery=%d msa_ignore=%d log_mask=0x%x\n",
 			    profile, policy->enabled, policy->pair_mode,
 			    policy->wake_mode, policy->boot_mode,
 			    policy->shutdown_mode, policy->pair_order,
+			    policy->discovery_mode,
 			    policy->dce12_force_msa_ignore, policy->log_mask);
 	}
 }
@@ -483,8 +491,16 @@ enum dc_status link_apple5k_finish_discovery(struct dc_link *root,
 	}
 	mutex_unlock(&root->apple5k.lock);
 
-	/* Never clear a discovery latch while firmware/native scanout is live. */
-	if (apple5k_pair_has_stream(root)) {
+	/*
+	 * Bounded discovery must return the panel to the verified compatibility
+	 * base before boot detection completes.  Mode 0 retains the previous
+	 * defer-on-any-Apple-stream behavior strictly as a command-line A/B
+	 * control; it is not the transactional default because it can leak
+	 * DISCOVERY ownership into the first atomic commit.
+	 */
+	if (root->dc->apple5k_policy.discovery_mode ==
+				APPLE5K_DISCOVERY_DEFER &&
+	    apple5k_pair_has_stream(root)) {
 		if (link_apple5k_log_enabled(root->dc, APPLE5K_LOG_SUMMARY)) {
 			DC_LOGGER_INIT(root->ctx->logger);
 			DC_LOG_INFO("APPLE5K-TXN discovery finish deferred root[%u] reason=pair-stream-active\n",
@@ -517,6 +533,11 @@ enum dc_status link_apple5k_finish_discovery(struct dc_link *root,
 		DC_LOGGER_INIT(root->ctx->logger);
 		DC_LOG_ERROR("APPLE5K-TXN discovery cleanup blocked root[%u] tuple=%02x/%02x/00\n",
 			     root->link_index, r41c, r425);
+	} else if (link_apple5k_log_enabled(root->dc,
+						 APPLE5K_LOG_SUMMARY)) {
+		DC_LOGGER_INIT(root->ctx->logger);
+		DC_LOG_INFO("APPLE5K-TXN discovery closed root[%u] tuple=%02x/%02x/00 state=READY owner=none\n",
+			    root->link_index, r41c, r425);
 	}
 	return status;
 }

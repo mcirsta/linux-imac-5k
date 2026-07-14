@@ -537,23 +537,48 @@ static bool apple5k_prepare_root_aux(struct dc_link *root)
 	return panel_on && status == DC_OK && dpcd_rev != 0;
 }
 
+struct apple5k_prearm {
+	enum apple5k_tx_state state;
+	enum apple5k_latch_owner owner;
+	u32 generation;
+};
+
+/* A pre-arm failure may release only the software ownership it acquired. */
+static bool apple5k_restore_prearm(struct dc_link *root, const struct apple5k_prearm *prior)
+{
+	bool restored = false;
+
+	mutex_lock(&root->apple5k.lock);
+	if (root->apple5k.generation == prior->generation &&
+	    root->apple5k.state == APPLE5K_TX_ENABLING &&
+	    root->apple5k.latch_owner == APPLE5K_LATCH_ENABLE &&
+	    !root->apple5k.block_rearm) {
+		root->apple5k.state = prior->state;
+		root->apple5k.latch_owner = prior->owner;
+		restored = true;
+	}
+	mutex_unlock(&root->apple5k.lock);
+
+	return restored;
+}
+
 static bool apple5k_begin_native_enable(struct dc_link *root,
 					struct dc_link *slave,
 					struct pipe_ctx *root_pipe,
 					struct pipe_ctx *slave_pipe)
 {
-	struct apple5k_panel_mode_status st;
+	struct apple5k_panel_mode_status st = { 0 };
+	struct apple5k_prearm prior;
 	uint8_t power_state = DP_POWER_STATE_D0;
 	uint8_t dpcd_rev = 0;
 	uint32_t ready_gate = 0;
 	enum dc_status power_status = DC_ERROR_UNEXPECTED;
 	enum dc_status rev_status = DC_ERROR_UNEXPECTED;
 	enum dc_status status;
-	enum apple5k_tx_state prior_state;
-	enum apple5k_latch_owner prior_owner;
 	bool transactional;
 	bool ready;
 	bool have_status;
+	bool restored;
 	int elapsed_ms;
 
 	if (!dc_link_has_tiled_root_panel_patch(root) ||
@@ -585,22 +610,19 @@ static bool apple5k_begin_native_enable(struct dc_link *root,
 	 * holds VDD through the readiness probe and latch arm.  No panel-private
 	 * write is allowed until the root AUX probe below succeeds.
 	 */
-	prior_state = root->apple5k.state;
-	prior_owner = root->apple5k.latch_owner;
+	prior.state = root->apple5k.state;
+	prior.owner = root->apple5k.latch_owner;
 	root->apple5k.generation++;
+	prior.generation = root->apple5k.generation;
 	root->apple5k.state = APPLE5K_TX_ENABLING;
 	root->apple5k.latch_owner = APPLE5K_LATCH_ENABLE;
 	mutex_unlock(&root->apple5k.lock);
 	if (!apple5k_prepare_root_aux(root)) {
-		DC_LOG_ERROR("APPLE5K-TXN refusing enable without root VDD/AUX root_link[%u]\n",
-			     root->link_index);
-		mutex_lock(&root->apple5k.lock);
-		if (root->apple5k.state == APPLE5K_TX_ENABLING &&
-		    root->apple5k.latch_owner == APPLE5K_LATCH_ENABLE) {
-			root->apple5k.state = prior_state;
-			root->apple5k.latch_owner = prior_owner;
-		}
-		mutex_unlock(&root->apple5k.lock);
+		restored = apple5k_restore_prearm(root, &prior);
+		DC_LOG_ERROR("APPLE5K-TXN refusing enable without root VDD/AUX root_link[%u] restored=%d prior=%s/%s\n",
+			     root->link_index, restored,
+			     link_apple5k_state_name(prior.state),
+			     link_apple5k_latch_owner_name(prior.owner));
 		return false;
 	}
 	mutex_lock(&root->apple5k.lock);
@@ -621,20 +643,20 @@ static bool apple5k_begin_native_enable(struct dc_link *root,
 						&st);
 	}
 	if (!have_status || st.s41c != DC_OK || st.s425 != DC_OK ||
-	    st.s4f1 != DC_OK ||
-	    (apple5k_panel_status_is_mixed(&st) &&
-	     prior_state != APPLE5K_TX_DISCOVERING)) {
-		DC_LOG_INFO("APPLE5K-TXN refusing enable from unknown/mixed state root_link[%u] 41c=0x%02x(s=%d) 425=0x%02x(s=%d) 4f1=0x%02x(s=%d)\n",
+	    st.s4f1 != DC_OK) {
+		restored = apple5k_restore_prearm(root, &prior);
+		DC_LOG_INFO("APPLE5K-TXN refusing enable without pre-arm tuple root_link[%u] 41c=0x%02x(s=%d) 425=0x%02x(s=%d) 4f1=0x%02x(s=%d) restored=%d prior=%s/%s\n",
 			    root->link_index, st.r41c, st.s41c, st.r425,
-			    st.s425, st.r4f1, st.s4f1);
-		mutex_lock(&root->apple5k.lock);
-		root->apple5k.state = APPLE5K_TX_BLOCKED;
-		root->apple5k.block_rearm = true;
-		mutex_unlock(&root->apple5k.lock);
+			    st.s425, st.r4f1, st.s4f1, restored,
+			    link_apple5k_state_name(prior.state),
+			    link_apple5k_latch_owner_name(prior.owner));
 		return false;
 	}
 
 	if (apple5k_panel_status_needs_base_clear(&st)) {
+		DC_LOG_INFO("APPLE5K-TXN clearing stale pre-arm tuple root_link[%u] tuple=%02x/%02x/%02x mixed=%d\n",
+			    root->link_index, st.r41c, st.r425, st.r4f1,
+			    apple5k_panel_status_is_mixed(&st));
 		status = apple5k_write_root_latch(root, 0,
 						  "native-txn:clear-stale");
 		msleep(10);
@@ -656,10 +678,11 @@ static bool apple5k_begin_native_enable(struct dc_link *root,
 			return false;
 		}
 	} else if (!apple5k_panel_status_is_base(&st)) {
-		mutex_lock(&root->apple5k.lock);
-		root->apple5k.state = APPLE5K_TX_BLOCKED;
-		root->apple5k.block_rearm = true;
-		mutex_unlock(&root->apple5k.lock);
+		restored = apple5k_restore_prearm(root, &prior);
+		DC_LOG_INFO("APPLE5K-TXN refusing unsupported pre-arm tuple root_link[%u] tuple=%02x/%02x/%02x restored=%d prior=%s/%s\n",
+			    root->link_index, st.r41c, st.r425, st.r4f1,
+			    restored, link_apple5k_state_name(prior.state),
+			    link_apple5k_latch_owner_name(prior.owner));
 		return false;
 	}
 

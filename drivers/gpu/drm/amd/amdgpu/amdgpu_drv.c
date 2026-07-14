@@ -228,6 +228,7 @@ int amdgpu_apple5k_wake_mode;
 int amdgpu_apple5k_boot_mode;
 int amdgpu_apple5k_shutdown_mode;
 int amdgpu_apple5k_pair_order;
+int amdgpu_apple5k_discovery_mode = 1;
 int amdgpu_apple5k_dce12_force_msa_ignore;
 uint amdgpu_apple5k_log_mask = 1;
 int amdgpu_async_gfx_ring = 1;
@@ -937,6 +938,11 @@ module_param_named(apple5k_shutdown_mode, amdgpu_apple5k_shutdown_mode, int, 044
 MODULE_PARM_DESC(apple5k_pair_order,
 		 "Apple 5K transactional pair order (0 = root first (default), 1 = slave first, 2 = existing pipe order)");
 module_param_named(apple5k_pair_order, amdgpu_apple5k_pair_order, int, 0444);
+
+MODULE_PARM_DESC(apple5k_discovery_mode,
+		 "Apple 5K scoped discovery cleanup (0 = defer while an Apple stream exists, 1 = bounded close and verify (default))");
+module_param_named(apple5k_discovery_mode,
+		   amdgpu_apple5k_discovery_mode, int, 0444);
 
 MODULE_PARM_DESC(apple5k_dce12_force_msa_ignore,
 		 "Apple 5K DCE12 tiled panel force DPCD 0x107 bit 7 (0 = off (default), 1 = on)");

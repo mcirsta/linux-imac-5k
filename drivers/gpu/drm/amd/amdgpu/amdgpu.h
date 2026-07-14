@@ -213,6 +213,7 @@ extern int amdgpu_apple5k_wake_mode;
 extern int amdgpu_apple5k_boot_mode;
 extern int amdgpu_apple5k_shutdown_mode;
 extern int amdgpu_apple5k_pair_order;
+extern int amdgpu_apple5k_discovery_mode;
 extern int amdgpu_apple5k_dce12_force_msa_ignore;
 extern uint amdgpu_apple5k_log_mask;
 extern int amdgpu_dm_abm_level;

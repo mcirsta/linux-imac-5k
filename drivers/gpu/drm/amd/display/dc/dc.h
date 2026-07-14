@@ -1596,6 +1596,11 @@ enum apple5k_wake_mode {
 	APPLE5K_WAKE_OFF = 2,
 };
 
+enum apple5k_discovery_mode {
+	APPLE5K_DISCOVERY_DEFER = 0,
+	APPLE5K_DISCOVERY_BOUNDED = 1,
+};
+
 enum apple5k_boot_mode {
 	APPLE5K_BOOT_INHERIT = 0,
 	APPLE5K_BOOT_OBSERVE = 1,
@@ -1646,6 +1651,7 @@ struct apple5k_policy {
 	enum apple5k_boot_mode boot_mode;
 	enum apple5k_shutdown_mode shutdown_mode;
 	enum apple5k_pair_order pair_order;
+	enum apple5k_discovery_mode discovery_mode;
 	bool dce12_force_msa_ignore;
 	uint32_t log_mask;
 };
