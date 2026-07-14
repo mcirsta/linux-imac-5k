@@ -61,7 +61,6 @@
 #include "vpg.h"
 #include "grph_object_id.h"
 #include <linux/dmi.h>
-#include <linux/kexec.h>
 #include <linux/ktime.h>
 #include <linux/reboot.h>
 
@@ -1424,7 +1423,8 @@ static bool apple5k_state_get_timing_pair(struct dc_state *state,
 }
 
 /* Pair-wide pre-reset transition.  DPMS/suspend targets with no Apple streams
- * neutralize native explicitly; restart keeps its policy-controlled path.
+ * neutralize native explicitly; every SYSTEM_RESTART teardown (including
+ * kexec, which has no module-safe discriminator) uses the restart policy.
  */
 enum dc_status link_apple_5k_prepare_transition(struct dc *dc,
 					       struct dc_state *state)
@@ -1441,8 +1441,7 @@ enum dc_status link_apple_5k_prepare_transition(struct dc *dc,
 	if (!dc || !state || !dc->apple5k_policy.enabled)
 		return DC_OK;
 
-	if (system_state == SYSTEM_RESTART && !kexec_in_progress &&
-	    state->stream_count == 0) {
+	if (system_state == SYSTEM_RESTART && state->stream_count == 0) {
 		link_apple_5k_prepare_shutdown(dc, state);
 		return DC_OK;
 	}
@@ -1585,8 +1584,7 @@ void link_apple_5k_prepare_shutdown(struct dc *dc,
 	int i;
 
 	if (!dc || !new_state || !dc->apple5k_policy.enabled ||
-	    system_state != SYSTEM_RESTART || kexec_in_progress ||
-	    new_state->stream_count != 0)
+	    system_state != SYSTEM_RESTART || new_state->stream_count != 0)
 		return;
 
 	for (i = 0; i < dc->link_count; i++) {
