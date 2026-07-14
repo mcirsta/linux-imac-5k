@@ -1747,11 +1747,6 @@ void dce110_link_encoder_connect_dig_be_to_fe(
 			field &= ~get_frontend_source(engine);
 
 		REG_UPDATE(DIG_BE_CNTL, DIG_FE_SOURCE_SELECT, field);
-
-		/* APPLE5K P1 probe: which UNIPHY(BE) drives which DIG_FE(engine).
-		 * Windows routes source 5(eDP/root) and 4(DP/slave) on the Pro. */
-		DC_LOG_INFO("APPLE5K-PROBE: connect_be_to_fe transmitter=%d engine=%d connect=%d fe_source_select=0x%x\n",
-			    enc->transmitter, engine, connect, field);
 	}
 }
 

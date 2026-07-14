@@ -1771,7 +1771,8 @@ static void program_timing_sync(
 				}
 			}
 
-			if (group_has_tiled) {
+			if (group_has_tiled && dc->apple5k_policy.enabled &&
+			    (dc->apple5k_policy.log_mask & 0x10)) {
 				DC_LOG_INFO("APPLE5K-SYNC group=%d size=%d sync_type=%d(%s) master_tg_inst=%u\n",
 					    num_group, group_size, sync_type,
 					    sync_type == TIMING_SYNCHRONIZABLE ? "TIMING" :
@@ -1807,53 +1808,6 @@ static void program_timing_sync(
 			if (sync_type == TIMING_SYNCHRONIZABLE) {
 				dc->hwss.enable_timing_synchronization(
 					dc, ctx, group_index, group_size, pipe_set);
-				link_apple_5k_finalize_tiled_pair(
-					dc, group_size, pipe_set);
-				link_apple_5k_log_panel_mode(pipe_set[0]->stream->link,
-							     "gsl:post");
-				/* Short OTG burst: keep as a Vega-vs-Polaris
-				 * coherence witness, not as control flow.
-				 */
-				{
-					int s, t;
-					bool has_tiled = false;
-
-					for (t = 0; t < group_size; t++) {
-						struct dc_link *tl =
-							pipe_set[t]->stream->link;
-
-						if (dc_link_has_tiled_root_panel_patch(tl) ||
-						    dc_link_has_tiled_slave_panel_patch(tl)) {
-							has_tiled = true;
-							break;
-						}
-					}
-
-					for (s = 0; has_tiled && s < 12; s++) {
-						for (t = 0; t < group_size; t++) {
-							struct timing_generator *tg =
-								pipe_set[t]->stream_res.tg;
-							struct dc_stream_state *ps =
-								pipe_set[t]->stream;
-							struct crtc_position pos = {0};
-							uint32_t fc = 0;
-
-							if (tg->funcs->get_position)
-								tg->funcs->get_position(tg, &pos);
-							if (tg->funcs->get_frame_count)
-								fc = tg->funcs->get_frame_count(tg);
-
-							DC_LOG_INFO("APPLE5K-OTG    sample[%d] member[%d] link[%d] tg_inst=%u frame=%u vcount=%d hcount=%d nominal_v=%d\n",
-								    s, t,
-								    ps->link ? (int)ps->link->link_index : -1,
-								    tg->inst, fc,
-								    pos.vertical_count,
-								    pos.horizontal_count,
-								    pos.nominal_vcount);
-						}
-						udelay(120);
-					}
-				}
 			} else
 				if (sync_type == VBLANK_SYNCHRONIZABLE) {
 				dc->hwss.enable_vblanks_synchronization(
@@ -2365,6 +2319,10 @@ static enum dc_status dc_commit_state_no_check(struct dc *dc, struct dc_state *c
 	if (dc->hwss.dmub_hw_control_lock)
 		dc->hwss.dmub_hw_control_lock(dc, context, false);
 
+	result = link_apple_5k_finalize_state(dc, context);
+	if (result != DC_OK)
+		return result;
+
 	for (i = 0; i < context->stream_count; i++) {
 		const struct dc_link *link = context->streams[i]->link;
 
@@ -2583,18 +2541,6 @@ enum dc_status dc_commit_streams(struct dc *dc, struct dc_commit_streams_params 
 					status->is_abm_supported = true;
 			}
 		}
-	}
-
-	/*
-	 * APPLE5K T2: after the streams are committed (GSL genlock ran inside
-	 * dc_commit_state_no_check -> dc_trigger_sync -> program_timing_sync), read
-	 * the tiled-5K panel mode so the compat->native flip can be localized to the
-	 * commit/scanout window. No-op on non-tiled links.
-	 */
-	if (res == DC_OK) {
-		for (i = 0; i < params->stream_count; i++)
-			link_apple_5k_log_panel_mode(params->streams[i]->link,
-						     "commit:post");
 	}
 
 fail:

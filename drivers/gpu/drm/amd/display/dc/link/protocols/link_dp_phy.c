@@ -31,6 +31,7 @@
  */
 
 #include "link_dp_phy.h"
+#include "../apple5k.h"
 #include "link_dpcd.h"
 #include "link_dp_training.h"
 #include "link_dp_capability.h"
@@ -44,14 +45,19 @@
 void dpcd_write_rx_power_ctrl(struct dc_link *link, bool on)
 {
 	uint8_t state;
+	enum dc_status status;
 
 	state = on ? DP_POWER_STATE_D0 : DP_POWER_STATE_D3;
 
 	if (link->sync_lt_in_progress)
 		return;
 
-	core_link_write_dpcd(link, DP_SET_POWER, &state,
-						 sizeof(state));
+	status = core_link_write_dpcd(link, DP_SET_POWER, &state,
+					      sizeof(state));
+	if (link_apple5k_is_tile(link) &&
+	    link_apple5k_log_enabled(link->dc, APPLE5K_LOG_POWER))
+		DC_LOG_INFO("APPLE5K-POWER receiver link[%u] target=%s status=%d\n",
+			    link->link_index, on ? "D0" : "D3", status);
 
 }
 
@@ -207,4 +213,3 @@ void dp_set_fec_enable(struct dc_link *link, const struct link_resource *link_re
 		}
 	}
 }
-

@@ -32,6 +32,7 @@
 
 #include "link_dpms.h"
 #include "link_detection.h"
+#include "apple5k.h"
 #include "link_hwss.h"
 #include "protocols/link_edp_panel_control.h"
 #include "protocols/link_ddc.h"
@@ -123,11 +124,12 @@ static enum dc_status tiled_root_write_panel_wake(struct dc_link *link,
 	set_ddc_transaction_type(link->ddc, DDC_TRANSACTION_TYPE_I2C_OVER_AUX);
 	link->aux_mode = link_is_in_aux_transaction_mode(link->ddc);
 
-	status = link_apple_5k_root_panel_latch_pulse(link);
-	DC_LOG_INFO("APPLE5K: root wake 0x4F1 stage=%s root_link[%u] slave_link[%d] status=%d root_aux=%d\n",
-		    stage ? stage : "unknown", link->link_index,
-		    slave_link ? (int)slave_link->link_index : -1,
-		    status, link->aux_mode);
+	status = link_apple5k_begin_discovery(link, stage);
+	if (link_apple5k_log_enabled(link->dc, APPLE5K_LOG_LINK))
+		DC_LOG_INFO("APPLE5K: root wake 0x4F1 stage=%s root_link[%u] slave_link[%d] status=%d root_aux=%d\n",
+			    stage ? stage : "unknown", link->link_index,
+			    slave_link ? (int)slave_link->link_index : -1,
+			    status, link->aux_mode);
 
 	return status;
 }
@@ -141,7 +143,11 @@ static bool tiled_slave_poll_aux(struct dc_link *link,
 	enum ddc_transaction_type old_transaction_type;
 	bool old_aux_mode;
 	enum dc_status status;
+	enum dc_status logged_status = DC_ERROR_UNEXPECTED;
 	uint8_t dpcd_rev = 0;
+	uint8_t logged_rev = 0;
+	bool have_logged = false;
+	bool log_link;
 	unsigned int elapsed_ms;
 
 	if (!link || !link->ddc)
@@ -149,11 +155,14 @@ static bool tiled_slave_poll_aux(struct dc_link *link,
 
 	old_transaction_type = link->ddc->transaction_type;
 	old_aux_mode = link->aux_mode;
+	log_link = link_apple5k_log_enabled(link->dc, APPLE5K_LOG_LINK);
 
-	DC_LOG_INFO("APPLE5K: slave AUX poll start stage=%s link[%u] root_link[%d] hpd=%d aux=%d old_transaction=%d\n",
-		    stage ? stage : "unknown", link->link_index,
-		    root_link ? (int)root_link->link_index : -1,
-		    link->hpd_status, link->aux_mode, old_transaction_type);
+	if (log_link)
+		DC_LOG_INFO("APPLE5K: slave AUX poll start stage=%s link[%u] root_link[%d] hpd=%d aux=%d old_transaction=%d\n",
+			    stage ? stage : "unknown", link->link_index,
+			    root_link ? (int)root_link->link_index : -1,
+			    link->hpd_status, link->aux_mode,
+			    old_transaction_type);
 
 	set_ddc_transaction_type(link->ddc, DDC_TRANSACTION_TYPE_I2C_OVER_AUX);
 	link->aux_mode = link_is_in_aux_transaction_mode(link->ddc);
@@ -173,10 +182,18 @@ static bool tiled_slave_poll_aux(struct dc_link *link,
 		status = core_link_read_dpcd(link, DP_DPCD_REV,
 					    &dpcd_rev, sizeof(dpcd_rev));
 
-		DC_LOG_INFO("APPLE5K: slave AUX poll stage=%s link[%u] elapsed_ms=%u status=%d dpcd_rev=0x%02x hpd=%d aux=%d\n",
-			    stage ? stage : "unknown", link->link_index,
-			    elapsed_ms, status, dpcd_rev,
-			    link->hpd_status, link->aux_mode);
+		if (log_link && (!have_logged || status != logged_status ||
+				 dpcd_rev != logged_rev ||
+				 status == DC_OK ||
+				 elapsed_ms >= TILED_SLAVE_AUX_WAKE_TIMEOUT_MS)) {
+			DC_LOG_INFO("APPLE5K: slave AUX poll stage=%s link[%u] elapsed_ms=%u status=%d dpcd_rev=0x%02x hpd=%d aux=%d\n",
+				    stage ? stage : "unknown", link->link_index,
+				    elapsed_ms, status, dpcd_rev,
+				    link->hpd_status, link->aux_mode);
+			logged_status = status;
+			logged_rev = dpcd_rev;
+			have_logged = true;
+		}
 
 		if (status == DC_OK && dpcd_rev != 0) {
 			if (dpcd_rev_out)

@@ -48,6 +48,8 @@
 
 #include "sspl/dc_spl_types.h"
 
+#include <linux/mutex.h>
+
 struct abm_save_restore;
 
 /* forward declaration */
@@ -1582,7 +1584,84 @@ struct dc_scratch_space {
  * A link contains one or more sinks and their connected status.
  * The currently active signal type (HDMI, DP-SST, DP-MST) is also reported.
  */
- struct dc_link {
+enum apple5k_pair_mode {
+	APPLE5K_PAIR_LEGACY = 0,
+	APPLE5K_PAIR_COORDINATED = 1,
+	APPLE5K_PAIR_TRANSACTIONAL = 2,
+};
+
+enum apple5k_wake_mode {
+	APPLE5K_WAKE_LEGACY = 0,
+	APPLE5K_WAKE_SCOPED = 1,
+	APPLE5K_WAKE_OFF = 2,
+};
+
+enum apple5k_boot_mode {
+	APPLE5K_BOOT_INHERIT = 0,
+	APPLE5K_BOOT_OBSERVE = 1,
+	APPLE5K_BOOT_COLD = 3,
+};
+
+enum apple5k_shutdown_mode {
+	APPLE5K_SHUTDOWN_STOCK = 0,
+	APPLE5K_SHUTDOWN_OBSERVE = 1,
+	APPLE5K_SHUTDOWN_PAIR_QUIESCE = 2,
+	APPLE5K_SHUTDOWN_NEUTRALIZE = 4,
+};
+
+enum apple5k_zero_stream_reason {
+	APPLE5K_ZERO_STREAM_UNSPECIFIED = 0,
+	APPLE5K_ZERO_STREAM_DPMS,
+	APPLE5K_ZERO_STREAM_SUSPEND,
+};
+
+enum apple5k_pair_order {
+	APPLE5K_ORDER_ROOT_FIRST = 0,
+	APPLE5K_ORDER_SLAVE_FIRST = 1,
+	APPLE5K_ORDER_PIPE = 2,
+};
+
+enum apple5k_tx_state {
+	APPLE5K_TX_IDLE = 0,
+	APPLE5K_TX_DISCOVERING,
+	APPLE5K_TX_READY,
+	APPLE5K_TX_ENABLING,
+	APPLE5K_TX_NATIVE,
+	APPLE5K_TX_QUIESCING,
+	APPLE5K_TX_ABORTING,
+	APPLE5K_TX_BLOCKED,
+};
+
+enum apple5k_latch_owner {
+	APPLE5K_LATCH_NONE = 0,
+	APPLE5K_LATCH_DISCOVERY,
+	APPLE5K_LATCH_ENABLE,
+	APPLE5K_LATCH_TEARDOWN,
+};
+
+struct apple5k_policy {
+	bool enabled;
+	enum apple5k_pair_mode pair_mode;
+	enum apple5k_wake_mode wake_mode;
+	enum apple5k_boot_mode boot_mode;
+	enum apple5k_shutdown_mode shutdown_mode;
+	enum apple5k_pair_order pair_order;
+	bool dce12_force_msa_ignore;
+	uint32_t log_mask;
+};
+
+struct apple5k_pair_state {
+	struct mutex lock;
+	enum apple5k_tx_state state;
+	/* Critical 0x4F1 transition owner, not a cached physical latch value. */
+	enum apple5k_latch_owner latch_owner;
+	uint32_t generation;
+	uint32_t arm_count;
+	uint32_t disarm_count;
+	bool block_rearm;
+};
+
+struct dc_link {
 	struct dc_sink *remote_sinks[MAX_SINKS_PER_LINK];
 	unsigned int sink_count;
 	struct dc_sink *local_sink;
@@ -1752,17 +1831,14 @@ struct dc_scratch_space {
 	 */
 	struct dc_link *tiled_peer;
 
-	/*
-	 * APPLE5K: true only while the bounded native 5K enable transaction is
-	 * active in the paired DPMS finalizer. While set, the eDP power-off guard
-	 * keeps the panel powered, matching firmware's no-power-cycle arm->enable
-	 * invariant. Discovery/source-DPCD/training wake probes must not set this.
-	 */
-	bool apple5k_arming;
+	/* Root-owned lifecycle state for the paired Apple 5K panel. */
+	struct apple5k_pair_state apple5k;
+	bool apple5k_source_table_ok;
 };
 
 struct dc {
 	struct dc_debug_options debug;
+	struct apple5k_policy apple5k_policy;
 	struct dc_versions versions;
 	struct dc_caps caps;
 	struct dc_check_config check_config;

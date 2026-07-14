@@ -293,31 +293,6 @@ static void dce110_stream_encoder_dp_set_stream_attribute(
 		hw_crtc_timing.v_sync_width /= 2;
 	}
 
-	/* APPLE5K P2 probe: per-tile geometry that determines DP MSA. Logged
-	 * unconditionally here because the in-HW MSA block below is gated on a
-	 * register that is not populated on every DCE ASIC (e.g. Polaris). For a
-	 * single-tile state, the panel stretches if hwidth/active is full-width
-	 * instead of the 2560 tile width. engine 5=eDP/left, 4=DP/right. */
-	h_blank = hw_crtc_timing.h_total - hw_crtc_timing.h_border_left -
-		  hw_crtc_timing.h_addressable - hw_crtc_timing.h_border_right;
-	h_back_porch = h_blank - hw_crtc_timing.h_front_porch -
-		       hw_crtc_timing.h_sync_width;
-	h_active_start = hw_crtc_timing.h_sync_width + h_back_porch;
-	v_active_start = hw_crtc_timing.v_total - hw_crtc_timing.v_border_top -
-			 hw_crtc_timing.v_addressable - hw_crtc_timing.v_border_bottom -
-			 hw_crtc_timing.v_front_porch;
-	DC_LOG_INFO("APPLE5K-PROBE: MSA eng=%d depth=%d cs=%d active=%ux%u total=%ux%u hstart=%u vstart=%u hwidth=%u vheight=%u hsync=%u vsync=%u front_porch=%u/%u\n",
-		    enc->id, hw_crtc_timing.display_color_depth, output_color_space,
-		    hw_crtc_timing.h_addressable, hw_crtc_timing.v_addressable,
-		    hw_crtc_timing.h_total, hw_crtc_timing.v_total,
-		    h_active_start, v_active_start,
-		    hw_crtc_timing.h_border_left + hw_crtc_timing.h_addressable +
-			    hw_crtc_timing.h_border_right,
-		    hw_crtc_timing.v_border_top + hw_crtc_timing.v_addressable +
-			    hw_crtc_timing.v_border_bottom,
-		    hw_crtc_timing.h_sync_width, hw_crtc_timing.v_sync_width,
-		    hw_crtc_timing.h_front_porch, hw_crtc_timing.v_front_porch);
-
 	/* set pixel encoding */
 	switch (hw_crtc_timing.pixel_encoding) {
 	case PIXEL_ENCODING_YCBCR422:
@@ -939,11 +914,6 @@ static void dce110_stream_encoder_dp_blank(
 	 * screen on stream disable. */
 	REG_GET(DP_VID_STREAM_CNTL, DP_VID_STREAM_ENABLE, &reg1);
 
-	/* APPLE5K P1 probe: catch a tile being blanked. If the DP/right tile
-	 * (eng=4) gets blanked with no later unblank, that is the stretch. */
-	DC_LOG_INFO("APPLE5K-PROBE: dp_blank eng=%d was_enabled=%u\n",
-		    enc->id, reg1 & 0x1);
-
 	if ((reg1 & 0x1) == 0)
 		/*stream not enabled*/
 		return;
@@ -1040,15 +1010,6 @@ static void dce110_stream_encoder_dp_unblank(
 
 	REG_UPDATE(DP_VID_STREAM_CNTL, DP_VID_STREAM_ENABLE, true);
 
-	/* APPLE5K P1 probe: confirm the stream actually latched enabled per tile. */
-	{
-		uint32_t reg_en = 0;
-
-		REG_GET(DP_VID_STREAM_CNTL, DP_VID_STREAM_ENABLE, &reg_en);
-		DC_LOG_INFO("APPLE5K-PROBE: dp_unblank eng=%d enable_readback=%u pixclk_100hz=%u link_rate=%d\n",
-			    enc->id, reg_en, param->timing.pix_clk_100hz,
-			    param->link_settings.link_rate);
-	}
 }
 
 static void dce110_stream_encoder_set_avmute(

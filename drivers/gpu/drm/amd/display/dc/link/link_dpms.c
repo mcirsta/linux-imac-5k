@@ -37,6 +37,7 @@
 
 #include "dm_services.h"
 #include "link_dpms.h"
+#include "apple5k.h"
 #include "link_hwss.h"
 #include "link_validation.h"
 #include "accessories/link_dp_trace.h"
@@ -59,7 +60,10 @@
 #include "atomfirmware.h"
 #include "vpg.h"
 #include "grph_object_id.h"
+#include <linux/dmi.h>
+#include <linux/kexec.h>
 #include <linux/ktime.h>
+#include <linux/reboot.h>
 
 #define DC_LOGGER \
 	dc_logger
@@ -79,10 +83,6 @@
 #define PEAK_FACTOR_X1000 1006
 #define APPLE_5K_DPCD_PANEL_LATCH 0x4F1
 
-extern int amdgpu_apple5k_coordinated_enable;
-extern int amdgpu_apple5k_dce12_force_msa_ignore;
-extern int amdgpu_apple5k_cold_boot;
-
 struct apple5k_panel_mode_status {
 	uint8_t r41c;
 	uint8_t r41f;
@@ -100,14 +100,19 @@ struct apple5k_panel_mode_status {
 
 static struct dc_link *apple5k_root_for_link(struct dc_link *link)
 {
-	if (dc_link_has_tiled_root_panel_patch(link))
-		return link;
+	return link_apple5k_root_for_link(link);
+}
 
-	if (dc_link_has_tiled_slave_panel_patch(link) &&
-	    dc_link_has_tiled_root_panel_patch(link->tiled_peer))
-		return link->tiled_peer;
+static enum apple5k_tx_state apple5k_get_state(struct dc_link *root)
+{
+	enum apple5k_tx_state state = APPLE5K_TX_IDLE;
 
-	return NULL;
+	if (!root)
+		return state;
+	mutex_lock(&root->apple5k.lock);
+	state = root->apple5k.state;
+	mutex_unlock(&root->apple5k.lock);
+	return state;
 }
 
 static bool apple5k_read_panel_mode_status(struct dc_link *root,
@@ -118,47 +123,86 @@ static bool apple5k_read_panel_mode_status(struct dc_link *root,
 
 	memset(st, 0, sizeof(*st));
 	st->s41c = core_link_read_dpcd(root, 0x41C, &st->r41c, sizeof(st->r41c));
-	st->s41f = core_link_read_dpcd(root, 0x41F, &st->r41f, sizeof(st->r41f));
-	st->s423 = core_link_read_dpcd(root, 0x423, &st->r423, sizeof(st->r423));
 	st->s425 = core_link_read_dpcd(root, 0x425, &st->r425, sizeof(st->r425));
-	st->s42f = core_link_read_dpcd(root, 0x42F, &st->r42f, sizeof(st->r42f));
 	st->s4f1 = core_link_read_dpcd(root, APPLE_5K_DPCD_PANEL_LATCH,
 				       &st->r4f1, sizeof(st->r4f1));
 	return true;
 }
 
+static void apple5k_read_panel_diagnostics(
+		struct dc_link *root, struct apple5k_panel_mode_status *st)
+{
+	if (!st || !dc_link_has_tiled_root_panel_patch(root))
+		return;
+
+	st->s41f = core_link_read_dpcd(root, 0x41F, &st->r41f,
+				       sizeof(st->r41f));
+	st->s423 = core_link_read_dpcd(root, 0x423, &st->r423,
+				       sizeof(st->r423));
+	st->s42f = core_link_read_dpcd(root, 0x42F, &st->r42f,
+				       sizeof(st->r42f));
+}
+
 static bool apple5k_panel_status_is_native_good(
 		const struct apple5k_panel_mode_status *st)
 {
-	bool native_marker;
-	bool explicit_compat;
+	return st && st->s41c == DC_OK && st->r41c == 0x15 &&
+	       st->s425 == DC_OK && st->r425 == 0x00 &&
+	       st->s4f1 == DC_OK && st->r4f1 == 0x01;
+}
 
-	if (!st || st->s4f1 != DC_OK || st->r4f1 != 1)
+static bool apple5k_panel_status_is_base(
+		const struct apple5k_panel_mode_status *st)
+{
+	return st && st->s41c == DC_OK && st->r41c == 0x05 &&
+	       st->s425 == DC_OK && st->r425 == 0x02 &&
+	       st->s4f1 == DC_OK && st->r4f1 == 0x00;
+}
+
+static bool apple5k_panel_status_is_mixed(
+		const struct apple5k_panel_mode_status *st)
+{
+	if (!st || st->s41c != DC_OK || st->s425 != DC_OK ||
+	    st->s4f1 != DC_OK)
 		return false;
 
-	native_marker = (st->s41c == DC_OK && st->r41c == 0x15) ||
-			(st->s425 == DC_OK && !(st->r425 & 0x02));
-	explicit_compat = st->s425 == DC_OK && (st->r425 & 0x02);
-
-	return native_marker && !explicit_compat;
+	return (st->r4f1 == 1 && st->r425 == 0x02) ||
+	       (st->r41c == 0x15 && st->r425 == 0x02);
 }
 
 static bool apple5k_panel_status_needs_base_clear(
 		const struct apple5k_panel_mode_status *st)
 {
-	return st &&
+	return st && !apple5k_panel_status_is_base(st) &&
 	       ((st->s4f1 == DC_OK && st->r4f1 != 0) ||
-		(st->s41c == DC_OK && st->r41c == 0x15) ||
-		(st->s425 == DC_OK && (st->r425 & 0x02)));
+		(st->s41c == DC_OK && st->r41c == 0x15));
 }
 
 /*
- * APPLE5K mode-bisection probe (read-only). See link_dpcd.h. Resolves the tiled
- * ROOT (eDP) link from any tiled link and logs its Apple-private status bytes,
- * tagged with `stage`, so a Polaris boot log shows exactly which enable step
- * flips the panel compat->native (and a Vega log shows where it fails to).
+ * Explicit full diagnostic snapshot.  Successful hot paths use the minimal
+ * 0x41C/0x425/0x4F1 verdict tuple and call this only at coarse transaction
+ * boundaries; failures retain the complete reverse-engineering register set.
  */
-void link_apple_5k_log_panel_mode(struct dc_link *link, const char *stage)
+static void apple5k_log_panel_mode_status(
+		struct dc_link *link, struct dc_link *root, const char *stage,
+		const struct apple5k_panel_mode_status *st)
+{
+	DC_LOGGER_INIT(root->ctx->logger);
+
+	DC_LOG_INFO("APPLE5K-MODE stage=%s link[%u] root[%u] 0x41C=0x%02x(s=%d) 0x41F=0x%02x(s=%d) 0x423=0x%02x(s=%d,b2=%u) 0x425=0x%02x(s=%d) 0x42F=0x%02x(s=%d) 0x4F1=0x%02x(s=%d) -> %s\n",
+		    stage ? stage : "?", link->link_index, root->link_index,
+		    st->r41c, st->s41c, st->r41f, st->s41f, st->r423,
+		    st->s423,
+		    (st->s423 == DC_OK) ? ((st->r423 >> 2) & 1) : 0,
+		    st->r425, st->s425, st->r42f, st->s42f, st->r4f1,
+		    st->s4f1,
+		    (st->s425 == DC_OK) ?
+			    ((st->r425 & 0x02) ? "COMPAT" : "NATIVE") :
+			    "0x425-NACK");
+}
+
+static void link_apple_5k_log_panel_mode(struct dc_link *link,
+					 const char *stage)
 {
 	struct dc_link *root;
 	struct apple5k_panel_mode_status st;
@@ -166,44 +210,20 @@ void link_apple_5k_log_panel_mode(struct dc_link *link, const char *stage)
 	if (!link)
 		return;
 	root = apple5k_root_for_link(link);
-	if (!root)
+	if (!root || !link_apple5k_log_enabled(root->dc, APPLE5K_LOG_PANEL))
 		return;
 
-	DC_LOGGER_INIT(root->ctx->logger);
 	if (!apple5k_read_panel_mode_status(root, &st))
 		return;
-
-	DC_LOG_INFO("APPLE5K-MODE stage=%s link[%u] root[%u] 0x41C=0x%02x(s=%d) 0x41F=0x%02x(s=%d) 0x423=0x%02x(s=%d,b2=%u) 0x425=0x%02x(s=%d) 0x42F=0x%02x(s=%d) 0x4F1=0x%02x(s=%d) -> %s\n",
-		    stage ? stage : "?", link->link_index, root->link_index,
-		    st.r41c, st.s41c, st.r41f, st.s41f, st.r423, st.s423,
-		    (st.s423 == DC_OK) ? ((st.r423 >> 2) & 1) : 0,
-		    st.r425, st.s425, st.r42f, st.s42f, st.r4f1, st.s4f1,
-		    (st.s425 == DC_OK) ? ((st.r425 & 0x02) ? "COMPAT" : "NATIVE")
-				    : "0x425-NACK");
+	apple5k_read_panel_diagnostics(root, &st);
+	apple5k_log_panel_mode_status(link, root, stage, &st);
 }
 
 static enum dc_status apple5k_write_root_latch(struct dc_link *root,
 					       uint8_t value,
 					       const char *stage)
 {
-	uint8_t readback = 0;
-	enum dc_status status;
-	enum dc_status read_status;
-
-	if (!dc_link_has_tiled_root_panel_patch(root) || !root->local_sink)
-		return DC_ERROR_UNEXPECTED;
-
-	DC_LOGGER_INIT(root->ctx->logger);
-	link_apple_5k_log_panel_mode(root, stage);
-	status = core_link_write_dpcd(root, APPLE_5K_DPCD_PANEL_LATCH,
-				      &value, sizeof(value));
-	read_status = core_link_read_dpcd(root, APPLE_5K_DPCD_PANEL_LATCH,
-					  &readback, sizeof(readback));
-	DC_LOG_INFO("APPLE5K-TXN latch-write stage=%s root_link[%u] value=0x%02x status=%d read_status=%d readback=0x%02x transaction_active=%d\n",
-		    stage ? stage : "?", root->link_index, value, status,
-		    read_status, readback, root->apple5k_arming);
-
-	return status;
+	return link_apple5k_write_latch(root, value, stage);
 }
 
 /*
@@ -218,27 +238,45 @@ static enum dc_status apple5k_write_root_latch(struct dc_link *root,
 #define APPLE5K_READY_GATE_ROOT_HPD	0x100	/* DC_GPIO_HPD2_Y */
 #define APPLE5K_READY_GATE_SIBLING_HPD	0x001	/* DC_GPIO_HPD1_Y */
 
+static bool apple5k_pipe_is_blanked(struct pipe_ctx *pipe_ctx);
+
+static bool apple5k_read_ready_gate(struct dc_link *root,
+				    uint32_t *address_out,
+				    uint32_t *value_out)
+{
+	uint32_t address;
+
+	if (!root)
+		return false;
+	switch (root->ctx->dce_version) {
+	case DCE_VERSION_11_2:
+		address = 0x1223C >> 2;
+		break;
+	case DCE_VERSION_12_0:
+		address = 0x15734 >> 2;
+		break;
+	default:
+		return false;
+	}
+	if (address_out)
+		*address_out = address;
+	if (value_out)
+		*value_out = dm_read_reg(root->ctx, address);
+	return true;
+}
+
 static void apple5k_log_ready_gate(struct dc_link *root, const char *stage)
 {
 	uint32_t address;
 	uint32_t value;
 
-	if (!root)
+	if (!root || !link_apple5k_log_enabled(root->dc, APPLE5K_LOG_POWER))
 		return;
 
-	switch (root->ctx->dce_version) {
-	case DCE_VERSION_11_2:	/* Polaris GOP polls BAR byte 0x1223C */
-		address = 0x1223C >> 2;	/* mmDC_GPIO_HPD_Y (0x488F) */
-		break;
-	case DCE_VERSION_12_0:	/* Vega10 GOP polls BAR byte 0x15734 */
-		address = 0x15734 >> 2;	/* seg2 0x34C0 + 0x210D = 0x55CD */
-		break;
-	default:
+	if (!apple5k_read_ready_gate(root, &address, &value))
 		return;
-	}
 
 	DC_LOGGER_INIT(root->ctx->logger);
-	value = dm_read_reg(root->ctx, address);
 	DC_LOG_INFO("APPLE5K-TXN ready-gate stage=%s addr=0x%05x DC_GPIO_HPD_Y=0x%08x root_hpd2=%u sibling_hpd1=%u\n",
 		    stage ? stage : "?", address, value,
 		    (value & APPLE5K_READY_GATE_ROOT_HPD) ? 1 : 0,
@@ -258,11 +296,23 @@ bool link_apple_5k_wants_cold_boot(const struct dc *dc)
 {
 	unsigned int i;
 
-	if (amdgpu_apple5k_cold_boot <= 0 || !dc)
+	if (!dc || !dc->apple5k_policy.enabled ||
+	    dc->apple5k_policy.boot_mode != APPLE5K_BOOT_COLD ||
+	    dc->ctx->dce_version != DCE_VERSION_12_0 ||
+	    !dmi_match(DMI_PRODUCT_NAME, "iMacPro1,1"))
 		return false;
 
 	for (i = 0; i < dc->link_count; i++)
-		if (dc_link_has_tiled_root_panel_patch(dc->links[i]))
+		if (dc_link_has_tiled_root_panel_patch(dc->links[i]) &&
+		    dc->links[i]->tiled_peer &&
+		    dc_link_has_tiled_slave_panel_patch(
+			    dc->links[i]->tiled_peer) &&
+		    dc->links[i]->tiled_peer->tiled_peer == dc->links[i] &&
+		    dc->links[i]->local_sink &&
+		    dc->links[i]->tiled_peer->local_sink &&
+		    dc->links[i]->link_enc &&
+		    dc->links[i]->tiled_peer->link_enc &&
+		    dc->links[i]->ddc && dc->links[i]->tiled_peer->ddc)
 			return true;
 
 	return false;
@@ -272,21 +322,26 @@ void link_apple_5k_boot_cold_down(struct dc *dc)
 {
 	struct dc_link *root = NULL;
 	struct dc_link *slave = NULL;
+	struct apple5k_panel_mode_status st;
 	uint8_t power_state = DP_POWER_STATE_D3;
 	enum dc_status status;
+	bool found_root_pipe = false;
+	bool found_slave_pipe = false;
+	bool pair_quiet = true;
 	unsigned int i;
 
 	if (!link_apple_5k_wants_cold_boot(dc))
 		return;
 
 	for (i = 0; i < dc->link_count; i++) {
-		if (dc_link_has_tiled_root_panel_patch(dc->links[i]))
+		if (dc_link_has_tiled_root_panel_patch(dc->links[i])) {
 			root = dc->links[i];
-		else if (dc_link_has_tiled_slave_panel_patch(dc->links[i]))
-			slave = dc->links[i];
+			break;
+		}
 	}
 	if (!root)
 		return;
+	slave = root->tiled_peer;
 
 	DC_LOGGER_INIT(root->ctx->logger);
 	DC_LOG_INFO("APPLE5K-COLD boot cold-down root_link[%u] slave_link[%d]\n",
@@ -294,18 +349,47 @@ void link_apple_5k_boot_cold_down(struct dc *dc)
 
 	apple5k_log_ready_gate(root, "cold-boot:pre");
 	link_apple_5k_log_panel_mode(root, "cold-boot:pre");
-
-	/* Disarm the panel latch to the quiet compat base while AUX is up. */
-	(void)apple5k_write_root_latch(root, 0, "cold-boot:disarm");
-	root->apple5k_arming = false;
-	msleep(10);
+	mutex_lock(&root->apple5k.lock);
+	root->apple5k.state = APPLE5K_TX_QUIESCING;
+	root->apple5k.latch_owner = APPLE5K_LATCH_TEARDOWN;
+	root->apple5k.block_rearm = true;
+	mutex_unlock(&root->apple5k.lock);
 
 	/*
-	 * Put the slave sink in D3 so it re-enters through the normal D0 wake
-	 * + link training instead of continuing the firmware session. The
-	 * root (eDP) is torn down by the stock backlight/VDD power-off that
-	 * follows in dce110_enable_accelerated_mode.
+	 * Quiesce any inherited pair pipes before touching panel state.  The
+	 * normal accelerated-mode path will perform the complete source teardown.
 	 */
+	for (i = 0; dc->current_state && i < MAX_PIPES; i++) {
+		struct pipe_ctx *pipe = &dc->current_state->res_ctx.pipe_ctx[i];
+
+		if (pipe->stream && !pipe->top_pipe &&
+		    link_apple5k_root_for_link(pipe->stream->link) == root) {
+			if (pipe->stream->link == root)
+				found_root_pipe = true;
+			else if (pipe->stream->link == slave)
+				found_slave_pipe = true;
+			dc->hwss.blank_stream(pipe);
+			if (!apple5k_pipe_is_blanked(pipe))
+				pair_quiet = false;
+		}
+	}
+	if (root->link_enc && root->link_enc->funcs->is_dig_enabled &&
+	    root->link_enc->funcs->is_dig_enabled(root->link_enc) &&
+	    !found_root_pipe)
+		pair_quiet = false;
+	if (slave->link_enc && slave->link_enc->funcs->is_dig_enabled &&
+	    slave->link_enc->funcs->is_dig_enabled(slave->link_enc) &&
+	    !found_slave_pipe)
+		pair_quiet = false;
+	if (!pair_quiet) {
+		mutex_lock(&root->apple5k.lock);
+		root->apple5k.state = APPLE5K_TX_BLOCKED;
+		root->apple5k.block_rearm = true;
+		mutex_unlock(&root->apple5k.lock);
+		return;
+	}
+
+	/* Put the slave in D3 before a root clear can hide its AUX route. */
 	if (slave && slave->local_sink) {
 		status = core_link_write_dpcd(slave, DP_SET_POWER,
 					      &power_state, sizeof(power_state));
@@ -313,99 +397,400 @@ void link_apple_5k_boot_cold_down(struct dc *dc)
 			    slave->link_index, status);
 	}
 
+	status = apple5k_write_root_latch(root, 0, "cold-boot:disarm");
+	msleep(10);
+	if (status == DC_OK &&
+	    (!apple5k_read_panel_mode_status(root, &st) ||
+	     !apple5k_panel_status_is_base(&st)))
+		status = DC_ERROR_UNEXPECTED;
+	mutex_lock(&root->apple5k.lock);
+	root->apple5k.state = status == DC_OK ? APPLE5K_TX_READY :
+						       APPLE5K_TX_BLOCKED;
+	root->apple5k.block_rearm = status != DC_OK;
+	if (status == DC_OK)
+		root->apple5k.latch_owner = APPLE5K_LATCH_NONE;
+	mutex_unlock(&root->apple5k.lock);
+
 	link_apple_5k_log_panel_mode(root, "cold-boot:done");
 	apple5k_log_ready_gate(root, "cold-boot:done");
 }
 
-static bool apple5k_begin_native_enable(struct dc_link *root,
-					struct dc_link *slave)
+static enum dc_status apple5k_neutralize_pair(struct dc_link *root,
+					      struct dc_link *slave,
+					      struct pipe_ctx *root_pipe,
+					      struct pipe_ctx *slave_pipe,
+					      const char *stage)
 {
 	struct apple5k_panel_mode_status st;
-	enum dc_status status;
+	uint8_t power_state = DP_POWER_STATE_D3;
+	enum dc_status power_status = DC_ERROR_UNEXPECTED;
+	enum dc_status disarm_status;
+	enum apple5k_tx_state next_state;
+	bool pair_blank = true;
+	bool base = false;
 
-	if (!dc_link_has_tiled_root_panel_patch(root) ||
-	    !dc_link_has_tiled_slave_panel_patch(slave) ||
-	    !root->local_sink || !slave->local_sink)
+	if (!root || !slave ||
+	    !dc_link_has_tiled_root_panel_patch(root) ||
+	    !dc_link_has_tiled_slave_panel_patch(slave))
+		return DC_ERROR_UNEXPECTED;
+
+	DC_LOGGER_INIT(root->ctx->logger);
+	mutex_lock(&root->apple5k.lock);
+	root->apple5k.state = APPLE5K_TX_ABORTING;
+	root->apple5k.latch_owner = APPLE5K_LATCH_TEARDOWN;
+	root->apple5k.block_rearm = true;
+	mutex_unlock(&root->apple5k.lock);
+	root->link_state_valid = false;
+	slave->link_state_valid = false;
+	slave->apple5k_source_table_ok = false;
+
+	if (root_pipe)
+		root->dc->hwss.blank_stream(root_pipe);
+	if (slave_pipe)
+		root->dc->hwss.blank_stream(slave_pipe);
+	if ((root_pipe && !apple5k_pipe_is_blanked(root_pipe)) ||
+	    (slave_pipe && !apple5k_pipe_is_blanked(slave_pipe)) ||
+	    (!!root_pipe != !!slave_pipe))
+		pair_blank = false;
+
+	/* Never clear the pair latch while either source can still scan out. */
+	if (!pair_blank) {
+		DC_LOG_ERROR("APPLE5K-TXN neutralize blocked stage=%s root_link[%u] reason=pair-not-blank\n",
+			     stage ? stage : "?", root->link_index);
+		mutex_lock(&root->apple5k.lock);
+		root->apple5k.state = APPLE5K_TX_BLOCKED;
+		mutex_unlock(&root->apple5k.lock);
+		return DC_ERROR_UNEXPECTED;
+	}
+
+	/* A root clear can hide the sibling AUX route, so request D3 first. */
+	if (slave->local_sink)
+		power_status = core_link_write_dpcd(slave, DP_SET_POWER,
+						  &power_state,
+						  sizeof(power_state));
+
+	disarm_status = apple5k_write_root_latch(root, 0, stage);
+	msleep(10);
+	if (disarm_status == DC_OK &&
+	    apple5k_read_panel_mode_status(root, &st) &&
+	    apple5k_panel_status_is_base(&st))
+		base = true;
+
+	next_state = base ? APPLE5K_TX_READY : APPLE5K_TX_BLOCKED;
+	mutex_lock(&root->apple5k.lock);
+	root->apple5k.state = next_state;
+	root->apple5k.block_rearm = !base;
+	if (base)
+		root->apple5k.latch_owner = APPLE5K_LATCH_NONE;
+	mutex_unlock(&root->apple5k.lock);
+
+	DC_LOG_INFO("APPLE5K-TXN neutralize stage=%s root_link[%u] slave_link[%u] blank=%d slave_d3_s=%d disarm_s=%d base=%d next=%s\n",
+		    stage ? stage : "?", root->link_index, slave->link_index,
+		    pair_blank, power_status, disarm_status, base,
+		    link_apple5k_state_name(next_state));
+	if (!base)
+		link_apple_5k_log_panel_mode(root, "native-txn:abort-blocked");
+
+	return base ? DC_OK : DC_ERROR_UNEXPECTED;
+}
+
+#define APPLE5K_ROOT_AUX_RETRIES		5
+#define APPLE5K_ROOT_AUX_RETRY_MS	10
+
+static bool apple5k_prepare_root_aux(struct dc_link *root)
+{
+	uint8_t dpcd_rev = 0;
+	enum dc_status status = DC_ERROR_UNEXPECTED;
+	bool panel_on;
+	int attempt;
+	int attempts = 0;
+
+	if (!root || root->connector_signal != SIGNAL_TYPE_EDP ||
+	    !root->panel_cntl || !root->panel_cntl->funcs ||
+	    !root->panel_cntl->funcs->is_panel_powered_on ||
+	    !root->dc->hwss.edp_power_control ||
+	    !root->dc->hwss.edp_wait_for_hpd_ready)
 		return false;
 
 	DC_LOGGER_INIT(root->ctx->logger);
+	if (!root->dc->config.edp_no_power_sequencing)
+		root->dc->hwss.edp_power_control(root, true);
+	root->dc->hwss.edp_wait_for_hpd_ready(root, true);
+	panel_on = root->panel_cntl->funcs->is_panel_powered_on(
+			root->panel_cntl);
+
+	for (attempt = 1; panel_on && attempt <= APPLE5K_ROOT_AUX_RETRIES;
+	     attempt++) {
+		attempts = attempt;
+		dpcd_rev = 0;
+		status = core_link_read_dpcd(root, DP_DPCD_REV, &dpcd_rev,
+					     sizeof(dpcd_rev));
+		if (status == DC_OK && dpcd_rev != 0)
+			break;
+		if (attempt < APPLE5K_ROOT_AUX_RETRIES)
+			msleep(APPLE5K_ROOT_AUX_RETRY_MS);
+	}
+
+	DC_LOG_INFO("APPLE5K-TXN root-ready root_link[%u] panel_on=%d aux_s=%d dpcd_rev=0x%02x attempts=%d\n",
+		    root->link_index, panel_on, status, dpcd_rev,
+		    attempts);
+
+	return panel_on && status == DC_OK && dpcd_rev != 0;
+}
+
+static bool apple5k_begin_native_enable(struct dc_link *root,
+					struct dc_link *slave,
+					struct pipe_ctx *root_pipe,
+					struct pipe_ctx *slave_pipe)
+{
+	struct apple5k_panel_mode_status st;
+	uint8_t power_state = DP_POWER_STATE_D0;
+	uint8_t dpcd_rev = 0;
+	uint32_t ready_gate = 0;
+	enum dc_status power_status = DC_ERROR_UNEXPECTED;
+	enum dc_status rev_status = DC_ERROR_UNEXPECTED;
+	enum dc_status status;
+	enum apple5k_tx_state prior_state;
+	enum apple5k_latch_owner prior_owner;
+	bool transactional;
+	bool ready;
+	bool have_status;
+	int elapsed_ms;
+
+	if (!dc_link_has_tiled_root_panel_patch(root) ||
+	    !dc_link_has_tiled_slave_panel_patch(slave) ||
+	    root->tiled_peer != slave || slave->tiled_peer != root ||
+	    !root->local_sink || !slave->local_sink ||
+	    !root->link_enc || !slave->link_enc ||
+	    !root->ddc || !slave->ddc ||
+	    !root_pipe || !slave_pipe ||
+	    !root_pipe->stream || !slave_pipe->stream ||
+	    root_pipe->stream->link != root ||
+	    slave_pipe->stream->link != slave ||
+	    !apple5k_pipe_is_blanked(root_pipe) ||
+	    !apple5k_pipe_is_blanked(slave_pipe))
+		return false;
+	transactional = root->dc->apple5k_policy.pair_mode ==
+						APPLE5K_PAIR_TRANSACTIONAL;
+	ready = !transactional;
+
+	DC_LOGGER_INIT(root->ctx->logger);
+	mutex_lock(&root->apple5k.lock);
+	if (root->apple5k.state == APPLE5K_TX_BLOCKED ||
+	    root->apple5k.block_rearm) {
+		mutex_unlock(&root->apple5k.lock);
+		return false;
+	}
+	/*
+	 * Enter ENABLING before powering the root so the eDP power-off guard
+	 * holds VDD through the readiness probe and latch arm.  No panel-private
+	 * write is allowed until the root AUX probe below succeeds.
+	 */
+	prior_state = root->apple5k.state;
+	prior_owner = root->apple5k.latch_owner;
+	root->apple5k.generation++;
+	root->apple5k.state = APPLE5K_TX_ENABLING;
+	root->apple5k.latch_owner = APPLE5K_LATCH_ENABLE;
+	mutex_unlock(&root->apple5k.lock);
+	if (!apple5k_prepare_root_aux(root)) {
+		DC_LOG_ERROR("APPLE5K-TXN refusing enable without root VDD/AUX root_link[%u]\n",
+			     root->link_index);
+		mutex_lock(&root->apple5k.lock);
+		if (root->apple5k.state == APPLE5K_TX_ENABLING &&
+		    root->apple5k.latch_owner == APPLE5K_LATCH_ENABLE) {
+			root->apple5k.state = prior_state;
+			root->apple5k.latch_owner = prior_owner;
+		}
+		mutex_unlock(&root->apple5k.lock);
+		return false;
+	}
+	mutex_lock(&root->apple5k.lock);
+	if (root->apple5k.state != APPLE5K_TX_ENABLING ||
+	    root->apple5k.latch_owner != APPLE5K_LATCH_ENABLE ||
+	    root->apple5k.block_rearm) {
+		mutex_unlock(&root->apple5k.lock);
+		return false;
+	}
+	mutex_unlock(&root->apple5k.lock);
 
 	apple5k_log_ready_gate(root, "native-txn:pre");
-	link_apple_5k_log_panel_mode(root, "native-txn:pre");
-	if (apple5k_read_panel_mode_status(root, &st) &&
-	    apple5k_panel_status_needs_base_clear(&st)) {
+	have_status = apple5k_read_panel_mode_status(root, &st);
+	if (have_status &&
+	    link_apple5k_log_enabled(root->dc, APPLE5K_LOG_PANEL)) {
+		apple5k_read_panel_diagnostics(root, &st);
+		apple5k_log_panel_mode_status(root, root, "native-txn:pre",
+						&st);
+	}
+	if (!have_status || st.s41c != DC_OK || st.s425 != DC_OK ||
+	    st.s4f1 != DC_OK ||
+	    (apple5k_panel_status_is_mixed(&st) &&
+	     prior_state != APPLE5K_TX_DISCOVERING)) {
+		DC_LOG_INFO("APPLE5K-TXN refusing enable from unknown/mixed state root_link[%u] 41c=0x%02x(s=%d) 425=0x%02x(s=%d) 4f1=0x%02x(s=%d)\n",
+			    root->link_index, st.r41c, st.s41c, st.r425,
+			    st.s425, st.r4f1, st.s4f1);
+		mutex_lock(&root->apple5k.lock);
+		root->apple5k.state = APPLE5K_TX_BLOCKED;
+		root->apple5k.block_rearm = true;
+		mutex_unlock(&root->apple5k.lock);
+		return false;
+	}
+
+	if (apple5k_panel_status_needs_base_clear(&st)) {
 		status = apple5k_write_root_latch(root, 0,
 						  "native-txn:clear-stale");
 		msleep(10);
-		link_apple_5k_log_panel_mode(root,
-					     "native-txn:after-clear");
-		if (status != DC_OK)
+		have_status = apple5k_read_panel_mode_status(root, &st);
+		if (have_status &&
+		    link_apple5k_log_enabled(root->dc, APPLE5K_LOG_PANEL)) {
+			apple5k_read_panel_diagnostics(root, &st);
+			apple5k_log_panel_mode_status(root, root,
+						"native-txn:after-clear", &st);
+		}
+		if (status != DC_OK || !have_status ||
+		    !apple5k_panel_status_is_base(&st)) {
 			DC_LOG_INFO("APPLE5K-TXN clear-stale failed root_link[%u] status=%d\n",
 				    root->link_index, status);
+			mutex_lock(&root->apple5k.lock);
+			root->apple5k.state = APPLE5K_TX_BLOCKED;
+			root->apple5k.block_rearm = true;
+			mutex_unlock(&root->apple5k.lock);
+			return false;
+		}
+	} else if (!apple5k_panel_status_is_base(&st)) {
+		mutex_lock(&root->apple5k.lock);
+		root->apple5k.state = APPLE5K_TX_BLOCKED;
+		root->apple5k.block_rearm = true;
+		mutex_unlock(&root->apple5k.lock);
+		return false;
 	}
 
 	status = apple5k_write_root_latch(root, 1, "native-txn:arm");
 	if (status != DC_OK) {
-		root->apple5k_arming = false;
 		DC_LOG_INFO("APPLE5K-TXN arm failed root_link[%u] slave_link[%u] status=%d\n",
 			    root->link_index, slave->link_index, status);
+		apple5k_neutralize_pair(root, slave, root_pipe, slave_pipe,
+					    "native-txn:arm-fail-disarm");
 		return false;
 	}
 
-	root->apple5k_arming = true;
 	msleep(10);
-	link_apple_5k_log_panel_mode(root, "native-txn:armed");
+	for (elapsed_ms = 0; !ready && elapsed_ms <= 210; elapsed_ms += 5) {
+		if (apple5k_read_ready_gate(root, NULL, &ready_gate) &&
+		    (ready_gate & (APPLE5K_READY_GATE_ROOT_HPD |
+				   APPLE5K_READY_GATE_SIBLING_HPD)) ==
+				  (APPLE5K_READY_GATE_ROOT_HPD |
+				   APPLE5K_READY_GATE_SIBLING_HPD)) {
+			power_status = core_link_write_dpcd(slave, DP_SET_POWER,
+							    &power_state,
+							    sizeof(power_state));
+			dpcd_rev = 0;
+			rev_status = core_link_read_dpcd(slave, DP_DPCD_REV,
+							 &dpcd_rev,
+							 sizeof(dpcd_rev));
+			if (power_status == DC_OK && rev_status == DC_OK &&
+			    dpcd_rev != 0) {
+				ready = true;
+				break;
+			}
+		}
+		if (elapsed_ms < 210)
+			msleep(5);
+	}
+	if (!ready) {
+		DC_LOG_ERROR("APPLE5K-TXN ready/AUX timeout root_link[%u] slave_link[%u] gate=0x%08x power_s=%d rev_s=%d rev=0x%02x\n",
+			     root->link_index, slave->link_index, ready_gate,
+			     power_status, rev_status, dpcd_rev);
+		apple5k_neutralize_pair(root, slave, root_pipe, slave_pipe,
+					    "native-txn:ready-fail-disarm");
+		return false;
+	}
+	if (transactional &&
+	    link_apple5k_log_enabled(root->dc, APPLE5K_LOG_LINK))
+		DC_LOG_INFO("APPLE5K-TXN ready/AUX root_link[%u] slave_link[%u] elapsed_ms=%d gate=0x%08x dpcd_rev=0x%02x\n",
+			    root->link_index, slave->link_index, elapsed_ms,
+			    ready_gate, dpcd_rev);
 	return true;
 }
 
-/*
- * Log the sibling (slave) tile's DP link/lane status at the instant native is
- * expected. If the slave silently dropped training, the root cannot hold
- * native and today we would never see why. Lane-count aware so a healthy
- * 2-lane link is not mis-reported as untrained.
- */
-static void apple5k_log_slave_link_status(struct dc_link *slave,
-					  const char *stage)
-{
-	uint8_t l01 = 0, l23 = 0, align = 0;
-	enum dc_status s01, s23, sa;
+struct apple5k_link_status {
+	uint8_t dpcd[4];	/* 0x202..0x205 */
+	enum dc_status status;
 	unsigned int lane_count;
-	bool lanes_ok;
+	bool has_sink_status;
+	bool trained;
+};
 
-	if (!slave || !slave->local_sink)
-		return;
+/* Read the contiguous lane/alignment block in one AUX transaction. */
+static bool apple5k_read_link_status(struct dc_link *link, bool include_sink,
+				      struct apple5k_link_status *st)
+{
+	unsigned int size;
 
-	DC_LOGGER_INIT(slave->ctx->logger);
+	if (!st)
+		return false;
+	size = include_sink ? sizeof(st->dpcd) : 3;
+	memset(st, 0, sizeof(*st));
+	if (!link || !link->local_sink)
+		return false;
 
-	lane_count = slave->cur_link_settings.lane_count;
-	s01 = core_link_read_dpcd(slave, 0x202, &l01, sizeof(l01));
-	s23 = core_link_read_dpcd(slave, 0x203, &l23, sizeof(l23));
-	sa  = core_link_read_dpcd(slave, 0x204, &align, sizeof(align));
+	st->lane_count = link->cur_link_settings.lane_count;
+	st->has_sink_status = include_sink;
+	if (st->lane_count < 1 || st->lane_count > 4)
+		return false;
+	st->status = core_link_read_dpcd(link, DP_LANE0_1_STATUS,
+					 st->dpcd, size);
+	if (st->status != DC_OK || !(st->dpcd[2] & 0x01) ||
+	    (st->dpcd[0] & 0x07) != 0x07 ||
+	    (st->lane_count >= 2 &&
+	     ((st->dpcd[0] >> 4) & 0x07) != 0x07) ||
+	    (st->lane_count >= 3 && (st->dpcd[1] & 0x07) != 0x07) ||
+	    (st->lane_count >= 4 &&
+	     ((st->dpcd[1] >> 4) & 0x07) != 0x07))
+		return false;
 
-	/*
-	 * Per-lane status nibble = CR_DONE | CHANNEL_EQ | SYMBOL_LOCKED (0x7).
-	 * 0x202 holds lanes 0/1, 0x203 holds lanes 2/3, 0x204 bit0 = interlane
-	 * align done.
-	 */
-	lanes_ok = (sa == DC_OK) && (align & 0x01) && (s01 == DC_OK);
-	if (lane_count >= 1 && (l01 & 0x07) != 0x07)
-		lanes_ok = false;
-	if (lane_count >= 2 && ((l01 >> 4) & 0x07) != 0x07)
-		lanes_ok = false;
-	if (lane_count >= 3) {
-		if (s23 != DC_OK || (l23 & 0x07) != 0x07)
-			lanes_ok = false;
-		if (lane_count >= 4 && ((l23 >> 4) & 0x07) != 0x07)
-			lanes_ok = false;
-	}
-
-	DC_LOG_INFO("APPLE5K-TXN slave-link stage=%s slave_link[%u] lanes=%u 0x202=0x%02x(s=%d) 0x203=0x%02x(s=%d) 0x204=0x%02x(s=%d) trained=%d\n",
-		    stage ? stage : "?", slave->link_index, lane_count,
-		    l01, s01, l23, s23, align, sa, lanes_ok ? 1 : 0);
+	st->trained = true;
+	return true;
 }
 
-#define APPLE5K_NATIVE_POLL_INTERVAL_MS	2
-#define APPLE5K_NATIVE_POLL_TIMEOUT_MS	80
+static void apple5k_log_link_status(
+		struct dc_link *link, const char *stage,
+		const struct apple5k_link_status *st)
+{
+	if (!link || !st ||
+	    !link_apple5k_log_enabled(link->dc, APPLE5K_LOG_LINK))
+		return;
+
+	DC_LOGGER_INIT(link->ctx->logger);
+	DC_LOG_INFO("APPLE5K-TXN link-status stage=%s link[%u] lanes=%u status=%d 0x202=0x%02x 0x203=0x%02x 0x204=0x%02x sink_valid=%d 0x205=0x%02x trained=%d\n",
+		    stage ? stage : "?", link->link_index, st->lane_count,
+		    st->status, st->dpcd[0], st->dpcd[1], st->dpcd[2],
+		    st->has_sink_status, st->dpcd[3], st->trained);
+}
+
+#define APPLE5K_NATIVE_POLL_INTERVAL_MS	5
+#define APPLE5K_NATIVE_POLL_TIMEOUT_MS	100
+
+static void apple5k_log_sink_link_status(struct dc_link *link);
+
+static void apple5k_log_native_poll_change(
+		struct dc_link *root, const struct apple5k_panel_mode_status *st,
+		struct apple5k_panel_mode_status *prev, bool *have_prev,
+		unsigned int poll, int elapsed_ms)
+{
+	if (!link_apple5k_log_enabled(root->dc, APPLE5K_LOG_PANEL) ||
+	    (*have_prev && st->r41c == prev->r41c &&
+	     st->r425 == prev->r425 && st->r4f1 == prev->r4f1))
+		return;
+
+	DC_LOGGER_INIT(root->ctx->logger);
+	DC_LOG_INFO("APPLE5K-TXN native-poll #%u t=%dms 0x41C=0x%02x 0x425=0x%02x 0x4F1=0x%02x -> %s\n",
+		    poll, elapsed_ms, st->r41c, st->r425, st->r4f1,
+		    (st->s425 == DC_OK) ?
+			    ((st->r425 & 0x02) ? "COMPAT" : "NATIVE") :
+			    "0x425-NACK");
+	*prev = *st;
+	*have_prev = true;
+}
 
 static bool apple5k_finish_native_enable(struct dc_link *root,
 					 struct dc_link *slave,
@@ -415,8 +800,15 @@ static bool apple5k_finish_native_enable(struct dc_link *root,
 {
 	struct apple5k_panel_mode_status st;
 	struct apple5k_panel_mode_status prev;
+	struct apple5k_link_status root_link_status;
+	struct apple5k_link_status slave_link_status;
 	bool have_prev = false;
+	bool native_tuple_seen = false;
 	bool native_good = false;
+	bool root_trained = false;
+	bool slave_trained = false;
+	uint8_t slave_sink_status = 0;
+	enum dc_status slave_sink_read = DC_ERROR_UNEXPECTED;
 	ktime_t start;
 	ktime_t native_at = 0;
 	unsigned int polls = 0;
@@ -427,6 +819,8 @@ static bool apple5k_finish_native_enable(struct dc_link *root,
 
 	DC_LOGGER_INIT(root->ctx->logger);
 	memset(&prev, 0, sizeof(prev));
+	memset(&root_link_status, 0, sizeof(root_link_status));
+	memset(&slave_link_status, 0, sizeof(slave_link_status));
 
 	/*
 	 * Source-side snapshot: was each tile's OTG (CRTC master-enable)
@@ -434,7 +828,8 @@ static bool apple5k_finish_native_enable(struct dc_link *root,
 	 * stuck in compat with both timing generators up points at a missing
 	 * source-signal step rather than a DPCD-sequencing problem.
 	 */
-	if (root_pipe && root_pipe->stream_res.tg &&
+	if (link_apple5k_log_enabled(root->dc, APPLE5K_LOG_TIMING) &&
+	    root_pipe && root_pipe->stream_res.tg &&
 	    root_pipe->stream_res.tg->funcs->is_tg_enabled &&
 	    slave_pipe && slave_pipe->stream_res.tg &&
 	    slave_pipe->stream_res.tg->funcs->is_tg_enabled) {
@@ -447,8 +842,6 @@ static bool apple5k_finish_native_enable(struct dc_link *root,
 	}
 
 	apple5k_log_ready_gate(root, "native-txn:verify");
-	apple5k_log_slave_link_status(slave, "native-txn:verify");
-	link_apple_5k_log_panel_mode(root, "native-txn:verify");
 
 	/*
 	 * Poll the native verdict instead of sampling once: the firmware may
@@ -460,92 +853,91 @@ static bool apple5k_finish_native_enable(struct dc_link *root,
 	for (;;) {
 		elapsed_ms = (int)ktime_ms_delta(ktime_get(), start);
 		polls++;
-		if (apple5k_read_panel_mode_status(root, &st)) {
-			if (!have_prev || st.r41c != prev.r41c ||
-			    st.r425 != prev.r425 || st.r4f1 != prev.r4f1) {
-				DC_LOG_INFO("APPLE5K-TXN native-poll #%u t=%dms 0x41C=0x%02x 0x425=0x%02x 0x4F1=0x%02x -> %s\n",
-					    polls, elapsed_ms, st.r41c, st.r425,
-					    st.r4f1,
-					    (st.s425 == DC_OK)
-						? ((st.r425 & 0x02) ? "COMPAT"
-								    : "NATIVE")
-						: "0x425-NACK");
-				prev = st;
-				have_prev = true;
-			}
-			if (apple5k_panel_status_is_native_good(&st)) {
-				native_good = true;
-				native_at = ktime_get();
+		if (!native_tuple_seen &&
+		    apple5k_read_panel_mode_status(root, &st)) {
+			apple5k_log_native_poll_change(root, &st, &prev,
+						 &have_prev, polls, elapsed_ms);
+			native_tuple_seen = apple5k_panel_status_is_native_good(&st);
+		}
+		if (native_tuple_seen) {
+			if (!slave->apple5k_source_table_ok)
 				break;
+			root_trained = apple5k_read_link_status(
+					root, false, &root_link_status);
+			slave_trained = apple5k_read_link_status(
+					slave, true, &slave_link_status);
+			slave_sink_status = slave_link_status.dpcd[3];
+			slave_sink_read = slave_link_status.status;
+			if (slave_sink_read == DC_OK &&
+			    (slave_sink_status & 0x01) &&
+			    root_trained && slave_trained &&
+			    apple5k_read_panel_mode_status(root, &st)) {
+				apple5k_log_native_poll_change(root, &st, &prev,
+							 &have_prev, polls,
+							 elapsed_ms);
+				if (apple5k_panel_status_is_native_good(&st)) {
+					native_good = true;
+					native_at = ktime_get();
+					break;
+				}
+				native_tuple_seen = false;
 			}
 		}
 		if (elapsed_ms >= APPLE5K_NATIVE_POLL_TIMEOUT_MS)
 			break;
 		msleep(APPLE5K_NATIVE_POLL_INTERVAL_MS);
 	}
+	apple5k_log_link_status(root, "native-txn:final",
+				   &root_link_status);
+	apple5k_log_link_status(slave, "native-txn:final",
+				   &slave_link_status);
 
-	DC_LOG_INFO("APPLE5K-TXN native-poll done root_link[%u] polls=%u native_good=%d time_to_native_ms=%d total_ms=%d\n",
+	DC_LOG_INFO("APPLE5K-TXN native-poll done root_link[%u] polls=%u native_good=%d source_table_ok=%d root_trained=%d slave_trained=%d slave_sink=0x%02x(s=%d) time_to_native_ms=%d total_ms=%d\n",
 		    root->link_index, polls, native_good,
+		    slave->apple5k_source_table_ok,
+		    root_trained, slave_trained,
+		    slave_sink_status, slave_sink_read,
 		    native_good ? (int)ktime_ms_delta(native_at, start) : -1,
 		    (int)ktime_ms_delta(ktime_get(), start));
 
 	if (transaction_started && native_good) {
-		root->apple5k_arming = false;
+		mutex_lock(&root->apple5k.lock);
+		root->apple5k.state = APPLE5K_TX_NATIVE;
+		root->apple5k.latch_owner = APPLE5K_LATCH_NONE;
+		root->apple5k.block_rearm = false;
+		mutex_unlock(&root->apple5k.lock);
 		DC_LOG_INFO("APPLE5K-TXN verified native root_link[%u] slave_link[%u]\n",
 			    root->link_index, slave ? slave->link_index : 0xffffffff);
 		return true;
 	}
 
-	DC_LOG_INFO("APPLE5K-TXN native verify failed root_link[%u] slave_link[%u] started=%d native_good=%d; disarming\n",
+	DC_LOG_INFO("APPLE5K-TXN native verify failed root_link[%u] slave_link[%u] started=%d native_good=%d; pair-quiescing\n",
 		    root->link_index, slave ? slave->link_index : 0xffffffff,
 		    transaction_started, native_good);
-	(void)apple5k_write_root_latch(root, 0, "native-txn:fail-disarm");
-	msleep(10);
-	link_apple_5k_log_panel_mode(root, "native-txn:after-fail-disarm");
-	root->apple5k_arming = false;
+	link_apple_5k_log_panel_mode(root, "native-txn:verify-fail");
+	apple5k_log_sink_link_status(root);
+	apple5k_log_sink_link_status(slave);
+	apple5k_neutralize_pair(root, slave, root_pipe, slave_pipe,
+				    "native-txn:verify-fail-disarm");
 	return false;
-}
-
-static void apple5k_disarm_for_stream_disable(struct dc_link *link,
-					      const char *stage)
-{
-	struct dc_link *root = apple5k_root_for_link(link);
-	struct apple5k_panel_mode_status st;
-
-	if (!dc_link_has_tiled_root_panel_patch(root) || !root->local_sink)
-		return;
-
-	DC_LOGGER_INIT(root->ctx->logger);
-
-	if (root->apple5k_arming) {
-		DC_LOG_INFO("APPLE5K-TXN keep latch armed at %s root_link[%u] reason=native-transaction-active\n",
-			    stage ? stage : "?", root->link_index);
-		return;
-	}
-
-	if (apple5k_read_panel_mode_status(root, &st) &&
-	    st.s4f1 == DC_OK && st.r4f1 == 0) {
-		DC_LOG_INFO("APPLE5K-TXN disable cleanup skip root_link[%u] stage=%s reason=latch-already-zero\n",
-			    root->link_index, stage ? stage : "?");
-		return;
-	}
-
-	(void)apple5k_write_root_latch(root, 0, stage);
-	msleep(10);
-	link_apple_5k_log_panel_mode(root, "disable-cleanup:after-disarm");
 }
 
 static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 {
-	uint8_t payload = 1;
-	uint8_t readback = 0;
 	enum dc_status status;
-	enum dc_status read_status;
 	struct dc_link *root = apple5k_root_for_link(link);
+	bool enable_owned = true;
 
 	if (!dc_link_needs_tiled_stream_enable_latch(link) || !link->local_sink)
 		return;
-	if (!root || !root->apple5k_arming) {
+	if (root && root->dc->apple5k_policy.pair_mode ==
+					APPLE5K_PAIR_TRANSACTIONAL) {
+		mutex_lock(&root->apple5k.lock);
+		enable_owned = root->apple5k.state == APPLE5K_TX_ENABLING &&
+			root->apple5k.latch_owner == APPLE5K_LATCH_ENABLE;
+		mutex_unlock(&root->apple5k.lock);
+	}
+	if (!root || !enable_owned) {
 		DC_LOGGER_INIT(link->ctx->logger);
 		DC_LOG_INFO("APPLE5K: stream-enable latch skipped link[%u] root_link[%d] reason=no-native-transaction\n",
 			    link->link_index, root ? (int)root->link_index : -1);
@@ -554,24 +946,14 @@ static void dp_write_tiled_stream_enable_latch(struct dc_link *link)
 
 	DC_LOGGER_INIT(link->ctx->logger);
 
-	link_apple_5k_log_panel_mode(link, "stream-latch:pre");
-	status = core_link_write_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
-				      &payload, sizeof(payload));
-	read_status = core_link_read_dpcd(link, APPLE_5K_DPCD_PANEL_LATCH,
-					  &readback, sizeof(readback));
-	DC_LOG_INFO("APPLE5K: stream-enable latch 0x4F1 link[%u] status=%d value=0x%02x read_status=%d readback=0x%02x sink=%p\n",
-		    link->link_index, status, payload, read_status, readback,
-		    link->local_sink);
-	link_apple_5k_log_panel_mode(link, "stream-latch:post");
+	status = link_apple5k_write_latch(link, 1, "stream-enable-latch");
+	DC_LOG_INFO("APPLE5K: stream-enable latch link[%u] status=%d sink=%p\n",
+		    link->link_index, status, link->local_sink);
 }
 
 /*
- * APPLE5K sink-status probe: the source side (MSA, routing, latch) is proven
- * identical between the working iMac19,1 and the failing iMacPro1,1, so read
- * the PANEL side at stream enable. "Left tile stretched" = the panel composes
- * only the eDP tile, so if the DP/slave tile's sink lanes are not symbol-locked
- * / interlane-align not done, the panel never accepted that tile. Runs for both
- * tiled links so the working vs broken machines can be diffed per tile.
+ * Failure-only sink snapshot.  Keep these extra configuration/private reads
+ * out of successful stream enable and native verification.
  */
 static void apple5k_log_sink_link_status(struct dc_link *link)
 {
@@ -583,7 +965,8 @@ static void apple5k_log_sink_link_status(struct dc_link *link)
 
 	if (!link || !link->local_sink ||
 	    (!dc_link_has_tiled_root_panel_patch(link) &&
-	     !dc_link_has_tiled_slave_panel_patch(link)))
+	     !dc_link_has_tiled_slave_panel_patch(link)) ||
+	    !link_apple5k_log_enabled(link->dc, APPLE5K_LOG_LINK))
 		return;
 
 	DC_LOGGER_INIT(link->ctx->logger);
@@ -777,24 +1160,78 @@ static bool apple5k_pipe_is_blanked(struct pipe_ctx *pipe_ctx)
 	return false;
 }
 
-static bool apple5k_state_get_timing_pair(struct dc_state *state,
-					  struct dc_link *root,
-					  struct pipe_ctx **root_pipe_out,
-					  struct pipe_ctx **slave_pipe_out)
+enum apple5k_target_class {
+	APPLE5K_TARGET_NONE = 0,
+	APPLE5K_TARGET_ROOT_ONLY,
+	APPLE5K_TARGET_SLAVE_ONLY,
+	APPLE5K_TARGET_PAIR,
+	APPLE5K_TARGET_INVALID,
+};
+
+struct apple5k_target_snapshot {
+	enum apple5k_target_class class;
+	struct dc_stream_state *root_stream;
+	struct dc_stream_state *slave_stream;
+	struct pipe_ctx *root_pipe;
+	struct pipe_ctx *slave_pipe;
+	unsigned int root_stream_count;
+	unsigned int slave_stream_count;
+	unsigned int root_pipe_count;
+	unsigned int slave_pipe_count;
+};
+
+static const char *apple5k_target_class_name(enum apple5k_target_class class)
 {
-	struct pipe_ctx *root_pipe = NULL;
-	struct pipe_ctx *slave_pipe = NULL;
-	struct dc_stream_state *root_stream = NULL;
-	struct dc_stream_state *slave_stream = NULL;
+	switch (class) {
+	case APPLE5K_TARGET_NONE: return "NONE";
+	case APPLE5K_TARGET_ROOT_ONLY: return "ROOT_ONLY";
+	case APPLE5K_TARGET_SLAVE_ONLY: return "SLAVE_ONLY";
+	case APPLE5K_TARGET_PAIR: return "PAIR";
+	case APPLE5K_TARGET_INVALID: return "INVALID";
+	default: return "?";
+	}
+}
+
+/*
+ * Classify one immutable dc_state snapshot once.  Stream membership expresses
+ * commit intent; the pipe scan validates that the same root/slave streams have
+ * exactly one top-level timing source each.  Consumers must act on this class
+ * and the captured pipes instead of reconstructing independent booleans.
+ */
+static void apple5k_classify_target(struct dc_state *state,
+					 struct dc_link *root,
+					 struct apple5k_target_snapshot *target)
+{
+	struct dc_link *slave;
+	bool invalid = false;
 	int i;
 
-	if (root_pipe_out)
-		*root_pipe_out = NULL;
-	if (slave_pipe_out)
-		*slave_pipe_out = NULL;
-
+	memset(target, 0, sizeof(*target));
+	target->class = APPLE5K_TARGET_INVALID;
 	if (!state || !dc_link_has_tiled_root_panel_patch(root))
-		return false;
+		return;
+
+	slave = root->tiled_peer;
+	for (i = 0; i < state->stream_count; i++) {
+		struct dc_stream_state *stream = state->streams[i];
+		struct dc_link *link;
+
+		if (!stream || !stream->link) {
+			invalid = true;
+			continue;
+		}
+		link = stream->link;
+		if (link == root) {
+			target->root_stream_count++;
+			target->root_stream = stream;
+		} else if (apple5k_root_for_link(link) == root) {
+			target->slave_stream_count++;
+			target->slave_stream = stream;
+			if (link != slave || link->tiled_peer != root ||
+			    !dc_link_has_tiled_slave_panel_patch(link))
+				invalid = true;
+		}
+	}
 
 	for (i = 0; i < MAX_PIPES; i++) {
 		struct pipe_ctx *pipe = &state->res_ctx.pipe_ctx[i];
@@ -802,29 +1239,299 @@ static bool apple5k_state_get_timing_pair(struct dc_state *state,
 
 		if (!pipe->stream || pipe->top_pipe || pipe->prev_odm_pipe)
 			continue;
-
 		link = pipe->stream->link;
-		if (link == root && dc_link_has_tiled_root_panel_patch(link)) {
-			root_pipe = pipe;
-			root_stream = pipe->stream;
-		} else if (apple5k_root_for_link(link) == root &&
-			   dc_link_has_tiled_slave_panel_patch(link)) {
-			slave_pipe = pipe;
-			slave_stream = pipe->stream;
+		if (link == root) {
+			target->root_pipe_count++;
+			target->root_pipe = pipe;
+			if (pipe->stream != target->root_stream)
+				invalid = true;
+		} else if (apple5k_root_for_link(link) == root) {
+			target->slave_pipe_count++;
+			target->slave_pipe = pipe;
+			if (pipe->stream != target->slave_stream || link != slave ||
+			    link->tiled_peer != root)
+				invalid = true;
 		}
 	}
 
-	if (!root_pipe || !slave_pipe ||
-	    !resource_are_streams_timing_synchronizable(root_stream,
-						       slave_stream))
-		return false;
+	if (target->root_stream_count > 1 || target->slave_stream_count > 1 ||
+	    target->root_pipe_count > 1 || target->slave_pipe_count > 1)
+		invalid = true;
+	if (target->root_stream_count != target->root_pipe_count ||
+	    target->slave_stream_count != target->slave_pipe_count)
+		invalid = true;
+	if (invalid)
+		return;
+
+	if (!target->root_stream_count && !target->slave_stream_count) {
+		target->class = APPLE5K_TARGET_NONE;
+		return;
+	}
+	if (target->root_stream_count == 1 && !target->slave_stream_count) {
+		target->class = APPLE5K_TARGET_ROOT_ONLY;
+		return;
+	}
+	if (!target->root_stream_count && target->slave_stream_count == 1) {
+		target->class = APPLE5K_TARGET_SLAVE_ONLY;
+		return;
+	}
+	if (target->root_stream_count != 1 || target->slave_stream_count != 1 ||
+	    !slave || !root->local_sink || !slave->local_sink ||
+	    !resource_are_streams_timing_synchronizable(target->root_stream,
+						       target->slave_stream) ||
+	    target->root_stream->timing.h_addressable != 2560 ||
+	    target->root_stream->timing.v_addressable != 2880 ||
+	    target->slave_stream->timing.h_addressable != 2560 ||
+	    target->slave_stream->timing.v_addressable != 2880)
+		return;
+
+	target->class = APPLE5K_TARGET_PAIR;
+}
+
+static void apple5k_log_target_snapshot(
+		struct dc_link *root, const char *stage,
+		const struct apple5k_target_snapshot *target)
+{
+	if (!root || !target ||
+	    (!link_apple5k_log_enabled(root->dc, APPLE5K_LOG_SUMMARY) &&
+	     target->class != APPLE5K_TARGET_SLAVE_ONLY &&
+	     target->class != APPLE5K_TARGET_INVALID))
+		return;
+
+	DC_LOGGER_INIT(root->ctx->logger);
+	if (target->class == APPLE5K_TARGET_SLAVE_ONLY ||
+	    target->class == APPLE5K_TARGET_INVALID)
+		DC_LOG_ERROR("APPLE5K-TARGET stage=%s root[%u] class=%s streams=%u/%u pipes=%u/%u\n",
+			     stage ? stage : "?", root->link_index,
+			     apple5k_target_class_name(target->class),
+			     target->root_stream_count,
+			     target->slave_stream_count,
+			     target->root_pipe_count,
+			     target->slave_pipe_count);
+	else
+		DC_LOG_INFO("APPLE5K-TARGET stage=%s root[%u] class=%s streams=%u/%u pipes=%u/%u\n",
+			    stage ? stage : "?", root->link_index,
+			    apple5k_target_class_name(target->class),
+			    target->root_stream_count,
+			    target->slave_stream_count,
+			    target->root_pipe_count,
+			    target->slave_pipe_count);
+}
+
+static const char *apple5k_zero_stream_reason_name(
+		enum apple5k_zero_stream_reason reason)
+{
+	switch (reason) {
+	case APPLE5K_ZERO_STREAM_DPMS: return "DPMS";
+	case APPLE5K_ZERO_STREAM_SUSPEND: return "SUSPEND";
+	default: return "UNSPECIFIED";
+	}
+}
+
+static enum dc_status apple5k_prepare_zero_stream(
+		struct dc_state *state, struct dc_link *root)
+{
+	struct apple5k_target_snapshot current_target;
+	struct dc_link *slave = root->tiled_peer;
+	enum apple5k_zero_stream_reason reason =
+		state->apple5k_zero_stream_reason;
+	enum apple5k_tx_state tx_state;
+	enum apple5k_latch_owner owner;
+	enum dc_status status;
+	bool block_rearm;
+	bool clean;
+
+	if (reason == APPLE5K_ZERO_STREAM_UNSPECIFIED)
+		return DC_OK;
+	if (!slave || slave->tiled_peer != root)
+		return DC_ERROR_UNEXPECTED;
+
+	apple5k_classify_target(root->dc->current_state, root,
+				 &current_target);
+	apple5k_log_target_snapshot(root, "zero-stream:current",
+				    &current_target);
+	mutex_lock(&root->apple5k.lock);
+	tx_state = root->apple5k.state;
+	owner = root->apple5k.latch_owner;
+	block_rearm = root->apple5k.block_rearm;
+	mutex_unlock(&root->apple5k.lock);
+
+	if (link_apple5k_log_enabled(root->dc, APPLE5K_LOG_SUMMARY)) {
+		DC_LOGGER_INIT(root->ctx->logger);
+		DC_LOG_INFO("APPLE5K-ZERO reason=%s root[%u] current=%s state=%s owner=%s blocked=%d\n",
+			    apple5k_zero_stream_reason_name(reason),
+			    root->link_index,
+			    apple5k_target_class_name(current_target.class),
+			    link_apple5k_state_name(tx_state),
+			    link_apple5k_latch_owner_name(owner), block_rearm);
+	}
+
+	if (current_target.class == APPLE5K_TARGET_PAIR) {
+		/* A prior successful neutralization can precede the atomic off. */
+		clean = tx_state == APPLE5K_TX_READY &&
+			owner == APPLE5K_LATCH_NONE && !block_rearm &&
+			apple5k_pipe_is_blanked(current_target.root_pipe) &&
+			apple5k_pipe_is_blanked(current_target.slave_pipe);
+		if (clean)
+			return DC_OK;
+
+		status = apple5k_neutralize_pair(root, slave,
+						 current_target.root_pipe,
+						 current_target.slave_pipe,
+						 reason == APPLE5K_ZERO_STREAM_SUSPEND ?
+						 "suspend:neutralize" :
+						 "dpms-off:neutralize");
+		return status;
+	}
+
+	if (current_target.class != APPLE5K_TARGET_NONE &&
+	    current_target.class != APPLE5K_TARGET_ROOT_ONLY)
+		return DC_ERROR_UNEXPECTED;
+
+	/* Root-only compat and repeated zero-stream commits own no native latch. */
+	clean = (tx_state == APPLE5K_TX_IDLE ||
+		 tx_state == APPLE5K_TX_READY) &&
+		owner == APPLE5K_LATCH_NONE && !block_rearm;
+	if (clean)
+		return DC_OK;
+
+	mutex_lock(&root->apple5k.lock);
+	root->apple5k.state = APPLE5K_TX_BLOCKED;
+	root->apple5k.block_rearm = true;
+	mutex_unlock(&root->apple5k.lock);
+	return DC_ERROR_UNEXPECTED;
+}
+
+static bool apple5k_state_get_timing_pair(struct dc_state *state,
+					  struct dc_link *root,
+					  struct pipe_ctx **root_pipe_out,
+					  struct pipe_ctx **slave_pipe_out)
+{
+	struct apple5k_target_snapshot target;
 
 	if (root_pipe_out)
-		*root_pipe_out = root_pipe;
+		*root_pipe_out = NULL;
 	if (slave_pipe_out)
-		*slave_pipe_out = slave_pipe;
-
+		*slave_pipe_out = NULL;
+	apple5k_classify_target(state, root, &target);
+	if (target.class != APPLE5K_TARGET_PAIR)
+		return false;
+	if (root_pipe_out)
+		*root_pipe_out = target.root_pipe;
+	if (slave_pipe_out)
+		*slave_pipe_out = target.slave_pipe;
 	return true;
+}
+
+/* Pair-wide pre-reset transition.  DPMS/suspend targets with no Apple streams
+ * neutralize native explicitly; restart keeps its policy-controlled path.
+ */
+enum dc_status link_apple_5k_prepare_transition(struct dc *dc,
+					       struct dc_state *state)
+{
+	struct apple5k_target_snapshot target;
+	struct apple5k_target_snapshot current_target;
+	struct apple5k_panel_mode_status st;
+	struct dc_link *root;
+	struct dc_link *slave;
+	enum apple5k_tx_state tx_state;
+	enum dc_status status;
+	int i;
+
+	if (!dc || !state || !dc->apple5k_policy.enabled)
+		return DC_OK;
+
+	if (system_state == SYSTEM_RESTART && !kexec_in_progress &&
+	    state->stream_count == 0) {
+		link_apple_5k_prepare_shutdown(dc, state);
+		return DC_OK;
+	}
+	if (dc->apple5k_policy.pair_mode == APPLE5K_PAIR_LEGACY)
+		return DC_OK;
+
+	for (i = 0; i < dc->link_count; i++) {
+		root = dc->links[i];
+		if (!dc_link_has_tiled_root_panel_patch(root))
+			continue;
+		apple5k_classify_target(state, root, &target);
+		apple5k_log_target_snapshot(root, "prepare-transition:target",
+					    &target);
+		if (target.class == APPLE5K_TARGET_NONE) {
+			status = apple5k_prepare_zero_stream(state, root);
+			if (status != DC_OK)
+				return status;
+			continue;
+		}
+		if (target.class == APPLE5K_TARGET_PAIR)
+			continue;
+		if (target.class != APPLE5K_TARGET_ROOT_ONLY ||
+		    !root->tiled_peer)
+			return DC_ERROR_UNEXPECTED;
+		if (dc->apple5k_policy.pair_mode !=
+		    APPLE5K_PAIR_TRANSACTIONAL)
+			continue;
+		slave = root->tiled_peer;
+		mutex_lock(&root->apple5k.lock);
+		tx_state = root->apple5k.state;
+		if (tx_state != APPLE5K_TX_NATIVE &&
+		    tx_state != APPLE5K_TX_DISCOVERING &&
+		    tx_state != APPLE5K_TX_ENABLING) {
+			mutex_unlock(&root->apple5k.lock);
+			continue;
+		}
+		root->apple5k.state = APPLE5K_TX_QUIESCING;
+		root->apple5k.latch_owner = APPLE5K_LATCH_TEARDOWN;
+		root->apple5k.block_rearm = true;
+		mutex_unlock(&root->apple5k.lock);
+
+		apple5k_classify_target(dc->current_state, root, &current_target);
+		apple5k_log_target_snapshot(root, "prepare-transition:current",
+					    &current_target);
+		if (current_target.class == APPLE5K_TARGET_PAIR) {
+			dc->hwss.blank_stream(current_target.root_pipe);
+			dc->hwss.blank_stream(current_target.slave_pipe);
+			if (!apple5k_pipe_is_blanked(current_target.root_pipe) ||
+			    !apple5k_pipe_is_blanked(current_target.slave_pipe))
+				return DC_ERROR_UNEXPECTED;
+		} else if (current_target.class == APPLE5K_TARGET_ROOT_ONLY) {
+			/* A discovery-only root can be balanced after its one source
+			 * path is quiet.  Native/enable ownership must never be reduced
+			 * to a per-link clear.
+			 */
+			if (tx_state != APPLE5K_TX_DISCOVERING ||
+			    !current_target.root_pipe)
+				return DC_ERROR_UNEXPECTED;
+			dc->hwss.blank_stream(current_target.root_pipe);
+			if (!apple5k_pipe_is_blanked(current_target.root_pipe))
+				return DC_ERROR_UNEXPECTED;
+		} else if (current_target.class != APPLE5K_TARGET_NONE) {
+			return DC_ERROR_UNEXPECTED;
+		}
+
+		root->link_state_valid = false;
+		slave->link_state_valid = false;
+
+		status = apple5k_write_root_latch(root, 0,
+						 "native-to-compat:disarm");
+		msleep(10);
+		if (status == DC_OK &&
+		    apple5k_read_panel_mode_status(root, &st) &&
+		    apple5k_panel_status_is_base(&st)) {
+			mutex_lock(&root->apple5k.lock);
+			root->apple5k.state = APPLE5K_TX_READY;
+			root->apple5k.latch_owner = APPLE5K_LATCH_NONE;
+			root->apple5k.block_rearm = false;
+			mutex_unlock(&root->apple5k.lock);
+			return DC_OK;
+		}
+
+		mutex_lock(&root->apple5k.lock);
+		root->apple5k.state = APPLE5K_TX_BLOCKED;
+		mutex_unlock(&root->apple5k.lock);
+		return DC_ERROR_UNEXPECTED;
+	}
+
+	return DC_OK;
 }
 
 static bool apple5k_should_defer_pair_finalizer(struct dc_state *state,
@@ -833,13 +1540,23 @@ static bool apple5k_should_defer_pair_finalizer(struct dc_state *state,
 	struct pipe_ctx *root_pipe = NULL;
 	struct pipe_ctx *slave_pipe = NULL;
 	struct dc_link *root;
+	enum apple5k_tx_state tx_state;
 
-	if (amdgpu_apple5k_coordinated_enable <= 0 ||
+	if (!pipe_ctx || !pipe_ctx->stream ||
+	    !pipe_ctx->stream->link->dc->apple5k_policy.enabled ||
+	    pipe_ctx->stream->link->dc->apple5k_policy.pair_mode ==
+						APPLE5K_PAIR_LEGACY ||
 	    !apple5k_pipe_is_tile(pipe_ctx))
 		return false;
 
 	root = apple5k_root_for_link(pipe_ctx->stream->link);
 	if (!apple5k_state_get_timing_pair(state, root, &root_pipe, &slave_pipe))
+		return false;
+	tx_state = apple5k_get_state(root);
+	if (root->dc->apple5k_policy.pair_mode ==
+					APPLE5K_PAIR_TRANSACTIONAL &&
+	    tx_state != APPLE5K_TX_ENABLING &&
+	    tx_state != APPLE5K_TX_NATIVE)
 		return false;
 
 	/*
@@ -850,15 +1567,163 @@ static bool apple5k_should_defer_pair_finalizer(struct dc_state *state,
 	       apple5k_pipe_is_blanked(slave_pipe);
 }
 
-static void apple5k_latch_stream_and_log_status(struct dc_link *link)
+static void apple5k_latch_stream(struct dc_link *link)
 {
 	dp_write_tiled_stream_enable_latch(link);
-	apple5k_log_sink_link_status(link);
 }
 
-void link_apple_5k_finalize_tiled_pair(struct dc *dc, int group_size,
-				       struct pipe_ctx *pipe_set[])
+void link_apple_5k_prepare_shutdown(struct dc *dc,
+				    struct dc_state *new_state)
 {
+	struct apple5k_target_snapshot current_target;
+	struct pipe_ctx *root_pipe = NULL;
+	struct pipe_ctx *slave_pipe = NULL;
+	struct apple5k_panel_mode_status st;
+	struct dc_link *root = NULL;
+	enum apple5k_shutdown_mode mode;
+	enum dc_status status;
+	int i;
+
+	if (!dc || !new_state || !dc->apple5k_policy.enabled ||
+	    system_state != SYSTEM_RESTART || kexec_in_progress ||
+	    new_state->stream_count != 0)
+		return;
+
+	for (i = 0; i < dc->link_count; i++) {
+		struct dc_link *candidate = dc->links[i];
+
+		if (!dc_link_has_tiled_root_panel_patch(candidate))
+			continue;
+		apple5k_classify_target(dc->current_state, candidate,
+					 &current_target);
+		apple5k_log_target_snapshot(candidate, "shutdown:current",
+					    &current_target);
+		if (current_target.class == APPLE5K_TARGET_NONE ||
+		    current_target.class == APPLE5K_TARGET_ROOT_ONLY)
+			continue;
+		if (current_target.class != APPLE5K_TARGET_PAIR)
+			return;
+		root = candidate;
+		root_pipe = current_target.root_pipe;
+		slave_pipe = current_target.slave_pipe;
+		break;
+	}
+	if (!root || !root_pipe || !slave_pipe)
+		return;
+
+	mode = dc->apple5k_policy.shutdown_mode;
+	mutex_lock(&root->apple5k.lock);
+	root->apple5k.block_rearm = true;
+	if (mode != APPLE5K_SHUTDOWN_STOCK &&
+	    mode != APPLE5K_SHUTDOWN_OBSERVE)
+		root->apple5k.state = APPLE5K_TX_QUIESCING;
+	if (mode == APPLE5K_SHUTDOWN_NEUTRALIZE)
+		root->apple5k.latch_owner = APPLE5K_LATCH_TEARDOWN;
+	mutex_unlock(&root->apple5k.lock);
+
+	link_apple_5k_log_panel_mode(root, "restart:entry");
+	if (mode == APPLE5K_SHUTDOWN_STOCK ||
+	    mode == APPLE5K_SHUTDOWN_OBSERVE)
+		return;
+
+	dc->hwss.blank_stream(root_pipe);
+	dc->hwss.blank_stream(slave_pipe);
+	if (!apple5k_pipe_is_blanked(root_pipe) ||
+	    !apple5k_pipe_is_blanked(slave_pipe)) {
+		mutex_lock(&root->apple5k.lock);
+		root->apple5k.state = APPLE5K_TX_BLOCKED;
+		mutex_unlock(&root->apple5k.lock);
+		return;
+	}
+
+	if (mode != APPLE5K_SHUTDOWN_NEUTRALIZE)
+		return;
+
+	status = apple5k_write_root_latch(root, 0,
+					 "restart:neutralize");
+	msleep(10);
+	if (status == DC_OK && apple5k_read_panel_mode_status(root, &st) &&
+	    apple5k_panel_status_is_base(&st)) {
+		mutex_lock(&root->apple5k.lock);
+		root->apple5k.state = APPLE5K_TX_READY;
+		root->apple5k.latch_owner = APPLE5K_LATCH_NONE;
+		mutex_unlock(&root->apple5k.lock);
+	} else {
+		mutex_lock(&root->apple5k.lock);
+		root->apple5k.state = APPLE5K_TX_BLOCKED;
+		mutex_unlock(&root->apple5k.lock);
+	}
+}
+
+enum dc_status link_apple_5k_prepare_tiled_pair(struct dc *dc,
+					       struct dc_state *state)
+{
+	struct apple5k_target_snapshot target;
+	struct pipe_ctx *root_pipe;
+	struct pipe_ctx *slave_pipe;
+	struct dc_link *root;
+	struct dc_link *slave;
+	bool root_blank;
+	bool slave_blank;
+	enum apple5k_tx_state tx_state;
+	int i;
+
+	if (!dc || !state || !dc->apple5k_policy.enabled ||
+	    dc->apple5k_policy.pair_mode != APPLE5K_PAIR_TRANSACTIONAL)
+		return DC_OK;
+
+	for (i = 0; i < dc->link_count; i++) {
+		root = dc->links[i];
+		if (!dc_link_has_tiled_root_panel_patch(root))
+			continue;
+		apple5k_classify_target(state, root, &target);
+		apple5k_log_target_snapshot(root, "prepare-pair:target", &target);
+		if (target.class == APPLE5K_TARGET_NONE ||
+		    target.class == APPLE5K_TARGET_ROOT_ONLY)
+			continue;
+		if (target.class != APPLE5K_TARGET_PAIR)
+			return DC_ERROR_UNEXPECTED;
+		root_pipe = target.root_pipe;
+		slave_pipe = target.slave_pipe;
+		slave = slave_pipe->stream->link;
+		root_blank = apple5k_pipe_is_blanked(root_pipe);
+		slave_blank = apple5k_pipe_is_blanked(slave_pipe);
+		tx_state = apple5k_get_state(root);
+		if (!root_blank || !slave_blank) {
+			/* An unchanged live native pair needs no reconstruction. */
+			if (tx_state == APPLE5K_TX_NATIVE &&
+			    !root_blank && !slave_blank &&
+			    root->link_state_valid && slave->link_state_valid)
+				return DC_OK;
+
+			/* A half-live pair is never a valid transaction boundary. */
+			if (root_blank != slave_blank)
+				return DC_ERROR_UNEXPECTED;
+
+			/* Quiesce an inherited GOP pair together before clearing it. */
+			dc->hwss.blank_stream(root_pipe);
+			dc->hwss.blank_stream(slave_pipe);
+			if (!apple5k_pipe_is_blanked(root_pipe) ||
+			    !apple5k_pipe_is_blanked(slave_pipe))
+				return DC_ERROR_UNEXPECTED;
+		}
+
+		/* A new transaction must not reuse firmware/half-programmed links. */
+		root->link_state_valid = false;
+		slave->link_state_valid = false;
+		slave->apple5k_source_table_ok = false;
+		return apple5k_begin_native_enable(root, slave, root_pipe,
+						   slave_pipe) ?
+					DC_OK : DC_ERROR_UNEXPECTED;
+	}
+
+	return DC_OK;
+}
+
+enum dc_status link_apple_5k_finalize_state(struct dc *dc,
+					    struct dc_state *state)
+{
+	struct apple5k_target_snapshot target;
 	struct pipe_ctx *root_pipe = NULL;
 	struct pipe_ctx *slave_pipe = NULL;
 	struct dc_link *root_link;
@@ -866,87 +1731,109 @@ void link_apple_5k_finalize_tiled_pair(struct dc *dc, int group_size,
 	bool root_blank;
 	bool slave_blank;
 	bool transaction_started;
+	enum apple5k_tx_state tx_state;
 	struct dal_logger *dc_logger;
 	u64 start_ns;
 	u64 mid_ns;
 	u64 end_ns;
 	int i;
 
-	if (!dc || !pipe_set || amdgpu_apple5k_coordinated_enable <= 0)
-		return;
+	if (!dc || !state || !dc->apple5k_policy.enabled ||
+	    dc->apple5k_policy.pair_mode == APPLE5K_PAIR_LEGACY)
+		return DC_OK;
 
-	for (i = 0; i < group_size; i++) {
-		struct pipe_ctx *pipe = pipe_set[i];
-		struct dc_link *link;
+	for (i = 0; i < dc->link_count; i++) {
+		struct dc_link *candidate = dc->links[i];
 
-		if (!pipe || !pipe->stream)
+		if (!dc_link_has_tiled_root_panel_patch(candidate))
 			continue;
-
-		link = pipe->stream->link;
-		if (!apple5k_is_tile(link))
+		apple5k_classify_target(state, candidate, &target);
+		apple5k_log_target_snapshot(candidate, "finalize:target", &target);
+		if (target.class == APPLE5K_TARGET_NONE ||
+		    target.class == APPLE5K_TARGET_ROOT_ONLY)
 			continue;
-
-		if (dc_link_has_tiled_root_panel_patch(link))
-			root_pipe = pipe;
-		else if (dc_link_has_tiled_slave_panel_patch(link))
-			slave_pipe = pipe;
+		if (target.class != APPLE5K_TARGET_PAIR)
+			return DC_ERROR_UNEXPECTED;
+		root_pipe = target.root_pipe;
+		slave_pipe = target.slave_pipe;
+		break;
 	}
-
 	if (!root_pipe || !slave_pipe)
-		return;
-	if (!resource_are_streams_timing_synchronizable(root_pipe->stream,
-						       slave_pipe->stream))
-		return;
+		return DC_OK;
 
 	root_link = root_pipe->stream->link;
 	slave_link = slave_pipe->stream->link;
 	root_blank = apple5k_pipe_is_blanked(root_pipe);
 	slave_blank = apple5k_pipe_is_blanked(slave_pipe);
+	tx_state = apple5k_get_state(root_link);
 	dc_logger = root_link->ctx->logger;
 
 	if (!root_blank || !slave_blank) {
+		if (tx_state == APPLE5K_TX_NATIVE)
+			return DC_OK;
 		DC_LOG_INFO("APPLE5K-UNBLANK pair-finalizer skip root_link[%u] slave_link[%u] root_blank=%d slave_blank=%d reason=not-deferred-pair\n",
 			    root_link->link_index, slave_link->link_index,
 			    root_blank, slave_blank);
-		return;
+		return DC_ERROR_UNEXPECTED;
 	}
 
-	transaction_started = apple5k_begin_native_enable(root_link, slave_link);
+	if (dc->apple5k_policy.pair_mode == APPLE5K_PAIR_COORDINATED)
+		transaction_started = apple5k_begin_native_enable(root_link,
+							 slave_link,
+							 root_pipe,
+							 slave_pipe);
+	else
+		transaction_started =
+			apple5k_get_state(root_link) == APPLE5K_TX_ENABLING;
 	DC_LOG_INFO("APPLE5K-TXN pair-finalizer begin root_link[%u] slave_link[%u] started=%d\n",
 		    root_link->link_index, slave_link->link_index,
 		    transaction_started);
 
-	DC_LOG_INFO("APPLE5K-UNBLANK pair-finalizer start root_link[%u] slave_link[%u] root_tg=%u slave_tg=%u root_blank=%d slave_blank=%d\n",
-		    root_link->link_index, slave_link->link_index,
-		    root_pipe->stream_res.tg->inst, slave_pipe->stream_res.tg->inst,
-		    root_blank, slave_blank);
+	if (link_apple5k_log_enabled(dc, APPLE5K_LOG_TIMING))
+		DC_LOG_INFO("APPLE5K-UNBLANK pair-finalizer start root_link[%u] slave_link[%u] root_tg=%u slave_tg=%u root_blank=%d slave_blank=%d\n",
+			    root_link->link_index, slave_link->link_index,
+			    root_pipe->stream_res.tg->inst,
+			    slave_pipe->stream_res.tg->inst,
+			    root_blank, slave_blank);
+
+	if (!transaction_started)
+		return DC_ERROR_UNEXPECTED;
 
 	start_ns = ktime_get_ns();
-	if (root_blank)
-		dc->hwss.unblank_stream(root_pipe,
-			&root_pipe->stream->link->cur_link_settings);
-	mid_ns = ktime_get_ns();
-	if (slave_blank)
+	if (dc->apple5k_policy.pair_order == APPLE5K_ORDER_SLAVE_FIRST) {
 		dc->hwss.unblank_stream(slave_pipe,
 			&slave_pipe->stream->link->cur_link_settings);
+		mid_ns = ktime_get_ns();
+		dc->hwss.unblank_stream(root_pipe,
+			&root_pipe->stream->link->cur_link_settings);
+	} else {
+		dc->hwss.unblank_stream(root_pipe,
+			&root_pipe->stream->link->cur_link_settings);
+		mid_ns = ktime_get_ns();
+		dc->hwss.unblank_stream(slave_pipe,
+			&slave_pipe->stream->link->cur_link_settings);
+	}
 	end_ns = ktime_get_ns();
 
-	DC_LOG_INFO("APPLE5K-UNBLANK pair-finalizer done root_link[%u] slave_link[%u] gap_ns=%llu total_ns=%llu root_blank_after=%d slave_blank_after=%d\n",
-		    root_link->link_index, slave_link->link_index,
-		    (unsigned long long)(mid_ns - start_ns),
-		    (unsigned long long)(end_ns - start_ns),
-		    apple5k_pipe_is_blanked(root_pipe),
-		    apple5k_pipe_is_blanked(slave_pipe));
+	if (link_apple5k_log_enabled(dc, APPLE5K_LOG_TIMING))
+		DC_LOG_INFO("APPLE5K-UNBLANK pair-finalizer done root_link[%u] slave_link[%u] gap_ns=%llu total_ns=%llu root_blank_after=%d slave_blank_after=%d\n",
+			    root_link->link_index, slave_link->link_index,
+			    (unsigned long long)(mid_ns - start_ns),
+			    (unsigned long long)(end_ns - start_ns),
+			    apple5k_pipe_is_blanked(root_pipe),
+			    apple5k_pipe_is_blanked(slave_pipe));
 
 	if (root_pipe->stream->sink_patches.delay_ignore_msa > 0)
 		msleep(root_pipe->stream->sink_patches.delay_ignore_msa);
 	if (slave_pipe->stream->sink_patches.delay_ignore_msa > 0)
 		msleep(slave_pipe->stream->sink_patches.delay_ignore_msa);
 
-	apple5k_latch_stream_and_log_status(root_link);
-	apple5k_latch_stream_and_log_status(slave_link);
-	apple5k_finish_native_enable(root_link, slave_link,
-				     root_pipe, slave_pipe, transaction_started);
+	apple5k_latch_stream(root_link);
+	apple5k_latch_stream(slave_link);
+	return apple5k_finish_native_enable(root_link, slave_link,
+					    root_pipe, slave_pipe,
+					    transaction_started) ?
+		DC_OK : DC_ERROR_UNEXPECTED;
 }
 
 static bool get_ext_hdmi_settings(struct pipe_ctx *pipe_ctx,
@@ -1797,7 +2684,7 @@ static void program_msa_timing_ignore(struct dc_stream_state *stream)
 	apple5k_dce12_tile = link->ctx->dce_version == DCE_VERSION_12_0 &&
 		apple5k_is_tile(link);
 	apple5k_force_msa_ignore = apple5k_dce12_tile &&
-		amdgpu_apple5k_dce12_force_msa_ignore > 0;
+		link->dc->apple5k_policy.dce12_force_msa_ignore;
 
 	DC_LOGGER_INIT(link->ctx->logger);
 
@@ -1818,7 +2705,8 @@ static void program_msa_timing_ignore(struct dc_stream_state *stream)
 			&new_downspread.raw, sizeof(new_downspread));
 	}
 
-	if (apple5k_dce12_tile)
+	if (apple5k_dce12_tile &&
+	    link_apple5k_log_enabled(link->dc, APPLE5K_LOG_LINK))
 		DC_LOG_INFO("APPLE5K: DCE12 MSA-ignore 0x107 link[%u] force=%d read_status=%d old=0x%02x new=0x%02x write=%d write_status=%d stream_ignore_msa=%u\n",
 			    link->link_index, apple5k_force_msa_ignore,
 			    read_status, old_downspread.raw, new_downspread.raw,
@@ -1841,7 +2729,7 @@ static void enable_stream_features(struct pipe_ctx *pipe_ctx,
 			DC_LOG_INFO("APPLE5K: defer stream-latch/status link[%u] until pair finalizer\n",
 				    link->link_index);
 		else
-			apple5k_latch_stream_and_log_status(link);
+			apple5k_latch_stream(link);
 	} else {
 		dm_helpers_mst_enable_stream_features(stream);
 	}
@@ -3110,9 +3998,6 @@ void link_set_dpms_off(struct pipe_ctx *pipe_ctx)
 
 	update_psp_stream_config(pipe_ctx, true);
 	dc->hwss.blank_stream(pipe_ctx);
-	if (apple5k_is_tile(link))
-		apple5k_disarm_for_stream_disable(link,
-						  "dpms-off:blanked-disarm");
 
 	if (pipe_ctx->link_config.dp_tunnel_settings.should_use_dp_bw_allocation)
 		deallocate_usb4_bandwidth(pipe_ctx->stream);
@@ -3205,8 +4090,6 @@ void link_set_dpms_on(
 	DC_LOGGER_INIT(pipe_ctx->stream->ctx->logger);
 
 	ASSERT(is_master_pipe_for_link(link, pipe_ctx));
-
-	link_apple_5k_log_panel_mode(link, "dpms-on:entry");
 
 	if (dp_is_128b_132b_signal(pipe_ctx))
 		vpg = pipe_ctx->stream_res.hpo_dp_stream_enc->vpg;

@@ -221,9 +221,15 @@ int amdgpu_smu_pptable_id = -1;
 uint amdgpu_dc_feature_mask = 2;
 uint amdgpu_dc_debug_mask;
 uint amdgpu_dc_visual_confirm;
-int amdgpu_apple5k_coordinated_enable = 1;
+int amdgpu_apple5k_enable = 1;
+int amdgpu_apple5k_profile;
+int amdgpu_apple5k_pair_mode = 1;
+int amdgpu_apple5k_wake_mode;
+int amdgpu_apple5k_boot_mode;
+int amdgpu_apple5k_shutdown_mode;
+int amdgpu_apple5k_pair_order;
 int amdgpu_apple5k_dce12_force_msa_ignore;
-int amdgpu_apple5k_cold_boot = 1;
+uint amdgpu_apple5k_log_mask = 1;
 int amdgpu_async_gfx_ring = 1;
 int amdgpu_mcbp = -1;
 int amdgpu_discovery = -1;
@@ -904,18 +910,42 @@ module_param_named(dcdebugmask, amdgpu_dc_debug_mask, uint, 0444);
 MODULE_PARM_DESC(visualconfirm, "Visual confirm (0 = off (default), 1 = MPO, 5 = PSR)");
 module_param_named(visualconfirm, amdgpu_dc_visual_confirm, uint, 0444);
 
-MODULE_PARM_DESC(apple5k_coordinated_enable,
-		 "Apple 5K tiled panel coordinated blanked enable (0 = off, 1 = on (default))");
-module_param_named(apple5k_coordinated_enable, amdgpu_apple5k_coordinated_enable, int, 0444);
+MODULE_PARM_DESC(apple5k_enable,
+		 "Apple 5K tiled-panel quirks (0 = off, 1 = on (default))");
+module_param_named(apple5k_enable, amdgpu_apple5k_enable, int, 0444);
+
+MODULE_PARM_DESC(apple5k_profile,
+		 "Apple 5K experiment profile (0 = custom/default, 1 = observe, 2 = coherent, 3 = Pro cold, 4 = coherent+cold, 5 = coherent+shutdown observe, 6 = pair-quiesce shutdown, 8 = neutralize shutdown, 9 = coherent+MSA-ignore, 10 = legacy, 11 = no Apple writes)");
+module_param_named(apple5k_profile, amdgpu_apple5k_profile, int, 0444);
+
+MODULE_PARM_DESC(apple5k_pair_mode,
+		 "Apple 5K pair mode for profile 0 (0 = legacy, 1 = coordinated (default), 2 = transactional)");
+module_param_named(apple5k_pair_mode, amdgpu_apple5k_pair_mode, int, 0444);
+
+MODULE_PARM_DESC(apple5k_wake_mode,
+		 "Apple 5K discovery wake for profile 0 (0 = legacy (default), 1 = scoped, 2 = off)");
+module_param_named(apple5k_wake_mode, amdgpu_apple5k_wake_mode, int, 0444);
+
+MODULE_PARM_DESC(apple5k_boot_mode,
+		 "Apple 5K boot policy for profile 0 (0 = inherit (default), 1 = observe, 3 = exact-Pro cold)");
+module_param_named(apple5k_boot_mode, amdgpu_apple5k_boot_mode, int, 0444);
+
+MODULE_PARM_DESC(apple5k_shutdown_mode,
+		 "Apple 5K restart policy for profile 0 (0 = stock (default), 1 = observe, 2 = pair quiesce, 4 = neutralize)");
+module_param_named(apple5k_shutdown_mode, amdgpu_apple5k_shutdown_mode, int, 0444);
+
+MODULE_PARM_DESC(apple5k_pair_order,
+		 "Apple 5K transactional pair order (0 = root first (default), 1 = slave first, 2 = existing pipe order)");
+module_param_named(apple5k_pair_order, amdgpu_apple5k_pair_order, int, 0444);
 
 MODULE_PARM_DESC(apple5k_dce12_force_msa_ignore,
 		 "Apple 5K DCE12 tiled panel force DPCD 0x107 bit 7 (0 = off (default), 1 = on)");
 module_param_named(apple5k_dce12_force_msa_ignore,
 		   amdgpu_apple5k_dce12_force_msa_ignore, int, 0444);
 
-MODULE_PARM_DESC(apple5k_cold_boot,
-		 "Apple 5K tiled panel full display cold-down at boot before first enable (0 = inherit firmware state, 1 = cold-down (default))");
-module_param_named(apple5k_cold_boot, amdgpu_apple5k_cold_boot, int, 0444);
+MODULE_PARM_DESC(apple5k_log_mask,
+		 "Apple 5K logging mask (bit0 summary, bit1 panel/latch, bit2 AUX/link, bit3 power/restart, bit4 timing)");
+module_param_named(apple5k_log_mask, amdgpu_apple5k_log_mask, uint, 0444);
 
 /**
  * DOC: abmlevel (uint)

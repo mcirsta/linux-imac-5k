@@ -81,46 +81,41 @@ struct link_service *link_create_link_service(void);
 void link_destroy_link_service(struct link_service **link_srv);
 
 /*
- * APPLE5K read-only mode probe (defined in link/link_dpms.c). Declared on the
- * link-service boundary so core (dc.c) can log the tiled-5K panel's native/compat
- * mode/status (DPCD 0x41C/0x41F/0x423/0x425/0x42F/0x4F1) at the
- * GSL/commit boundaries. No-op on NULL or non-tiled links; never writes.
+ * APPLE5K transactional preparation runs after old pipes are reset but before
+ * pair link training. Finalization runs after GSL, unblanks the pair, issues
+ * the late slave latch, and returns failure after pair-safe cleanup if strict
+ * native verification does not succeed.
  */
-void link_apple_5k_log_panel_mode(struct dc_link *link, const char *stage);
+enum dc_status link_apple_5k_prepare_tiled_pair(struct dc *dc,
+					       struct dc_state *state);
+enum dc_status link_apple_5k_prepare_transition(struct dc *dc,
+					       struct dc_state *state);
+enum dc_status link_apple_5k_finalize_state(struct dc *dc,
+					    struct dc_state *state);
+void link_apple_5k_prepare_shutdown(struct dc *dc,
+				    struct dc_state *new_state);
+void link_apple_5k_finish_detection(struct dc_link *link,
+				    enum dc_detect_reason reason);
 
 /*
- * APPLE5K tiled-pair finalizer (defined in link/link_dpms.c). Called after DC
- * accepts the root+slave timing group, mirroring the Windows shape where the
- * pair-level side effect happens late instead of from each independent stream.
- * This owns the bounded native transaction: stale clear, root 0x4F1 arm, 10 ms
- * wait, paired unblank, late stream latch, verify native status, and failure
- * disarm.
+ * APPLE5K eDP power-off exclusion (defined in link/protocols/link_dpcd.c).
+ * lock_edp_power_off() returns false when a latch owner requires VDD to remain
+ * up.  When it returns true, the caller must run the BIOS power-off and then
+ * call unlock_edp_power_off(); on the Apple root the pair mutex stays held
+ * across that whole window so a new latch owner cannot race the VDD command.
+ * Non-Apple links always return true and the unlock helper is a no-op.
  */
-void link_apple_5k_finalize_tiled_pair(struct dc *dc, int group_size,
-				       struct pipe_ctx *pipe_set[]);
-
-/*
- * APPLE5K eDP power-off guard (defined in link/protocols/link_dpcd.c). Called by
- * the hwseq just before an eDP VDD power-OFF. On the Apple 5K tiled root:
- *  - returns true (caller must SKIP the power-off) while the 0x4F1 latch is armed
- *    for the combined dual-tile enable — the firmware never power-cycles between
- *    arm and enable, and doing so wedges the Pro TCON into stuck-compat;
- *  - otherwise DISARMS the latch (writes 0x4F1=0 and waits 10 ms, the
- *    firmware's teardown action) and returns false so the caller proceeds with
- *    the power-off on a quiet base panel.
- * Returns false (normal power-off) for any non-tiled / non-Apple eDP.
- */
-bool link_apple_5k_edp_power_off_guard(struct dc_link *link);
+bool link_apple_5k_lock_edp_power_off(struct dc_link *link);
+void link_apple_5k_unlock_edp_power_off(struct dc_link *link);
 
 /*
  * APPLE5K depth-1 boot cold-down (defined in link/link_dpms.c). On platforms
  * where the firmware GOP drove the tiled panel through boot (no-iGPU
  * iMacPro1,1), the hwseq boot path refuses fast-boot/seamless inheritance of
- * that hot state and calls the cold-down before the full power-down: disarm
- * the root 0x4F1 latch (+10 ms), put the slave sink in D3, and log the
+ * that hot state and calls the cold-down before the full power-down: quiesce,
+ * put the slave sink in D3, disarm the root latch (+10 ms), and log the
  * ready-gate/panel state, reducing the hot boot to the cold base the
- * coordinated enable is proven on. Gated by the apple5k_cold_boot module
- * parameter (default on) plus tiled-root presence.
+ * coordinated enable is proven on. This is opt-in and exact-Pro gated.
  */
 bool link_apple_5k_wants_cold_boot(const struct dc *dc);
 void link_apple_5k_boot_cold_down(struct dc *dc);

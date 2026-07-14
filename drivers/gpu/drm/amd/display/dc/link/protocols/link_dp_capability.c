@@ -35,6 +35,7 @@
  */
 
 #include "link_dp_capability.h"
+#include "../apple5k.h"
 #include "link_ddc.h"
 #include "link_dpcd.h"
 #include "link_dp_dpia.h"
@@ -73,28 +74,35 @@ static void dpcd_set_tiled_slave_source_table_revision(
 	uint8_t table_revision[3];
 	uint8_t readback[3] = { 0 };
 	enum dc_status status;
-	enum dc_status read_status;
+	enum dc_status read_status = DC_ERROR_UNEXPECTED;
 	uint8_t auto_revision;
+	bool log_link;
 
 	if (!dc_link_needs_tiled_slave_source_table_rev(link) ||
-	    !link->ctx || !link->dc)
+	    !link->ctx || !link->dc || !link->dc->apple5k_policy.enabled)
 		return;
 
 	auto_revision = link->ctx->dce_version >= DCE_VERSION_12_0 ?
 			0x05 : 0x04;
+	link->apple5k_source_table_ok = false;
 	table_revision[0] = 0x04;
 	table_revision[1] = 0x1d;
 	table_revision[2] = 0x03;
 
 	status = core_link_write_dpcd(link, DP_SOURCE_TABLE_REVISION,
 				      table_revision, sizeof(table_revision));
-	read_status = core_link_read_dpcd(link, DP_SOURCE_TABLE_REVISION,
-					  readback, sizeof(readback));
-	DC_LOG_INFO("APPLE5K: source DPCD 0x310 write link[%u] status=%d value=%02x %02x %02x read_status=%d readback=%02x %02x %02x dce=%d auto_first=%02x force_apple5k_legacy=1\n",
-		    link->link_index, status, table_revision[0],
-		    table_revision[1], table_revision[2],
-		    read_status, readback[0], readback[1], readback[2],
-		    link->ctx->dce_version, auto_revision);
+	link->apple5k_source_table_ok = status == DC_OK;
+	log_link = link_apple5k_log_enabled(link->dc, APPLE5K_LOG_LINK);
+	if (status != DC_OK || log_link)
+		read_status = core_link_read_dpcd(link,
+						  DP_SOURCE_TABLE_REVISION,
+						  readback, sizeof(readback));
+	if (status != DC_OK || log_link)
+		DC_LOG_INFO("APPLE5K: source DPCD 0x310 write link[%u] status=%d value=%02x %02x %02x read_status=%d readback=%02x %02x %02x dce=%d auto_first=%02x force_apple5k_legacy=1\n",
+			    link->link_index, status, table_revision[0],
+			    table_revision[1], table_revision[2],
+			    read_status, readback[0], readback[1], readback[2],
+			    link->ctx->dce_version, auto_revision);
 }
 
 static bool dp_prepare_source_dpcd_write(struct dc_link *link)
@@ -111,11 +119,14 @@ static bool dp_prepare_source_dpcd_write(struct dc_link *link)
 		enum dc_status power_status;
 		enum dc_status rev_status;
 
-		wake_status = link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
-		DC_LOG_INFO("APPLE5K: root wake 0x4F1 stage=source-dpcd slave_link[%u] root_link[%d] try=%u status=%d\n",
-			    link->link_index,
-			    link->tiled_peer ? (int)link->tiled_peer->link_index : -1,
-			    try, wake_status);
+		wake_status = link_apple5k_require_wake_scope(link,
+							 "source-dpcd");
+		if (wake_status != DC_OK ||
+		    link_apple5k_log_enabled(link->dc, APPLE5K_LOG_LINK))
+			DC_LOG_INFO("APPLE5K: root wake 0x4F1 stage=source-dpcd slave_link[%u] root_link[%d] try=%u status=%d\n",
+				    link->link_index,
+				    link->tiled_peer ? (int)link->tiled_peer->link_index : -1,
+				    try, wake_status);
 
 		power_status = core_link_write_dpcd(link, DP_SET_POWER,
 						    &power_state,
@@ -129,8 +140,9 @@ static bool dp_prepare_source_dpcd_write(struct dc_link *link)
 		dpcd_rev = 0;
 		rev_status = core_link_read_dpcd(link, DP_DPCD_REV,
 						 &dpcd_rev, sizeof(dpcd_rev));
-		DC_LOG_INFO("APPLE5K: source-DPCD AUX rev poll link[%u] try=%u status=%d dpcd_rev=0x%02x\n",
-			    link->link_index, try, rev_status, dpcd_rev);
+		if (link_apple5k_log_enabled(link->dc, APPLE5K_LOG_LINK))
+			DC_LOG_INFO("APPLE5K: source-DPCD AUX rev poll link[%u] try=%u status=%d dpcd_rev=0x%02x\n",
+				    link->link_index, try, rev_status, dpcd_rev);
 		if (rev_status == DC_OK && dpcd_rev != 0)
 			return true;
 

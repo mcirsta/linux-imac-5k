@@ -40,22 +40,4 @@ enum dc_status core_link_write_dpcd(
 		const uint8_t *data,
 		uint32_t size);
 
-/*
- * Pulse the Apple 5K root panel-latch DPCD (0x4F1 = 1) for discovery/wake
- * probes. This does not mark the bounded native-enable transaction active; that
- * ownership lives in the paired DPMS finalizer. Safe to call with NULL or
- * non-root link — no-op.
- */
-enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link);
-
-/*
- * APPLE5K read-only mode-bisection probe: resolve the tiled ROOT (eDP) link from
- * any tiled link and log its native/compat mode triplet 0x41C/0x425/0x4F1 with a
- * stage tag. 0x425 bit1: 1=COMPAT (stretched), 0=NATIVE (tiled). Logs the read
- * status so a NACK (register absent, e.g. on a non-Pro panel) is visible. Never
- * writes. Call before/after each candidate enable step to find the compat->native
- * flip point. No-op on NULL / non-tiled links.
- */
-void link_apple_5k_log_panel_mode(struct dc_link *link, const char *stage);
-
 #endif

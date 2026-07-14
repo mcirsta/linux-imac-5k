@@ -31,6 +31,7 @@
  * of link encoding and back end hardware.
  */
 #include "link_dp_training.h"
+#include "../apple5k.h"
 #include "link_dp_training_8b_10b.h"
 #include "link_dp_training_128b_132b.h"
 #include "link_dp_training_auxless.h"
@@ -1107,11 +1108,13 @@ static void dp_pre_link_training_wake(struct dc_link *link)
 		return;
 
 	if (dc_link_needs_tiled_slave_root_wake(link)) {
-		status = link_apple_5k_root_panel_latch_pulse(link->tiled_peer);
-		DC_LOG_INFO("APPLE5K: root wake 0x4F1 stage=training slave_link[%u] root_link[%d] status=%d\n",
-			    link->link_index,
-			    link->tiled_peer ? (int)link->tiled_peer->link_index : -1,
-			    status);
+		status = link_apple5k_require_wake_scope(link, "training");
+		if (status != DC_OK ||
+		    link_apple5k_log_enabled(link->dc, APPLE5K_LOG_LINK))
+			DC_LOG_INFO("APPLE5K: root wake 0x4F1 stage=training slave_link[%u] root_link[%d] status=%d\n",
+				    link->link_index,
+				    link->tiled_peer ? (int)link->tiled_peer->link_index : -1,
+				    status);
 	}
 }
 
@@ -1144,8 +1147,9 @@ static bool dp_prepare_sink_for_link_training(struct dc_link *link,
 		dpcd_rev = 0;
 		rev_status = core_link_read_dpcd(link, DP_DPCD_REV,
 						 &dpcd_rev, sizeof(dpcd_rev));
-		DC_LOG_INFO("APPLE5K: training AUX rev poll link[%u] try=%u status=%d dpcd_rev=0x%02x\n",
-			    link->link_index, try, rev_status, dpcd_rev);
+		if (link_apple5k_log_enabled(link->dc, APPLE5K_LOG_LINK))
+			DC_LOG_INFO("APPLE5K: training AUX rev poll link[%u] try=%u status=%d dpcd_rev=0x%02x\n",
+				    link->link_index, try, rev_status, dpcd_rev);
 		if (rev_status == DC_OK && dpcd_rev != 0)
 			return true;
 
@@ -1694,8 +1698,6 @@ enum link_training_result dp_perform_link_training(
 	enum dp_link_encoding encoding =
 			link_dp_get_encoding_format(link_settings);
 
-	link_apple_5k_log_panel_mode(link, "LT-entry");
-
 	/* decide training settings */
 	dp_decide_training_settings(
 			link,
@@ -1746,7 +1748,6 @@ enum link_training_result dp_perform_link_training(
 	dp_log_training_result(link, &lt_settings, status);
 	if (status != LINK_TRAINING_SUCCESS)
 		link->ctx->dc->debug_data.ltFailCount++;
-	link_apple_5k_log_panel_mode(link, "LT-exit");
 	return status;
 }
 

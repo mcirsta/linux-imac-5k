@@ -41,6 +41,7 @@
 #include "dc/dc_state.h"
 #include "amdgpu_dm_trace.h"
 #include "link/protocols/link_dpcd.h"
+#include "link/apple5k.h"
 #include "link_service_types.h"
 #include "link/protocols/link_dp_capability.h"
 #include "link/protocols/link_ddc.h"
@@ -2035,6 +2036,7 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
 	if (adev->dm.dc) {
 		drm_info(adev_to_drm(adev), "Display Core v%s initialized on %s\n", DC_VER,
 			 dce_version_to_string(adev->dm.dc->ctx->dce_version));
+		link_apple5k_resolve_policy(adev->dm.dc);
 		amdgpu_dm_log_apple5k_probe_identity(adev);
 	} else {
 		drm_info(adev_to_drm(adev), "Display Core failed to initialize with v%s!\n", DC_VER);
@@ -3114,6 +3116,9 @@ static enum dc_status amdgpu_dm_commit_zero_streams(struct dc *dc)
 	context = dc_state_create_current_copy(dc);
 	if (context == NULL)
 		return DC_ERROR_UNEXPECTED;
+	/* GPU-reset teardown is not an ordinary DPMS/suspend transaction. */
+	context->apple5k_zero_stream_reason =
+		APPLE5K_ZERO_STREAM_UNSPECIFIED;
 
 	/* First remove from context all streams */
 	for (i = 0; i < context->stream_count; i++) {
@@ -5626,15 +5631,16 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 		struct dc_link *link = NULL;
 
 		link = dc_get_link_at_index(dm->dc, i);
-		drm_info(adev_to_drm(adev),
-			 "APPLE5K: link inventory pre-detect link[%u] signal=%d internal=%d endpoint=%d link_id=%u:%u:%u ddc_hw=%u hpd_src=%u hpd=%d aux=%d enc=%u eng=%d has_sink=%d has_peer=%d\n",
-			 link->link_index, link->connector_signal,
-			 link->is_internal_display, link->ep_type,
-			 link->link_id.type, link->link_id.id,
-			 link->link_id.enum_id, link->ddc_hw_inst,
-			 link->hpd_src, link->hpd_status, link->aux_mode,
-			 link->link_enc_hw_inst, link->eng_id,
-			 !!link->local_sink, !!link->tiled_peer);
+		if (link_apple5k_log_enabled(dm->dc, APPLE5K_LOG_SUMMARY))
+			drm_info(adev_to_drm(adev),
+				 "APPLE5K: link inventory pre-detect link[%u] signal=%d internal=%d endpoint=%d link_id=%u:%u:%u ddc_hw=%u hpd_src=%u hpd=%d aux=%d enc=%u eng=%d has_sink=%d has_peer=%d\n",
+				 link->link_index, link->connector_signal,
+				 link->is_internal_display, link->ep_type,
+				 link->link_id.type, link->link_id.id,
+				 link->link_id.enum_id, link->ddc_hw_inst,
+				 link->hpd_src, link->hpd_status, link->aux_mode,
+				 link->link_enc_hw_inst, link->eng_id,
+				 !!link->local_sink, !!link->tiled_peer);
 
 		if (link->connector_signal == SIGNAL_TYPE_VIRTUAL) {
 			struct amdgpu_dm_wb_connector *wbcon = kzalloc_obj(*wbcon);
@@ -5717,6 +5723,7 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 	}
 
 	amdgpu_dm_reprobe_tiled_root_after_slave(adev);
+	link_apple5k_finish_all_discovery(dm->dc, "boot-detect-complete");
 
 	/* Debug dump: list all DC links and their associated sinks after detection
 	 * is complete for all connectors. This provides a comprehensive view of the
@@ -8228,6 +8235,9 @@ static void amdgpu_dm_log_apple5k_probe_identity(struct amdgpu_device *adev)
 	const char *bios = dmi_get_system_info(DMI_BIOS_VERSION);
 	const char *vendor = dmi_get_system_info(DMI_SYS_VENDOR);
 
+	if (!link_apple5k_log_enabled(adev->dm.dc, APPLE5K_LOG_SUMMARY))
+		return;
+
 	drm_info(dev,
 		 "APPLE5K: probe identity vendor=\"%s\" product=\"%s\" board=\"%s\" bios=\"%s\" kernel=\"%s\" gpu=%04x:%04x subsystem=%04x:%04x rev=%02x family=%d asic=%d dc=%s dce=%s links=%u vbios_pn=\"%s\" vbios_ver=\"%s\" vbios_date=\"%s\"\n",
 		 vendor ? vendor : "unknown",
@@ -8257,7 +8267,9 @@ static void amdgpu_dm_log_apple5k_connector_tile(
 	unsigned int preferred_count = 0;
 	int tile_group_id = 0;
 
-	if (!amdgpu_dm_connector_has_tiled_patch(aconnector))
+	if (!amdgpu_dm_connector_has_tiled_patch(aconnector) ||
+	    !link_apple5k_log_enabled(aconnector->dc_link->dc,
+					 APPLE5K_LOG_SUMMARY))
 		return;
 
 	connector = &aconnector->base;
@@ -8308,7 +8320,9 @@ static void amdgpu_dm_log_apple5k_modes(struct drm_connector *connector,
 	struct drm_display_mode *mode;
 	unsigned int mode_count = 0;
 
-	if (!amdgpu_dm_connector_has_tiled_patch(aconnector))
+	if (!amdgpu_dm_connector_has_tiled_patch(aconnector) ||
+	    !link_apple5k_log_enabled(aconnector->dc_link->dc,
+					 APPLE5K_LOG_TIMING))
 		return;
 
 	list_for_each_entry(mode, &connector->probed_modes, head) {
@@ -8370,7 +8384,9 @@ static void amdgpu_dm_log_apple5k_dc_streams(struct drm_device *dev,
 	bool has_apple5k_stream = false;
 	unsigned int i;
 
-	if (!dc_state)
+	if (!dc_state ||
+	    !link_apple5k_log_enabled(drm_to_adev(dev)->dm.dc,
+					 APPLE5K_LOG_TIMING))
 		return;
 
 	for (i = 0; i < dc_state->stream_count; i++) {
@@ -8442,6 +8458,8 @@ static void amdgpu_dm_log_apple5k_stream_color(
 		return;
 
 	link = aconnector->dc_link;
+	if (!link_apple5k_log_enabled(link->dc, APPLE5K_LOG_TIMING))
+		return;
 	if (drm_state)
 		drm_colorspace_name =
 			amdgpu_dm_apple5k_drm_colorspace_name(drm_state->colorspace);
@@ -8527,6 +8545,8 @@ static void amdgpu_dm_log_apple5k_plane_state(
 		return;
 
 	link = stream->link;
+	if (!link_apple5k_log_enabled(link->dc, APPLE5K_LOG_TIMING))
+		return;
 	fb = new_state->fb;
 	old_fb = old_state ? old_state->fb : NULL;
 
@@ -11756,6 +11776,9 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 	dm_state = dm_atomic_get_new_state(state);
 	if (dm_state && dm_state->context) {
 		dc_state = dm_state->context;
+		dc_state->apple5k_zero_stream_reason =
+			adev->in_suspend ? APPLE5K_ZERO_STREAM_SUSPEND :
+					   APPLE5K_ZERO_STREAM_DPMS;
 		amdgpu_dm_commit_streams(state, dc_state);
 	}
 

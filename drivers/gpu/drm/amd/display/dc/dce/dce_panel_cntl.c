@@ -170,14 +170,6 @@ static bool dce_is_panel_powered_on(struct panel_cntl *panel_cntl)
 
 	powered_on = (pwr_seq_state == 1) || (dig_on == 1 && dig_on_ovrd == 1);
 
-	/* APPLE5K: expose both resolved MMIO addresses and raw register values. */
-	DC_LOG_HW_RESUME_S3(
-		"APPLE5K: panel regs PWRSEQ_STATE[0x%08x]=0x%08x PWRSEQ_CNTL[0x%08x]=0x%08x PWRSEQ_REF_DIV[0x%08x] BIOS_SCRATCH_2[0x%08x] target_state=%u DIGON=%u DIGON_OVRD=%u powered_on=%d\n",
-		REG(PWRSEQ_STATE), REG_READ(PWRSEQ_STATE),
-		REG(PWRSEQ_CNTL), REG_READ(PWRSEQ_CNTL),
-		REG(PWRSEQ_REF_DIV), REG(BIOS_SCRATCH_2),
-		pwr_seq_state, dig_on, dig_on_ovrd, powered_on);
-
 	return powered_on;
 }
 

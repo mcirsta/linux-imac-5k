@@ -624,6 +624,9 @@ struct dc_state {
 	uint8_t stream_count;
 	uint8_t stream_mask;
 
+	/* Commit-local intent for an Apple 5K zero-stream target. */
+	enum apple5k_zero_stream_reason apple5k_zero_stream_reason;
+
 	/**
 	 * @stream_count: Total phantom streams in use
 	 */

@@ -768,7 +768,7 @@ void dce110_edp_power_control(
 	struct bp_transmitter_control cntl = { 0 };
 	enum bp_result bp_result;
 	uint8_t pwrseq_instance;
-	bool panel_on, log_lvtma;
+	bool panel_on;
 
 
 	if (dal_graphics_object_id_get_connector_id(link->link_enc->connector)
@@ -781,17 +781,14 @@ void dce110_edp_power_control(
 		return;
 
 	/*
-	 * APPLE5K: on a power-OFF, consult the tiled-root guard. While the 0x4F1
-	 * latch is armed for the combined dual-tile enable it returns true and we
-	 * MUST keep the panel powered (powering off while armed wedges the Pro TCON
-	 * into stuck-compat). Otherwise the guard has already disarmed (0x4F1=0) and
-	 * we proceed with the power-off on a quiet base panel.
+	 * APPLE5K: serialize the guard decision and the actual BIOS VDD command
+	 * against root latch ownership.  A false result means an owner is active
+	 * and VDD must remain up; a true result holds the pair exclusion until the
+	 * matching unlock at the end of this function.
 	 */
-	if (!power_up && link_apple_5k_edp_power_off_guard(link))
+	if (!power_up && !link_apple_5k_lock_edp_power_off(link))
 		return;
 
-	log_lvtma = link->ctx->dce_version == DCE_VERSION_12_0 &&
-		    dc_link_has_tiled_root_panel_patch(link);
 	panel_on = link->panel_cntl->funcs->is_panel_powered_on(link->panel_cntl);
 
 	if (power_up != panel_on) {
@@ -857,11 +854,6 @@ void dce110_edp_power_control(
 				"%s: BEGIN: Panel Power action: %s\n",
 				__func__, (power_up ? "On":"Off"));
 
-		/* APPLE5K: LVTMA readback just before the BIOS power command
-		 * (after any T12 wait) -- logs via is_panel_powered_on. */
-		if (log_lvtma)
-			(void)link->panel_cntl->funcs->is_panel_powered_on(link->panel_cntl);
-
 		cntl.action = power_up ?
 			TRANSMITTER_CONTROL_POWER_ON :
 			TRANSMITTER_CONTROL_POWER_OFF;
@@ -888,12 +880,6 @@ void dce110_edp_power_control(
 
 		bp_result = link_transmitter_control(ctx->dc_bios, &cntl);
 
-		/* APPLE5K: LVTMA readback after the BIOS power command --
-		 * bp_result only means the command was accepted, not that the
-		 * sequencer actually changed state. */
-		if (log_lvtma)
-			(void)link->panel_cntl->funcs->is_panel_powered_on(link->panel_cntl);
-
 		DC_LOG_HW_RESUME_S3(
 				"%s: END: Panel Power action: %s bp_result=%u\n",
 				__func__, (power_up ? "On":"Off"),
@@ -916,6 +902,9 @@ void dce110_edp_power_control(
 				"%s: Skipping Panel Power action: %s\n",
 				__func__, (power_up ? "On":"Off"));
 	}
+
+	if (!power_up)
+		link_apple_5k_unlock_edp_power_off(link);
 }
 
 void dce110_edp_wait_for_T12(
@@ -2496,7 +2485,8 @@ enum dc_status dce110_apply_ctx_to_hw(
 	struct dce_hwseq *hws = dc->hwseq;
 	struct dc_bios *dcb = dc->ctx->dc_bios;
 	enum dc_status status;
-	int i;
+	int i, pass;
+	int pass_count;
 	bool was_hpo_acquired = resource_is_hpo_acquired(dc->current_state);
 	bool is_hpo_acquired = resource_is_hpo_acquired(context);
 
@@ -2506,7 +2496,13 @@ enum dc_status dce110_apply_ctx_to_hw(
 
 	/* Reset old context */
 	/* look up the targets that have been removed since last commit */
+	status = link_apple_5k_prepare_transition(dc, context);
+	if (status != DC_OK)
+		return status;
 	hws->funcs.reset_hw_ctx_wrap(dc, context);
+	status = link_apple_5k_prepare_tiled_pair(dc, context);
+	if (status != DC_OK)
+		return status;
 
 	/* Skip applying if no targets */
 	if (context->stream_count <= 0)
@@ -2545,37 +2541,59 @@ enum dc_status dce110_apply_ctx_to_hw(
 		dc->hwseq->funcs.setup_hpo_hw_control(dc->hwseq, is_hpo_acquired);
 	}
 
-	for (i = 0; i < dc->res_pool->pipe_count; i++) {
-		struct pipe_ctx *pipe_ctx_old =
+	pass_count = dc->apple5k_policy.enabled &&
+		dc->apple5k_policy.pair_mode == APPLE5K_PAIR_TRANSACTIONAL &&
+		dc->apple5k_policy.pair_order != APPLE5K_ORDER_PIPE ? 3 : 1;
+	for (pass = 0; pass < pass_count; pass++) {
+		for (i = 0; i < dc->res_pool->pipe_count; i++) {
+			struct pipe_ctx *pipe_ctx_old =
 					&dc->current_state->res_ctx.pipe_ctx[i];
-		struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
+			struct pipe_ctx *pipe_ctx = &context->res_ctx.pipe_ctx[i];
+			bool is_root;
+			bool is_slave;
 
-		if (pipe_ctx->stream == NULL)
-			continue;
+			if (pipe_ctx->stream == NULL)
+				continue;
 
-		if (pipe_ctx->stream == pipe_ctx_old->stream &&
-			pipe_ctx->stream->link->link_state_valid) {
-			continue;
-		}
+			is_root = dc_link_has_tiled_root_panel_patch(
+					pipe_ctx->stream->link);
+			is_slave = dc_link_has_tiled_slave_panel_patch(
+					pipe_ctx->stream->link);
+			if (pass_count == 3) {
+				bool first = dc->apple5k_policy.pair_order ==
+					APPLE5K_ORDER_ROOT_FIRST ? is_root : is_slave;
+				bool second = dc->apple5k_policy.pair_order ==
+					APPLE5K_ORDER_ROOT_FIRST ? is_slave : is_root;
 
-		if (pipe_ctx_old->stream && !pipe_need_reprogram(pipe_ctx_old, pipe_ctx))
-			continue;
+				if ((pass == 0 && !first) ||
+				    (pass == 1 && !second) ||
+				    (pass == 2 && (is_root || is_slave)))
+					continue;
+			}
 
-		if (pipe_ctx->top_pipe || pipe_ctx->prev_odm_pipe)
-			continue;
+			if (pipe_ctx->stream == pipe_ctx_old->stream &&
+			    pipe_ctx->stream->link->link_state_valid)
+				continue;
 
-		status = dce110_apply_single_controller_ctx_to_hw(
-				pipe_ctx,
-				context,
-				dc);
+			if (pipe_ctx_old->stream &&
+			    !pipe_need_reprogram(pipe_ctx_old, pipe_ctx))
+				continue;
 
-		if (DC_OK != status)
-			return status;
+			if (pipe_ctx->top_pipe || pipe_ctx->prev_odm_pipe)
+				continue;
+
+			status = dce110_apply_single_controller_ctx_to_hw(
+					pipe_ctx, context, dc);
+
+			if (DC_OK != status)
+				return status;
 
 #ifdef CONFIG_DRM_AMD_DC_FP
-		if (hws->funcs.resync_fifo_dccg_dio)
-			hws->funcs.resync_fifo_dccg_dio(hws, dc, context, i);
+			if (hws->funcs.resync_fifo_dccg_dio)
+				hws->funcs.resync_fifo_dccg_dio(hws, dc,
+							 context, i);
 #endif
+		}
 	}
 
 	if (dc->fbc_compressor)

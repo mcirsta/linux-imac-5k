@@ -84,7 +84,10 @@ bool dc_get_edp_link_panel_inst(const struct dc *dc,
 
 bool dc_link_detect(struct dc_link *link, enum dc_detect_reason reason)
 {
-	return link->dc->link_srv->detect_link(link, reason);
+	bool detected = link->dc->link_srv->detect_link(link, reason);
+
+	link_apple_5k_finish_detection(link, reason);
+	return detected;
 }
 
 bool dc_link_detect_connection_type(struct dc_link *link,

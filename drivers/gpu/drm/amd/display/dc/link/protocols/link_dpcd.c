@@ -31,8 +31,8 @@
  */
 
 #include "link_dpcd.h"
+#include "../apple5k.h"
 #include <drm/display/drm_dp_helper.h>
-#include <linux/delay.h>
 #include "dm_helpers.h"
 
 #define DC_LOGGER \
@@ -255,78 +255,51 @@ enum dc_status core_link_write_dpcd(
 	return status;
 }
 
-/* Apple 5K dual-tile internal panel: DPCD 0x4F1 = root panel latch. */
-#define APPLE_5K_DPCD_ROOT_PANEL_LATCH 0x4F1
-
-enum dc_status link_apple_5k_root_panel_latch_pulse(struct dc_link *root_link)
+static bool apple5k_edp_power_guard_applies(struct dc_link *link)
 {
-	uint8_t payload = 1;
-	uint8_t readback = 0;
-	enum dc_status status;
-	enum dc_status read_status;
-
-	DC_LOGGER_INIT(root_link ? root_link->ctx->logger : NULL);
-
-	if (!dc_link_has_tiled_root_panel_patch(root_link))
-		return DC_OK;
-
-	read_status = core_link_read_dpcd(root_link,
-					  APPLE_5K_DPCD_ROOT_PANEL_LATCH,
-					  &readback, sizeof(readback));
-	if (read_status == DC_OK && readback == 1) {
-		DC_LOG_INFO("APPLE5K: root wake 0x4F1 skip already-set root_link[%u] readback=0x%02x transaction_active=%d\n",
-			    root_link->link_index, readback,
-			    root_link->apple5k_arming);
-		link_apple_5k_log_panel_mode(root_link,
-					     "root-latch-pulse:skip");
-		return DC_OK;
-	}
-
-	link_apple_5k_log_panel_mode(root_link, "root-latch-pulse:pre");
-	status = core_link_write_dpcd(root_link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
-				    &payload, sizeof(payload));
-	/*
-	 * This helper is still used by detection/source-DPCD/training wake probes.
-	 * Do not mark apple5k_arming here: that flag is now reserved for the bounded
-	 * paired native-enable transaction owned by link_apple_5k_finalize_tiled_pair().
-	 */
-	link_apple_5k_log_panel_mode(root_link, "root-latch-pulse:post");
-	return status;
+	/* local_sink may already be detached when the hwseq powers eDP down. */
+	return link && link->connector_signal == SIGNAL_TYPE_EDP &&
+	       link->dc->apple5k_policy.enabled;
 }
 
-bool link_apple_5k_edp_power_off_guard(struct dc_link *link)
+bool link_apple_5k_lock_edp_power_off(struct dc_link *link)
 {
-	uint8_t off = 0;
-	DC_LOGGER_INIT(link ? link->ctx->logger : NULL);
+	bool owned;
 
-	/* Only the Apple 5K tiled root (eDP) panel is affected. */
-	if (!dc_link_has_tiled_root_panel_patch(link))
-		return false;
-
-	if (link->apple5k_arming) {
-		/*
-		 * Mid arm->enable: keep the panel powered (skip the power-off). Powering
-		 * eDP VDD off while 0x4F1 is armed jams the Pro TCON into stuck-compat
-		 * (survives warm reboot). The firmware keeps the panel powered-but-
-		 * blanked through the combined enable; mirror that here.
-		 */
-		DC_LOG_INFO("APPLE5K: SKIP eDP power-OFF link[%u] (0x4F1 latch armed) to avoid TCON wedge\n",
-			    link->link_index);
+	/* Non-Apple links proceed without taking the pair lock. */
+	if (!apple5k_edp_power_guard_applies(link))
 		return true;
+
+	mutex_lock(&link->apple5k.lock);
+	owned = link->apple5k.latch_owner != APPLE5K_LATCH_NONE ||
+		link->apple5k.state == APPLE5K_TX_DISCOVERING ||
+		link->apple5k.state == APPLE5K_TX_ENABLING;
+	if (owned) {
+		DC_LOGGER_INIT(link->ctx->logger);
+		/*
+		 * Ownership is acquired before an arm or teardown starts and is not
+		 * released until native succeeds or a disarm is verified.  Therefore
+		 * an owner means VDD must stay up even if lifecycle state has already
+		 * advanced to ABORTING/BLOCKED.
+		 */
+		DC_LOG_INFO("APPLE5K: SKIP eDP power-OFF link[%u] state=%s owner=%s\n",
+			    link->link_index,
+			    link_apple5k_state_name(link->apple5k.state),
+			    link_apple5k_latch_owner_name(
+					link->apple5k.latch_owner));
+		mutex_unlock(&link->apple5k.lock);
+		return false;
 	}
 
 	/*
-	 * Genuine power-off and we are NOT mid-arm: disarm the latch first (write
-	 * 0x4F1=0, the firmware's teardown action) so the panel powers off in its
-	 * quiet base/compat state and is cleanly re-armable next enable. Never leave
-	 * an armed latch across a power-off.
+	 * Leave the lock held.  The caller releases it only after the BIOS VDD
+	 * command, closing the check-vs-power-off window against a new owner.
 	 */
-	link_apple_5k_log_panel_mode(link, "power-off:pre-disarm");
-	(void)core_link_write_dpcd(link, APPLE_5K_DPCD_ROOT_PANEL_LATCH,
-				   &off, sizeof(off));
-	msleep(10);
-	link_apple_5k_log_panel_mode(link, "power-off:post-disarm");
-	DC_LOG_INFO("APPLE5K: disarm 0x4F1=0 link[%u] before eDP power-OFF\n",
-		    link->link_index);
-	return false;
+	return true;
+}
+
+void link_apple_5k_unlock_edp_power_off(struct dc_link *link)
+{
+	if (apple5k_edp_power_guard_applies(link))
+		mutex_unlock(&link->apple5k.lock);
 }
