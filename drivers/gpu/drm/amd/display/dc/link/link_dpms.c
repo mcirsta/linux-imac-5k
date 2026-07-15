@@ -1553,10 +1553,19 @@ static bool apple5k_target_is_native_half(
 }
 
 /* A half-pair is permitted only as a blank intermediate teardown state. */
-static bool apple5k_native_half_is_clean(struct dc_link *root,
+static struct pipe_ctx *apple5k_native_half_pipe(
 		const struct apple5k_target_snapshot *target)
 {
-	struct pipe_ctx *pipe;
+	if (!apple5k_target_is_native_half(target))
+		return NULL;
+
+	return target->class == APPLE5K_TARGET_ROOT_ONLY ?
+		target->root_pipe : target->slave_pipe;
+}
+
+static bool apple5k_native_half_has_clean_ownership(struct dc_link *root,
+		const struct apple5k_target_snapshot *target)
+{
 	enum apple5k_tx_state tx_state;
 	enum apple5k_latch_owner owner;
 	bool block_rearm;
@@ -1564,8 +1573,6 @@ static bool apple5k_native_half_is_clean(struct dc_link *root,
 	if (!root || !apple5k_target_is_native_half(target))
 		return false;
 
-	pipe = target->class == APPLE5K_TARGET_ROOT_ONLY ?
-		target->root_pipe : target->slave_pipe;
 	mutex_lock(&root->apple5k.lock);
 	tx_state = root->apple5k.state;
 	owner = root->apple5k.latch_owner;
@@ -1573,7 +1580,15 @@ static bool apple5k_native_half_is_clean(struct dc_link *root,
 	mutex_unlock(&root->apple5k.lock);
 
 	return tx_state == APPLE5K_TX_READY &&
-	       owner == APPLE5K_LATCH_NONE && !block_rearm &&
+	       owner == APPLE5K_LATCH_NONE && !block_rearm;
+}
+
+static bool apple5k_native_half_is_clean(struct dc_link *root,
+		const struct apple5k_target_snapshot *target)
+{
+	struct pipe_ctx *pipe = apple5k_native_half_pipe(target);
+
+	return pipe && apple5k_native_half_has_clean_ownership(root, target) &&
 	       apple5k_pipe_is_blanked(pipe);
 }
 
@@ -2158,6 +2173,7 @@ enum dc_status link_apple_5k_finalize_state(struct dc *dc,
 					    struct dc_state *state)
 {
 	struct apple5k_target_snapshot target;
+	struct pipe_ctx *half_pipe;
 	struct pipe_ctx *root_pipe = NULL;
 	struct pipe_ctx *slave_pipe = NULL;
 	struct dc_link *root_link;
@@ -2186,24 +2202,36 @@ enum dc_status link_apple_5k_finalize_state(struct dc *dc,
 		if (target.class == APPLE5K_TARGET_NONE)
 			continue;
 		if (apple5k_target_is_native_half(&target)) {
-			if (!apple5k_native_half_is_clean(candidate, &target))
+			half_pipe = apple5k_native_half_pipe(&target);
+			if (!half_pipe ||
+			    !apple5k_native_half_has_clean_ownership(candidate,
+							       &target))
 				return DC_ERROR_UNEXPECTED;
 			if (state->apple5k_transition_reason ==
 					APPLE5K_TRANSITION_RESTART_HANDOFF) {
 				if (target.class != APPLE5K_TARGET_ROOT_ONLY)
 					return DC_ERROR_UNEXPECTED;
-				dc->hwss.unblank_stream(target.root_pipe,
-					&target.root_pipe->stream->link->cur_link_settings);
-				if (apple5k_pipe_is_blanked(target.root_pipe))
+				if (apple5k_pipe_is_blanked(half_pipe))
+					dc->hwss.unblank_stream(half_pipe,
+						&half_pipe->stream->link->cur_link_settings);
+				if (apple5k_pipe_is_blanked(half_pipe))
 					return DC_ERROR_UNEXPECTED;
 				if (link_apple5k_log_enabled(dc,
 							APPLE5K_LOG_SUMMARY)) {
 					DC_LOGGER_INIT(candidate->ctx->logger);
 					DC_LOG_INFO("APPLE5K-RESTART root handoff live root_link[%u] timing=%ux%u latch=base\n",
 						    candidate->link_index,
-						    target.root_pipe->stream->timing.h_addressable,
-						    target.root_pipe->stream->timing.v_addressable);
+						    half_pipe->stream->timing.h_addressable,
+						    half_pipe->stream->timing.v_addressable);
 				}
+			} else if (apple5k_reason_allows_teardown(
+					state->apple5k_transition_reason)) {
+				if (!apple5k_pipe_is_blanked(half_pipe))
+					dc->hwss.blank_stream(half_pipe);
+				if (!apple5k_pipe_is_blanked(half_pipe))
+					return DC_ERROR_UNEXPECTED;
+			} else {
+				return DC_ERROR_UNEXPECTED;
 			}
 			continue;
 		}
