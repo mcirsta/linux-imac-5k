@@ -8717,6 +8717,11 @@ amdgpu_dm_reprobe_tiled_root_after_slave(struct amdgpu_device *adev)
 	unsigned int old_len = 0;
 	const char *reread_result;
 
+	if (!dm->dc->apple5k_policy.enabled ||
+	    dm->dc->apple5k_policy.discovery_mode !=
+				APPLE5K_DISCOVERY_BOUNDED)
+		return;
+
 	drm_connector_list_iter_begin(dev, &iter);
 	drm_for_each_connector_iter(connector, &iter) {
 		struct amdgpu_dm_connector *aconnector;

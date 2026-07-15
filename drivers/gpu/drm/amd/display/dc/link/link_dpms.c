@@ -1690,7 +1690,8 @@ enum dc_status link_apple_5k_prepare_tiled_pair(struct dc *dc,
 	int i;
 
 	if (!dc || !state || !dc->apple5k_policy.enabled ||
-	    dc->apple5k_policy.pair_mode != APPLE5K_PAIR_TRANSACTIONAL)
+	    dc->apple5k_policy.pair_mode != APPLE5K_PAIR_TRANSACTIONAL ||
+	    dc->apple5k_policy.discovery_mode != APPLE5K_DISCOVERY_BOUNDED)
 		return DC_OK;
 
 	for (i = 0; i < dc->link_count; i++) {

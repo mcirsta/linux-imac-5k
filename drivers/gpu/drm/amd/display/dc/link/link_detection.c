@@ -255,6 +255,17 @@ static bool tiled_slave_try_pre_detect_aux(struct dc_link *link)
 		return false;
 
 	root_link = link->tiled_peer;
+	if (!root_link ||
+	    root_link->dc->apple5k_policy.discovery_mode !=
+				APPLE5K_DISCOVERY_BOUNDED) {
+		if (root_link &&
+		    link_apple5k_log_enabled(root_link->dc,
+					       APPLE5K_LOG_SUMMARY))
+			DC_LOG_INFO("APPLE5K: slave pre-detect skipped link[%u] root_link[%u] discovery_mode=%d\n",
+				    link->link_index, root_link->link_index,
+				    root_link->dc->apple5k_policy.discovery_mode);
+		return false;
+	}
 
 	if (tiled_slave_poll_aux(link, root_link, "slave-predetect",
 				&dpcd_rev, &elapsed_ms)) {

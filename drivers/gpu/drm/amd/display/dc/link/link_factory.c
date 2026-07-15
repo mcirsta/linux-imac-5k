@@ -905,6 +905,7 @@ struct dc_link *link_create(const struct link_init_data *init_params)
 	mutex_init(&link->apple5k.lock);
 	link->apple5k.state = APPLE5K_TX_IDLE;
 	link->apple5k.latch_owner = APPLE5K_LATCH_NONE;
+	link->apple5k.discovery_pulse_done = false;
 
 	if (false == link_construct(link, init_params))
 		goto construct_fail;

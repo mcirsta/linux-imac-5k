@@ -168,8 +168,8 @@ void link_apple5k_resolve_policy(struct dc *dc)
 		invalid_value = true;
 		policy->pair_order = APPLE5K_ORDER_ROOT_FIRST;
 	}
-	if (policy->discovery_mode < APPLE5K_DISCOVERY_DEFER ||
-	    policy->discovery_mode > APPLE5K_DISCOVERY_BOUNDED) {
+	if (policy->discovery_mode < APPLE5K_DISCOVERY_BYPASS ||
+	    policy->discovery_mode > APPLE5K_DISCOVERY_PULSE) {
 		invalid_value = true;
 		policy->discovery_mode = APPLE5K_DISCOVERY_BOUNDED;
 	}
@@ -259,23 +259,6 @@ const char *link_apple5k_latch_owner_name(enum apple5k_latch_owner owner)
 	}
 }
 
-static bool apple5k_pair_has_stream(const struct dc_link *root)
-{
-	const struct dc_state *state;
-	int i;
-
-	if (!root || !root->dc || !root->dc->current_state)
-		return false;
-	state = root->dc->current_state;
-	for (i = 0; i < state->stream_count; i++) {
-		const struct dc_link *link = state->streams[i]->link;
-
-		if (link == root || link == root->tiled_peer)
-			return true;
-	}
-	return false;
-}
-
 static enum dc_status apple5k_write_latch_locked(struct dc_link *link,
 						 struct dc_link *root,
 						 uint8_t value,
@@ -286,6 +269,17 @@ static enum dc_status apple5k_write_latch_locked(struct dc_link *link,
 
 	lockdep_assert_held(&root->apple5k.lock);
 	if (value > 1)
+		return DC_ERROR_UNEXPECTED;
+	/* Diagnostic modes may not escape into a later native transaction. */
+	if (root->dc->apple5k_policy.discovery_mode ==
+				APPLE5K_DISCOVERY_BYPASS)
+		return DC_ERROR_UNEXPECTED;
+	if (root->dc->apple5k_policy.discovery_mode ==
+				APPLE5K_DISCOVERY_PULSE &&
+	    (link != root ||
+	     root->apple5k.state != APPLE5K_TX_DISCOVERING ||
+	     root->apple5k.latch_owner != APPLE5K_LATCH_DISCOVERY ||
+	     root->apple5k.discovery_pulse_done))
 		return DC_ERROR_UNEXPECTED;
 	if (value && root->apple5k.block_rearm) {
 		return DC_ERROR_UNEXPECTED;
@@ -396,10 +390,18 @@ enum dc_status link_apple5k_begin_discovery(struct dc_link *root,
 	    root->dc->apple5k_policy.wake_mode == APPLE5K_WAKE_OFF)
 		return DC_ERROR_UNEXPECTED;
 
-	if (root->dc->apple5k_policy.wake_mode == APPLE5K_WAKE_LEGACY)
+	if (root->dc->apple5k_policy.wake_mode == APPLE5K_WAKE_LEGACY &&
+	    root->dc->apple5k_policy.discovery_mode ==
+				APPLE5K_DISCOVERY_BOUNDED)
 		return link_apple5k_write_latch(root, 1, stage);
 
 	mutex_lock(&root->apple5k.lock);
+	if (root->dc->apple5k_policy.discovery_mode ==
+				APPLE5K_DISCOVERY_PULSE &&
+	    root->apple5k.discovery_pulse_done) {
+		mutex_unlock(&root->apple5k.lock);
+		return DC_OK;
+	}
 	if (root->apple5k.state == APPLE5K_TX_DISCOVERING ||
 	    root->apple5k.state == APPLE5K_TX_ENABLING ||
 	    root->apple5k.state == APPLE5K_TX_NATIVE) {
@@ -418,6 +420,18 @@ enum dc_status link_apple5k_begin_discovery(struct dc_link *root,
 	s425 = core_link_read_dpcd(root, 0x425, &r425, sizeof(r425));
 	s4f1 = core_link_read_dpcd(root, APPLE5K_DPCD_PANEL_LATCH,
 				     &r4f1, sizeof(r4f1));
+	if (root->dc->apple5k_policy.discovery_mode ==
+				APPLE5K_DISCOVERY_BYPASS) {
+		if (link_apple5k_log_enabled(root->dc,
+					     APPLE5K_LOG_SUMMARY)) {
+			DC_LOGGER_INIT(root->ctx->logger);
+			DC_LOG_INFO("APPLE5K-TXN discovery bypass root[%u] tuple=%02x(s=%d)/%02x(s=%d)/%02x(s=%d) action=read-only\n",
+				    root->link_index, r41c, s41c, r425, s425,
+				    r4f1, s4f1);
+		}
+		return s41c == DC_OK && s425 == DC_OK && s4f1 == DC_OK ?
+				DC_OK : DC_ERROR_UNEXPECTED;
+	}
 	if (s41c != DC_OK || s425 != DC_OK || s4f1 != DC_OK) {
 		DC_LOGGER_INIT(root->ctx->logger);
 		DC_LOG_ERROR("APPLE5K-TXN discovery blocked: tuple read failed root[%u] 41c_s=%d 425_s=%d 4f1_s=%d\n",
@@ -463,6 +477,10 @@ enum dc_status link_apple5k_begin_discovery(struct dc_link *root,
 	if (status == DC_OK) {
 		mutex_unlock(&root->apple5k.lock);
 		msleep(10);
+		if (root->dc->apple5k_policy.discovery_mode ==
+					APPLE5K_DISCOVERY_PULSE)
+			return link_apple5k_finish_discovery(root,
+							      "discovery-pulse");
 		return DC_OK;
 	}
 
@@ -480,37 +498,13 @@ enum dc_status link_apple5k_finish_discovery(struct dc_link *root,
 	enum dc_status status;
 
 	root = link_apple5k_root_for_link(root);
-	if (!root || root->dc->apple5k_policy.wake_mode != APPLE5K_WAKE_SCOPED)
+	if (!root ||
+	    (root->dc->apple5k_policy.wake_mode != APPLE5K_WAKE_SCOPED &&
+	     root->dc->apple5k_policy.discovery_mode !=
+				APPLE5K_DISCOVERY_PULSE))
 		return DC_OK;
 
 	mutex_lock(&root->apple5k.lock);
-	if (root->apple5k.state != APPLE5K_TX_DISCOVERING ||
-	    root->apple5k.latch_owner != APPLE5K_LATCH_DISCOVERY) {
-		mutex_unlock(&root->apple5k.lock);
-		return DC_OK;
-	}
-	mutex_unlock(&root->apple5k.lock);
-
-	/*
-	 * Bounded discovery must return the panel to the verified compatibility
-	 * base before boot detection completes.  Mode 0 retains the previous
-	 * defer-on-any-Apple-stream behavior strictly as a command-line A/B
-	 * control; it is not the transactional default because it can leak
-	 * DISCOVERY ownership into the first atomic commit.
-	 */
-	if (root->dc->apple5k_policy.discovery_mode ==
-				APPLE5K_DISCOVERY_DEFER &&
-	    apple5k_pair_has_stream(root)) {
-		if (link_apple5k_log_enabled(root->dc, APPLE5K_LOG_SUMMARY)) {
-			DC_LOGGER_INIT(root->ctx->logger);
-			DC_LOG_INFO("APPLE5K-TXN discovery finish deferred root[%u] reason=pair-stream-active\n",
-				    root->link_index);
-		}
-		return DC_OK;
-	}
-
-	mutex_lock(&root->apple5k.lock);
-	/* Native enable may have taken ownership while streams were checked. */
 	if (root->apple5k.state != APPLE5K_TX_DISCOVERING ||
 	    root->apple5k.latch_owner != APPLE5K_LATCH_DISCOVERY) {
 		mutex_unlock(&root->apple5k.lock);
@@ -526,8 +520,12 @@ enum dc_status link_apple5k_finish_discovery(struct dc_link *root,
 	root->apple5k.state = status == DC_OK ? APPLE5K_TX_READY :
 						       APPLE5K_TX_BLOCKED;
 	root->apple5k.block_rearm = status != DC_OK;
-	if (status == DC_OK)
+	if (status == DC_OK) {
 		root->apple5k.latch_owner = APPLE5K_LATCH_NONE;
+		if (root->dc->apple5k_policy.discovery_mode ==
+					APPLE5K_DISCOVERY_PULSE)
+			root->apple5k.discovery_pulse_done = true;
+	}
 	mutex_unlock(&root->apple5k.lock);
 	if (status != DC_OK) {
 		DC_LOGGER_INIT(root->ctx->logger);
@@ -555,6 +553,9 @@ enum dc_status link_apple5k_require_wake_scope(struct dc_link *link,
 	enum dc_status status;
 
 	if (!root || !root->dc->apple5k_policy.enabled)
+		return DC_ERROR_UNEXPECTED;
+	if (root->dc->apple5k_policy.discovery_mode !=
+				APPLE5K_DISCOVERY_BOUNDED)
 		return DC_ERROR_UNEXPECTED;
 	if (root->dc->apple5k_policy.pair_mode !=
 					APPLE5K_PAIR_TRANSACTIONAL)

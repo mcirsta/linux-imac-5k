@@ -1597,8 +1597,9 @@ enum apple5k_wake_mode {
 };
 
 enum apple5k_discovery_mode {
-	APPLE5K_DISCOVERY_DEFER = 0,
+	APPLE5K_DISCOVERY_BYPASS = 0,
 	APPLE5K_DISCOVERY_BOUNDED = 1,
+	APPLE5K_DISCOVERY_PULSE = 2,
 };
 
 enum apple5k_boot_mode {
@@ -1665,6 +1666,7 @@ struct apple5k_pair_state {
 	uint32_t arm_count;
 	uint32_t disarm_count;
 	bool block_rearm;
+	bool discovery_pulse_done;
 };
 
 struct dc_link {

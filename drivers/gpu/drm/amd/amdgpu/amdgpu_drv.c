@@ -940,7 +940,7 @@ MODULE_PARM_DESC(apple5k_pair_order,
 module_param_named(apple5k_pair_order, amdgpu_apple5k_pair_order, int, 0444);
 
 MODULE_PARM_DESC(apple5k_discovery_mode,
-		 "Apple 5K scoped discovery cleanup (0 = defer while an Apple stream exists, 1 = bounded close and verify (default))");
+		 "Apple 5K discovery (0 = read-only bypass, 1 = full bounded discovery (default), 2 = one-shot arm/clear pulse without slave discovery)");
 module_param_named(apple5k_discovery_mode,
 		   amdgpu_apple5k_discovery_mode, int, 0444);
 
