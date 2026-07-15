@@ -78,6 +78,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/pci.h>
 #include <linux/power_supply.h>
+#include <linux/reboot.h>
 #include <linux/firmware.h>
 #include <linux/component.h>
 #include <linux/dmi.h>
@@ -3116,9 +3117,6 @@ static enum dc_status amdgpu_dm_commit_zero_streams(struct dc *dc)
 	context = dc_state_create_current_copy(dc);
 	if (context == NULL)
 		return DC_ERROR_UNEXPECTED;
-	/* GPU-reset teardown is not an ordinary DPMS/suspend transaction. */
-	context->apple5k_zero_stream_reason =
-		APPLE5K_ZERO_STREAM_UNSPECIFIED;
 
 	/* First remove from context all streams */
 	for (i = 0; i < context->stream_count; i++) {
@@ -3141,6 +3139,8 @@ static enum dc_status amdgpu_dm_commit_zero_streams(struct dc *dc)
 
 	params.streams = context->streams;
 	params.stream_count = context->stream_count;
+	/* GPU reset may rebuild DC while panel AUX is unavailable. */
+	params.apple5k_transition_reason = APPLE5K_TRANSITION_GPU_RESET;
 
 	return dc_commit_streams(dc, &params);
 }
@@ -11281,8 +11281,8 @@ static void dm_clear_writeback(struct amdgpu_display_manager *dm,
 	dc_stream_remove_writeback(dm->dc, crtc_state->stream, 0);
 }
 
-static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
-					struct dc_state *dc_state)
+static enum dc_status amdgpu_dm_commit_streams(
+		struct drm_atomic_state *state, struct dc_state *dc_state)
 {
 	struct drm_device *dev = state->dev;
 	struct amdgpu_device *adev = drm_to_adev(dev);
@@ -11294,7 +11294,13 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 	struct drm_connector *connector;
 	bool mode_set_reset_required = false;
 	u32 i;
-	struct dc_commit_streams_params params = {dc_state->streams, dc_state->stream_count};
+	struct dc_commit_streams_params params = {
+		.streams = dc_state->streams,
+		.stream_count = dc_state->stream_count,
+		.apple5k_transition_reason =
+			dc_state->apple5k_transition_reason,
+	};
+	enum dc_status status;
 	bool set_backlight_level = false;
 
 	/* Disable writeback */
@@ -11441,13 +11447,22 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 	amdgpu_dm_log_apple5k_dc_streams(dev, dc_state, "commit-after-sync");
 	mutex_lock(&dm->dc_lock);
 	dc_exit_ips_for_hw_access(dm->dc);
-	WARN_ON(!dc_commit_streams(dm->dc, &params));
+	if (params.stream_count == 0 &&
+	    params.apple5k_transition_reason == APPLE5K_TRANSITION_RESTART) {
+		status = dc_prepare_apple5k_restart_handoff(dm->dc);
+		if (status != DC_OK)
+			drm_err(dev, "APPLE5K restart root handoff failed: %d\n",
+				 status);
+	}
+	status = dc_commit_streams(dm->dc, &params);
 	amdgpu_dm_log_apple5k_dc_streams(dev, dc_state, "commit-after-dc");
 
 	/* Allow idle optimization when vblank count is 0 for display off */
 	if ((dm->active_vblank_irq_count == 0) && amdgpu_dm_is_headless(dm->adev))
 		dc_allow_idle_optimizations(dm->dc, true);
 	mutex_unlock(&dm->dc_lock);
+	if (status != DC_OK)
+		return status;
 
 	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
 		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
@@ -11482,6 +11497,8 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 				amdgpu_dm_backlight_set_level(dm, i, dm->brightness[i]);
 		}
 	}
+
+	return status;
 }
 
 static void dm_set_writeback(struct amdgpu_display_manager *dm,
@@ -11779,7 +11796,9 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 	struct drm_connector *connector;
 	struct drm_connector_state *old_con_state = NULL, *new_con_state = NULL;
 	struct dm_crtc_state *dm_old_crtc_state, *dm_new_crtc_state;
+	enum dc_status dc_status = DC_OK;
 	int crtc_disable_count = 0;
+	bool dc_commit_failed = false;
 
 	trace_amdgpu_dm_atomic_commit_tail_begin(state);
 
@@ -11789,10 +11808,36 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 	dm_state = dm_atomic_get_new_state(state);
 	if (dm_state && dm_state->context) {
 		dc_state = dm_state->context;
-		dc_state->apple5k_zero_stream_reason =
-			adev->in_suspend ? APPLE5K_ZERO_STREAM_SUSPEND :
-					   APPLE5K_ZERO_STREAM_DPMS;
-		amdgpu_dm_commit_streams(state, dc_state);
+		if (dc_state->apple5k_transition_reason ==
+					APPLE5K_TRANSITION_UNSPECIFIED) {
+			if (system_state == SYSTEM_RESTART)
+				dc_state->apple5k_transition_reason =
+						APPLE5K_TRANSITION_RESTART;
+			else if (adev->in_suspend)
+				dc_state->apple5k_transition_reason =
+						APPLE5K_TRANSITION_SUSPEND;
+			else if (dc_state->stream_count == 0)
+				dc_state->apple5k_transition_reason =
+						APPLE5K_TRANSITION_DPMS;
+			else
+				dc_state->apple5k_transition_reason =
+						APPLE5K_TRANSITION_MODESET;
+		}
+		dc_status = amdgpu_dm_commit_streams(state, dc_state);
+		if (dc_status != DC_OK) {
+			drm_err(dev,
+				"DC stream commit failed (%d); skipping dependent programming\n",
+				dc_status);
+			dc_commit_failed = true;
+		}
+	}
+	if (dc_commit_failed) {
+		wait_for_vblank = false;
+		for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state,
+					      new_crtc_state, i)
+			if (old_crtc_state->active && !new_crtc_state->active)
+				crtc_disable_count++;
+		goto commit_tail_hw_done;
 	}
 
 	amdgpu_dm_update_hdcp(state);
@@ -12043,6 +12088,7 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
 	 * send vblank event on all events not handled in flip and
 	 * mark consumed event for drm_atomic_helper_commit_hw_done
 	 */
+commit_tail_hw_done:
 	spin_lock_irqsave(&adev_to_drm(adev)->event_lock, flags);
 	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
 
@@ -13411,19 +13457,59 @@ static bool amdgpu_dm_crtc_mem_type_changed(struct drm_device *dev,
  */
 enum apple5k_tile_request {
 	APPLE5K_TILE_REQ_NONE = 0,	/* tiled pair not part of this modeset */
+	APPLE5K_TILE_REQ_OFF,		/* both tile connectors disabled */
 	APPLE5K_TILE_REQ_2TILE,		/* both tiles @ per-tile size (native) */
 	APPLE5K_TILE_REQ_1TILE,		/* root @ non-tile, slave off (compat) */
+	APPLE5K_TILE_REQ_TEARDOWN_HALF, /* blank half of a split pair disable */
 	APPLE5K_TILE_REQ_OTHER,		/* pair touched, not a clean 1/2-tile */
 };
 
 static const char *apple5k_tile_request_name(enum apple5k_tile_request req)
 {
 	switch (req) {
+	case APPLE5K_TILE_REQ_OFF:	return "off";
 	case APPLE5K_TILE_REQ_2TILE:	return "2-tile";
 	case APPLE5K_TILE_REQ_1TILE:	return "1-tile";
+	case APPLE5K_TILE_REQ_TEARDOWN_HALF: return "teardown-half";
 	case APPLE5K_TILE_REQ_OTHER:	return "other";
 	default:			return "none";
 	}
+}
+
+struct apple5k_atomic_endpoint {
+	const struct drm_display_mode *mode;
+	bool enabled;
+	bool tile_size;
+};
+
+static void amdgpu_dm_apple5k_get_atomic_endpoint(
+		struct drm_atomic_state *state, struct drm_connector *connector,
+		bool old, struct apple5k_atomic_endpoint *endpoint)
+{
+	struct drm_connector_state *connector_state;
+	struct drm_crtc_state *crtc_state;
+
+	memset(endpoint, 0, sizeof(*endpoint));
+	connector_state = old ?
+		drm_atomic_get_old_connector_state(state, connector) :
+		drm_atomic_get_new_connector_state(state, connector);
+	if (!connector_state)
+		connector_state = connector->state;
+	if (!connector_state || !connector_state->crtc)
+		return;
+
+	crtc_state = old ?
+		drm_atomic_get_old_crtc_state(state, connector_state->crtc) :
+		drm_atomic_get_new_crtc_state(state, connector_state->crtc);
+	if (!crtc_state)
+		crtc_state = connector_state->crtc->state;
+	if (!crtc_state || !crtc_state->enable)
+		return;
+
+	endpoint->enabled = true;
+	endpoint->mode = &crtc_state->mode;
+	endpoint->tile_size =
+		amdgpu_dm_mode_matches_tile_size(connector, endpoint->mode);
 }
 
 static enum apple5k_tile_request
@@ -13432,66 +13518,87 @@ amdgpu_dm_apple5k_classify_tile_switch(struct drm_atomic_state *state,
 				       struct drm_connector **slave_out)
 {
 	struct drm_connector *connector;
-	struct drm_connector_state *new_con_state;
 	struct drm_connector *root_conn = NULL, *slave_conn = NULL;
-	struct drm_connector_state *root_cs = NULL, *slave_cs = NULL;
-	struct drm_crtc_state *root_crtc_state = NULL;
-	const struct drm_display_mode *root_mode = NULL;
-	bool root_enabled, slave_enabled, root_is_tile_size;
+	struct drm_connector_list_iter iter;
+	struct apple5k_atomic_endpoint old_root, old_slave;
+	struct apple5k_atomic_endpoint new_root, new_slave;
+	struct drm_connector_state *new_root_cs, *new_slave_cs;
+	bool pair_touched;
+	bool old_pair;
 	enum apple5k_tile_request req = APPLE5K_TILE_REQ_NONE;
-	int i;
 
 	if (root_out)
 		*root_out = NULL;
 	if (slave_out)
 		*slave_out = NULL;
 
-	for_each_new_connector_in_state(state, connector, new_con_state, i) {
+	drm_connector_list_iter_begin(state->dev, &iter);
+	drm_for_each_connector_iter(connector, &iter) {
 		struct amdgpu_dm_connector *aconn;
 
 		if (connector->connector_type == DRM_MODE_CONNECTOR_WRITEBACK)
 			continue;
 		aconn = to_amdgpu_dm_connector(connector);
-		if (amdgpu_dm_connector_has_tiled_root_patch(aconn)) {
+		if (amdgpu_dm_connector_has_tiled_root_patch(aconn))
 			root_conn = connector;
-			root_cs = new_con_state;
-		} else if (amdgpu_dm_connector_has_tiled_slave_patch(aconn)) {
+		else if (amdgpu_dm_connector_has_tiled_slave_patch(aconn))
 			slave_conn = connector;
-			slave_cs = new_con_state;
-		}
 	}
+	drm_connector_list_iter_end(&iter);
 
-	/* Need both tile connectors present in this commit to classify. */
+	/* The full pair is classified even when userspace changes one connector
+	 * at a time.  Missing atomic objects inherit their current state.
+	 */
 	if (!root_conn || !slave_conn)
 		return APPLE5K_TILE_REQ_NONE;
 
-	if (root_cs->crtc) {
-		root_crtc_state = drm_atomic_get_new_crtc_state(state, root_cs->crtc);
-		if (root_crtc_state && root_crtc_state->enable)
-			root_mode = &root_crtc_state->mode;
-	}
+	new_root_cs = drm_atomic_get_new_connector_state(state, root_conn);
+	new_slave_cs = drm_atomic_get_new_connector_state(state, slave_conn);
+	pair_touched = new_root_cs || new_slave_cs;
+	if (!pair_touched && root_conn->state && root_conn->state->crtc)
+		pair_touched = drm_atomic_get_new_crtc_state(
+			state, root_conn->state->crtc) != NULL;
+	if (!pair_touched && slave_conn->state && slave_conn->state->crtc)
+		pair_touched = drm_atomic_get_new_crtc_state(
+			state, slave_conn->state->crtc) != NULL;
+	if (!pair_touched)
+		return APPLE5K_TILE_REQ_NONE;
 
-	root_enabled = root_mode != NULL;
-	slave_enabled = slave_cs->crtc != NULL;
-	root_is_tile_size = amdgpu_dm_mode_matches_tile_size(root_conn, root_mode);
+	amdgpu_dm_apple5k_get_atomic_endpoint(state, root_conn, true,
+						 &old_root);
+	amdgpu_dm_apple5k_get_atomic_endpoint(state, slave_conn, true,
+						 &old_slave);
+	amdgpu_dm_apple5k_get_atomic_endpoint(state, root_conn, false,
+						 &new_root);
+	amdgpu_dm_apple5k_get_atomic_endpoint(state, slave_conn, false,
+						 &new_slave);
+	old_pair = old_root.enabled && old_root.tile_size &&
+		   old_slave.enabled && old_slave.tile_size;
 
-	if (root_enabled && root_is_tile_size && slave_enabled)
+	if (!new_root.enabled && !new_slave.enabled)
+		req = APPLE5K_TILE_REQ_OFF;
+	else if (new_root.enabled && new_root.tile_size &&
+		 new_slave.enabled && new_slave.tile_size)
 		req = APPLE5K_TILE_REQ_2TILE;
-	else if (root_enabled && !root_is_tile_size && !slave_enabled)
+	else if (new_root.enabled && !new_root.tile_size && !new_slave.enabled)
 		req = APPLE5K_TILE_REQ_1TILE;
+	else if (old_pair &&
+		 ((new_root.enabled && new_root.tile_size && !new_slave.enabled) ||
+		  (!new_root.enabled && new_slave.enabled && new_slave.tile_size)))
+		req = APPLE5K_TILE_REQ_TEARDOWN_HALF;
 	else
 		req = APPLE5K_TILE_REQ_OTHER;
 
-	/* Only emit for the modeset that actually reshapes the pair. */
-	if (root_crtc_state && drm_atomic_crtc_needs_modeset(root_crtc_state))
-		drm_info(state->dev,
-			 "APPLE5K-SWITCH request=%s root=%s slave=%s root_mode=%dx%d tile_size=%ux%u\n",
-			 apple5k_tile_request_name(req),
-			 root_enabled ? "on" : "off",
-			 slave_enabled ? "on" : "off",
-			 root_mode ? root_mode->hdisplay : 0,
-			 root_mode ? root_mode->vdisplay : 0,
-			 root_conn->tile_h_size, root_conn->tile_v_size);
+	drm_info(state->dev,
+		 "APPLE5K-SWITCH request=%s old=%s/%s new=%s/%s root_mode=%dx%d tile_size=%ux%u\n",
+		 apple5k_tile_request_name(req),
+		 old_root.enabled ? "on" : "off",
+		 old_slave.enabled ? "on" : "off",
+		 new_root.enabled ? "on" : "off",
+		 new_slave.enabled ? "on" : "off",
+		 new_root.mode ? new_root.mode->hdisplay : 0,
+		 new_root.mode ? new_root.mode->vdisplay : 0,
+		 root_conn->tile_h_size, root_conn->tile_v_size);
 
 	if (root_out)
 		*root_out = root_conn;
@@ -13544,6 +13651,7 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 	struct dm_crtc_state *dm_old_crtc_state, *dm_new_crtc_state;
 	struct drm_dp_mst_topology_mgr *mgr;
 	struct drm_dp_mst_topology_state *mst_state;
+	enum apple5k_tile_request apple5k_request;
 	struct dsc_mst_fairness_vars vars[MAX_PIPES] = {0};
 
 	trace_amdgpu_dm_atomic_check_begin(state);
@@ -13554,13 +13662,22 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 		goto fail;
 	}
 
-	/*
-	 * APPLE5K: classify the tiled-pair 1-tile/2-tile intent (read-only).
-	 * Slice 1 logs the recognized request only; the accept/reject verdict
-	 * (spec §3.4) and the compat direct-timing validation (§5) build on
-	 * this in later slices.
+	/* A transactional panel has three stable atomic targets: both links off,
+	 * root-only at a compat mode, or both links at the native tile size.  A
+	 * blank half-pair is also accepted while an atomic teardown is split
+	 * across commits; never drive that 2560x2880 half-panel tile as a stable
+	 * root-only target.
 	 */
-	amdgpu_dm_apple5k_classify_tile_switch(state, NULL, NULL);
+	apple5k_request = amdgpu_dm_apple5k_classify_tile_switch(state,
+							 NULL, NULL);
+	if (dc->apple5k_policy.enabled &&
+	    dc->apple5k_policy.pair_mode == APPLE5K_PAIR_TRANSACTIONAL &&
+	    apple5k_request == APPLE5K_TILE_REQ_OTHER) {
+		drm_info(dev,
+			 "APPLE5K-SWITCH rejecting invalid transactional target\n");
+		ret = -EINVAL;
+		goto fail;
+	}
 
 	/* Check connector changes */
 	for_each_oldnew_connector_in_state(state, connector, old_con_state, new_con_state, i) {
@@ -14001,6 +14118,22 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
 				break;
 			}
 		}
+	}
+
+	if (lock_and_validation_needed && dm_state && dm_state->context) {
+		if (system_state == SYSTEM_RESTART)
+			dm_state->context->apple5k_transition_reason =
+					APPLE5K_TRANSITION_RESTART;
+		else if (adev->in_suspend)
+			dm_state->context->apple5k_transition_reason =
+					APPLE5K_TRANSITION_SUSPEND;
+		else if (apple5k_request == APPLE5K_TILE_REQ_OFF ||
+			 apple5k_request == APPLE5K_TILE_REQ_TEARDOWN_HALF)
+			dm_state->context->apple5k_transition_reason =
+					APPLE5K_TRANSITION_DPMS;
+		else
+			dm_state->context->apple5k_transition_reason =
+					APPLE5K_TRANSITION_MODESET;
 	}
 
 	/* Store the overall update type for use later in atomic check. */

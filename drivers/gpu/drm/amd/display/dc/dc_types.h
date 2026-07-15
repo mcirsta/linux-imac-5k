@@ -1446,10 +1446,21 @@ struct dc_state_create_params {
 	enum dc_power_source_type power_source;
 };
 
+enum apple5k_transition_reason {
+	APPLE5K_TRANSITION_UNSPECIFIED = 0,
+	APPLE5K_TRANSITION_MODESET,
+	APPLE5K_TRANSITION_DPMS,
+	APPLE5K_TRANSITION_SUSPEND,
+	APPLE5K_TRANSITION_RESTART,
+	APPLE5K_TRANSITION_GPU_RESET,
+	APPLE5K_TRANSITION_RESTART_HANDOFF,
+};
+
 struct dc_commit_streams_params {
 	struct dc_stream_state **streams;
 	uint8_t stream_count;
 	enum dc_power_source_type power_source;
+	enum apple5k_transition_reason apple5k_transition_reason;
 };
 
 struct set_backlight_level_params {

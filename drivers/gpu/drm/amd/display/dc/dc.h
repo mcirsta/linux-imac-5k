@@ -1612,13 +1612,8 @@ enum apple5k_shutdown_mode {
 	APPLE5K_SHUTDOWN_STOCK = 0,
 	APPLE5K_SHUTDOWN_OBSERVE = 1,
 	APPLE5K_SHUTDOWN_PAIR_QUIESCE = 2,
+	APPLE5K_SHUTDOWN_ROOT_HANDOFF = 3,
 	APPLE5K_SHUTDOWN_NEUTRALIZE = 4,
-};
-
-enum apple5k_zero_stream_reason {
-	APPLE5K_ZERO_STREAM_UNSPECIFIED = 0,
-	APPLE5K_ZERO_STREAM_DPMS,
-	APPLE5K_ZERO_STREAM_SUSPEND,
 };
 
 enum apple5k_pair_order {
@@ -1651,6 +1646,7 @@ struct apple5k_policy {
 	enum apple5k_wake_mode wake_mode;
 	enum apple5k_boot_mode boot_mode;
 	enum apple5k_shutdown_mode shutdown_mode;
+	uint32_t restart_handoff_ms;
 	enum apple5k_pair_order pair_order;
 	enum apple5k_discovery_mode discovery_mode;
 	bool transition_hpd_guard;
@@ -2157,6 +2153,11 @@ bool dc_link_detect(struct dc_link *link, enum dc_detect_reason reason);
  * root/sibling hardware gate confirms the expected low-to-high transition.
  */
 bool dc_link_consume_apple5k_transition_hpd(struct dc_link *link);
+
+/* Before restart teardown, reproduce the known-good live root-only handoff
+ * observed to leave the panel ready for firmware display initialization.
+ */
+enum dc_status dc_prepare_apple5k_restart_handoff(struct dc *dc);
 
 struct dc_sink_init_data;
 

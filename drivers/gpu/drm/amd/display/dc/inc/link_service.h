@@ -90,6 +90,7 @@ enum dc_status link_apple_5k_prepare_tiled_pair(struct dc *dc,
 					       struct dc_state *state);
 enum dc_status link_apple_5k_prepare_transition(struct dc *dc,
 					       struct dc_state *state);
+enum dc_status link_apple_5k_prepare_restart_handoff(struct dc *dc);
 enum dc_status link_apple_5k_finalize_state(struct dc *dc,
 					    struct dc_state *state);
 void link_apple_5k_prepare_shutdown(struct dc *dc,

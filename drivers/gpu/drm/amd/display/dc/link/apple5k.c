@@ -21,6 +21,7 @@ extern int amdgpu_apple5k_pair_mode;
 extern int amdgpu_apple5k_wake_mode;
 extern int amdgpu_apple5k_boot_mode;
 extern int amdgpu_apple5k_shutdown_mode;
+extern int amdgpu_apple5k_restart_handoff_ms;
 extern int amdgpu_apple5k_pair_order;
 extern int amdgpu_apple5k_discovery_mode;
 extern int amdgpu_apple5k_transition_hpd_guard;
@@ -42,6 +43,7 @@ static void apple5k_apply_profile(struct apple5k_policy *policy, int profile)
 	case 2:
 		policy->pair_mode = APPLE5K_PAIR_TRANSACTIONAL;
 		policy->wake_mode = APPLE5K_WAKE_SCOPED;
+		policy->shutdown_mode = APPLE5K_SHUTDOWN_ROOT_HANDOFF;
 		break;
 	case 3:
 		policy->boot_mode = APPLE5K_BOOT_COLD;
@@ -50,6 +52,7 @@ static void apple5k_apply_profile(struct apple5k_policy *policy, int profile)
 		policy->pair_mode = APPLE5K_PAIR_TRANSACTIONAL;
 		policy->wake_mode = APPLE5K_WAKE_SCOPED;
 		policy->boot_mode = APPLE5K_BOOT_COLD;
+		policy->shutdown_mode = APPLE5K_SHUTDOWN_ROOT_HANDOFF;
 		break;
 	case 5:
 		policy->pair_mode = APPLE5K_PAIR_TRANSACTIONAL;
@@ -109,6 +112,7 @@ void link_apple5k_resolve_policy(struct dc *dc)
 	policy->wake_mode = APPLE5K_WAKE_LEGACY;
 	policy->boot_mode = APPLE5K_BOOT_INHERIT;
 	policy->shutdown_mode = APPLE5K_SHUTDOWN_STOCK;
+	policy->restart_handoff_ms = amdgpu_apple5k_restart_handoff_ms;
 	policy->pair_order = APPLE5K_ORDER_ROOT_FIRST;
 	policy->discovery_mode = amdgpu_apple5k_discovery_mode;
 	policy->transition_hpd_guard = true;
@@ -165,9 +169,15 @@ void link_apple5k_resolve_policy(struct dc *dc)
 	if (policy->shutdown_mode != APPLE5K_SHUTDOWN_STOCK &&
 	    policy->shutdown_mode != APPLE5K_SHUTDOWN_OBSERVE &&
 	    policy->shutdown_mode != APPLE5K_SHUTDOWN_PAIR_QUIESCE &&
+	    policy->shutdown_mode != APPLE5K_SHUTDOWN_ROOT_HANDOFF &&
 	    policy->shutdown_mode != APPLE5K_SHUTDOWN_NEUTRALIZE) {
 		invalid_value = true;
 		policy->shutdown_mode = APPLE5K_SHUTDOWN_STOCK;
+	}
+	if (amdgpu_apple5k_restart_handoff_ms < 0 ||
+	    amdgpu_apple5k_restart_handoff_ms > 2000) {
+		invalid_value = true;
+		policy->restart_handoff_ms = 100;
 	}
 	if (policy->pair_order < APPLE5K_ORDER_ROOT_FIRST ||
 	    policy->pair_order > APPLE5K_ORDER_PIPE) {
@@ -210,11 +220,12 @@ void link_apple5k_resolve_policy(struct dc *dc)
 			DC_LOG_ERROR("APPLE5K-POLICY invalid custom field or combination; "
 				     "using safe effective values\n");
 		DC_LOG_INFO("APPLE5K-POLICY profile=%d enabled=%d pair=%d "
-			    "wake=%d boot=%d shutdown=%d order=%d discovery=%d "
+			    "wake=%d boot=%d shutdown=%d handoff_ms=%u order=%d discovery=%d "
 			    "hpd_guard=%d msa_ignore=%d log_mask=0x%x\n",
 			    profile, policy->enabled, policy->pair_mode,
 			    policy->wake_mode, policy->boot_mode,
-			    policy->shutdown_mode, policy->pair_order,
+			    policy->shutdown_mode, policy->restart_handoff_ms,
+			    policy->pair_order,
 			    policy->discovery_mode,
 			    policy->transition_hpd_guard,
 			    policy->dce12_force_msa_ignore, policy->log_mask);

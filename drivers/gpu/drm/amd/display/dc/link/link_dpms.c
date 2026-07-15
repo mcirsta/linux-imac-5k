@@ -1334,6 +1334,13 @@ static bool apple5k_pipe_is_tile(struct pipe_ctx *pipe_ctx)
 	       apple5k_is_tile(pipe_ctx->stream->link);
 }
 
+static bool apple5k_pipe_is_native_tile(struct pipe_ctx *pipe_ctx)
+{
+	return apple5k_pipe_is_tile(pipe_ctx) &&
+	       pipe_ctx->stream->timing.h_addressable == 2560 &&
+	       pipe_ctx->stream->timing.v_addressable == 2880;
+}
+
 static bool apple5k_pipe_is_blanked(struct pipe_ctx *pipe_ctx)
 {
 	if (!pipe_ctx || !pipe_ctx->stream_res.tg)
@@ -1509,14 +1516,65 @@ static void apple5k_log_target_snapshot(
 			    target->slave_pipe_count);
 }
 
-static const char *apple5k_zero_stream_reason_name(
-		enum apple5k_zero_stream_reason reason)
+static const char *apple5k_transition_reason_name(
+		enum apple5k_transition_reason reason)
 {
 	switch (reason) {
-	case APPLE5K_ZERO_STREAM_DPMS: return "DPMS";
-	case APPLE5K_ZERO_STREAM_SUSPEND: return "SUSPEND";
+	case APPLE5K_TRANSITION_MODESET: return "MODESET";
+	case APPLE5K_TRANSITION_DPMS: return "DPMS";
+	case APPLE5K_TRANSITION_SUSPEND: return "SUSPEND";
+	case APPLE5K_TRANSITION_RESTART: return "RESTART";
+	case APPLE5K_TRANSITION_GPU_RESET: return "GPU_RESET";
+	case APPLE5K_TRANSITION_RESTART_HANDOFF: return "RESTART_HANDOFF";
 	default: return "UNSPECIFIED";
 	}
+}
+
+static bool apple5k_reason_allows_teardown(
+		enum apple5k_transition_reason reason)
+{
+	return reason == APPLE5K_TRANSITION_DPMS ||
+	       reason == APPLE5K_TRANSITION_SUSPEND ||
+	       reason == APPLE5K_TRANSITION_RESTART;
+}
+
+static bool apple5k_target_is_native_half(
+		const struct apple5k_target_snapshot *target)
+{
+	if (!target)
+		return false;
+
+	if (target->class == APPLE5K_TARGET_ROOT_ONLY)
+		return apple5k_pipe_is_native_tile(target->root_pipe);
+	if (target->class == APPLE5K_TARGET_SLAVE_ONLY)
+		return apple5k_pipe_is_native_tile(target->slave_pipe);
+
+	return false;
+}
+
+/* A half-pair is permitted only as a blank intermediate teardown state. */
+static bool apple5k_native_half_is_clean(struct dc_link *root,
+		const struct apple5k_target_snapshot *target)
+{
+	struct pipe_ctx *pipe;
+	enum apple5k_tx_state tx_state;
+	enum apple5k_latch_owner owner;
+	bool block_rearm;
+
+	if (!root || !apple5k_target_is_native_half(target))
+		return false;
+
+	pipe = target->class == APPLE5K_TARGET_ROOT_ONLY ?
+		target->root_pipe : target->slave_pipe;
+	mutex_lock(&root->apple5k.lock);
+	tx_state = root->apple5k.state;
+	owner = root->apple5k.latch_owner;
+	block_rearm = root->apple5k.block_rearm;
+	mutex_unlock(&root->apple5k.lock);
+
+	return tx_state == APPLE5K_TX_READY &&
+	       owner == APPLE5K_LATCH_NONE && !block_rearm &&
+	       apple5k_pipe_is_blanked(pipe);
 }
 
 static enum dc_status apple5k_prepare_zero_stream(
@@ -1524,16 +1582,14 @@ static enum dc_status apple5k_prepare_zero_stream(
 {
 	struct apple5k_target_snapshot current_target;
 	struct dc_link *slave = root->tiled_peer;
-	enum apple5k_zero_stream_reason reason =
-		state->apple5k_zero_stream_reason;
+	enum apple5k_transition_reason reason =
+		state->apple5k_transition_reason;
 	enum apple5k_tx_state tx_state;
 	enum apple5k_latch_owner owner;
 	enum dc_status status;
 	bool block_rearm;
 	bool clean;
 
-	if (reason == APPLE5K_ZERO_STREAM_UNSPECIFIED)
-		return DC_OK;
 	if (!slave || slave->tiled_peer != root)
 		return DC_ERROR_UNEXPECTED;
 
@@ -1550,11 +1606,51 @@ static enum dc_status apple5k_prepare_zero_stream(
 	if (link_apple5k_log_enabled(root->dc, APPLE5K_LOG_SUMMARY)) {
 		DC_LOGGER_INIT(root->ctx->logger);
 		DC_LOG_INFO("APPLE5K-ZERO reason=%s root[%u] current=%s state=%s owner=%s blocked=%d\n",
-			    apple5k_zero_stream_reason_name(reason),
+			    apple5k_transition_reason_name(reason),
 			    root->link_index,
 			    apple5k_target_class_name(current_target.class),
 			    link_apple5k_state_name(tx_state),
 			    link_apple5k_latch_owner_name(owner), block_rearm);
+	}
+
+	/* A GPU reset owns the hardware reconstruction and may run with panel AUX
+	 * unavailable.  Drop all software claims on the old native transaction so
+	 * the restored pair must perform a fresh, verified native enable.
+	 */
+	if (reason == APPLE5K_TRANSITION_GPU_RESET) {
+		apple5k_cancel_transition_hpd(root, "gpu-reset");
+		root->link_state_valid = false;
+		slave->link_state_valid = false;
+		slave->apple5k_source_table_ok = false;
+		mutex_lock(&root->apple5k.lock);
+		root->apple5k.state = APPLE5K_TX_IDLE;
+		root->apple5k.latch_owner = APPLE5K_LATCH_NONE;
+		root->apple5k.block_rearm = false;
+		root->apple5k.discovery_pulse_done = false;
+		mutex_unlock(&root->apple5k.lock);
+		return DC_OK;
+	}
+
+	/* Every ordinary native-pair teardown must name its owner.  Silently
+	 * allowing an unclassified zero-stream commit would let generic per-link
+	 * powerdown change the physical latch while software remains NATIVE.
+	 */
+	if (reason == APPLE5K_TRANSITION_UNSPECIFIED ||
+	    reason == APPLE5K_TRANSITION_MODESET ||
+	    reason == APPLE5K_TRANSITION_RESTART_HANDOFF) {
+		DC_LOGGER_INIT(root->ctx->logger);
+
+		if (current_target.class == APPLE5K_TARGET_NONE &&
+		    (tx_state == APPLE5K_TX_IDLE ||
+		     tx_state == APPLE5K_TX_READY) &&
+		    owner == APPLE5K_LATCH_NONE && !block_rearm)
+			return DC_OK;
+		DC_LOG_ERROR("APPLE5K-ZERO reject root[%u] class=%s state=%s owner=%s blocked=%d\n",
+			     root->link_index,
+			     apple5k_target_class_name(current_target.class),
+			     link_apple5k_state_name(tx_state),
+			     link_apple5k_latch_owner_name(owner), block_rearm);
+		return DC_ERROR_UNEXPECTED;
 	}
 
 	if (current_target.class == APPLE5K_TARGET_PAIR) {
@@ -1569,11 +1665,32 @@ static enum dc_status apple5k_prepare_zero_stream(
 		status = apple5k_neutralize_pair(root, slave,
 						 current_target.root_pipe,
 						 current_target.slave_pipe,
-						 reason == APPLE5K_ZERO_STREAM_SUSPEND ?
+						 reason == APPLE5K_TRANSITION_SUSPEND ?
 						 "suspend:neutralize" :
+						 reason == APPLE5K_TRANSITION_RESTART ?
+						 "restart:fallback-neutralize" :
 						 "dpms-off:neutralize");
 		return status;
 	}
+
+	/* The restart handoff is intentionally live for a bounded settling
+	 * interval.  Consume it by blanking the root before generic zero-stream
+	 * reset; no latch write is needed because the handoff already owns none.
+	 */
+	if (reason == APPLE5K_TRANSITION_RESTART &&
+	    current_target.class == APPLE5K_TARGET_ROOT_ONLY &&
+	    apple5k_pipe_is_native_tile(current_target.root_pipe) &&
+	    tx_state == APPLE5K_TX_READY &&
+	    owner == APPLE5K_LATCH_NONE && !block_rearm) {
+		root->dc->hwss.blank_stream(current_target.root_pipe);
+		return apple5k_pipe_is_blanked(current_target.root_pipe) ?
+						DC_OK : DC_ERROR_UNEXPECTED;
+	}
+
+	if (apple5k_target_is_native_half(&current_target))
+		return apple5k_reason_allows_teardown(reason) &&
+		       apple5k_native_half_is_clean(root, &current_target) ?
+						DC_OK : DC_ERROR_UNEXPECTED;
 
 	if (current_target.class != APPLE5K_TARGET_NONE &&
 	    current_target.class != APPLE5K_TARGET_ROOT_ONLY)
@@ -1614,9 +1731,43 @@ static bool apple5k_state_get_timing_pair(struct dc_state *state,
 	return true;
 }
 
-/* Pair-wide pre-reset transition.  DPMS/suspend targets with no Apple streams
- * neutralize native explicitly; every SYSTEM_RESTART teardown (including
- * kexec, which has no module-safe discriminator) uses the restart policy.
+static enum dc_status apple5k_prepare_native_half(
+		struct dc_state *state, struct dc_link *root,
+		const struct apple5k_target_snapshot *target)
+{
+	struct apple5k_target_snapshot current_target;
+	enum apple5k_transition_reason reason =
+		state->apple5k_transition_reason;
+	bool restart_handoff;
+
+	restart_handoff = reason == APPLE5K_TRANSITION_RESTART_HANDOFF;
+	if (!apple5k_target_is_native_half(target) ||
+	    (restart_handoff && target->class != APPLE5K_TARGET_ROOT_ONLY) ||
+	    (!restart_handoff && !apple5k_reason_allows_teardown(reason)))
+		return DC_ERROR_UNEXPECTED;
+
+	apple5k_classify_target(root->dc->current_state, root,
+				 &current_target);
+	apple5k_log_target_snapshot(root, "native-half:current",
+				    &current_target);
+	if (current_target.class == APPLE5K_TARGET_PAIR)
+		return apple5k_neutralize_pair(root, root->tiled_peer,
+						 current_target.root_pipe,
+						 current_target.slave_pipe,
+						 restart_handoff ?
+						 "restart:root-handoff" :
+						 "dpms:half-teardown");
+
+	/* A second connector commit may consume the already-neutralized half. */
+	if (current_target.class == target->class &&
+	    apple5k_native_half_is_clean(root, &current_target))
+		return DC_OK;
+
+	return DC_ERROR_UNEXPECTED;
+}
+
+/* Pair-wide pre-reset transition.  A split DPMS teardown may temporarily
+ * retain one blank tile; it is never accepted as a usable display target.
  */
 enum dc_status link_apple_5k_prepare_transition(struct dc *dc,
 					       struct dc_state *state)
@@ -1633,7 +1784,10 @@ enum dc_status link_apple_5k_prepare_transition(struct dc *dc,
 	if (!dc || !state || !dc->apple5k_policy.enabled)
 		return DC_OK;
 
-	if (system_state == SYSTEM_RESTART && state->stream_count == 0) {
+	if (state->apple5k_transition_reason == APPLE5K_TRANSITION_RESTART &&
+	    state->stream_count == 0 &&
+	    dc->apple5k_policy.shutdown_mode !=
+					APPLE5K_SHUTDOWN_ROOT_HANDOFF) {
 		link_apple_5k_prepare_shutdown(dc, state);
 		return DC_OK;
 	}
@@ -1655,12 +1809,20 @@ enum dc_status link_apple_5k_prepare_transition(struct dc *dc,
 		}
 		if (target.class == APPLE5K_TARGET_PAIR)
 			continue;
+		if (apple5k_target_is_native_half(&target)) {
+			status = apple5k_prepare_native_half(state, root, &target);
+			if (status != DC_OK)
+				return status;
+			continue;
+		}
 		if (target.class != APPLE5K_TARGET_ROOT_ONLY ||
 		    !root->tiled_peer)
 			return DC_ERROR_UNEXPECTED;
 		if (dc->apple5k_policy.pair_mode !=
 		    APPLE5K_PAIR_TRANSACTIONAL)
 			continue;
+		if (!target.root_pipe)
+			return DC_ERROR_UNEXPECTED;
 		slave = root->tiled_peer;
 		mutex_lock(&root->apple5k.lock);
 		tx_state = root->apple5k.state;
@@ -1720,6 +1882,80 @@ enum dc_status link_apple_5k_prepare_transition(struct dc *dc,
 		root->apple5k.state = APPLE5K_TX_BLOCKED;
 		mutex_unlock(&root->apple5k.lock);
 		return DC_ERROR_UNEXPECTED;
+	}
+
+	return DC_OK;
+}
+
+enum dc_status link_apple_5k_prepare_restart_handoff(struct dc *dc)
+{
+	struct apple5k_target_snapshot current_target;
+	struct dc_commit_streams_params params = {};
+	struct dc_stream_state *root_streams[1];
+	struct dc_link *root;
+	enum apple5k_tx_state tx_state;
+	enum apple5k_latch_owner owner;
+	enum dc_status status;
+	bool block_rearm;
+	int i;
+
+	if (!dc || !dc->apple5k_policy.enabled ||
+	    dc->apple5k_policy.pair_mode == APPLE5K_PAIR_LEGACY ||
+	    dc->apple5k_policy.shutdown_mode !=
+					APPLE5K_SHUTDOWN_ROOT_HANDOFF ||
+	    system_state != SYSTEM_RESTART)
+		return DC_OK;
+
+	for (i = 0; i < dc->link_count; i++) {
+		root = dc->links[i];
+		if (!dc_link_has_tiled_root_panel_patch(root))
+			continue;
+
+		apple5k_classify_target(dc->current_state, root,
+					 &current_target);
+		apple5k_log_target_snapshot(root, "restart-handoff:current",
+					    &current_target);
+		if (current_target.class == APPLE5K_TARGET_NONE)
+			continue;
+		if (current_target.class == APPLE5K_TARGET_ROOT_ONLY) {
+			if (!apple5k_pipe_is_native_tile(
+						current_target.root_pipe))
+				continue;
+			mutex_lock(&root->apple5k.lock);
+			tx_state = root->apple5k.state;
+			owner = root->apple5k.latch_owner;
+			block_rearm = root->apple5k.block_rearm;
+			mutex_unlock(&root->apple5k.lock);
+			if (tx_state != APPLE5K_TX_READY ||
+			    owner != APPLE5K_LATCH_NONE || block_rearm ||
+			    apple5k_pipe_is_blanked(current_target.root_pipe))
+				return DC_ERROR_UNEXPECTED;
+			if (dc->apple5k_policy.restart_handoff_ms)
+				msleep(dc->apple5k_policy.restart_handoff_ms);
+			continue;
+		}
+		if (current_target.class != APPLE5K_TARGET_PAIR ||
+		    !current_target.root_stream)
+			return DC_ERROR_UNEXPECTED;
+
+		root_streams[0] = current_target.root_stream;
+		params.streams = root_streams;
+		params.stream_count = 1;
+		params.power_source = dc->current_state->power_source;
+		params.apple5k_transition_reason =
+					APPLE5K_TRANSITION_RESTART_HANDOFF;
+		status = dc_commit_streams(dc, &params);
+		if (status != DC_OK)
+			return status;
+
+		apple5k_classify_target(dc->current_state, root,
+					 &current_target);
+		if (current_target.class != APPLE5K_TARGET_ROOT_ONLY ||
+		    !apple5k_pipe_is_native_tile(current_target.root_pipe) ||
+		    apple5k_pipe_is_blanked(current_target.root_pipe))
+			return DC_ERROR_UNEXPECTED;
+		if (dc->apple5k_policy.restart_handoff_ms)
+			msleep(dc->apple5k_policy.restart_handoff_ms);
 	}
 
 	return DC_OK;
@@ -1870,8 +2106,14 @@ enum dc_status link_apple_5k_prepare_tiled_pair(struct dc *dc,
 			continue;
 		apple5k_classify_target(state, root, &target);
 		apple5k_log_target_snapshot(root, "prepare-pair:target", &target);
-		if (target.class == APPLE5K_TARGET_NONE ||
-		    target.class == APPLE5K_TARGET_ROOT_ONLY)
+		if (target.class == APPLE5K_TARGET_NONE)
+			continue;
+		if (apple5k_target_is_native_half(&target)) {
+			if (!apple5k_native_half_is_clean(root, &target))
+				return DC_ERROR_UNEXPECTED;
+			continue;
+		}
+		if (target.class == APPLE5K_TARGET_ROOT_ONLY)
 			continue;
 		if (target.class != APPLE5K_TARGET_PAIR)
 			return DC_ERROR_UNEXPECTED;
@@ -1941,8 +2183,31 @@ enum dc_status link_apple_5k_finalize_state(struct dc *dc,
 			continue;
 		apple5k_classify_target(state, candidate, &target);
 		apple5k_log_target_snapshot(candidate, "finalize:target", &target);
-		if (target.class == APPLE5K_TARGET_NONE ||
-		    target.class == APPLE5K_TARGET_ROOT_ONLY)
+		if (target.class == APPLE5K_TARGET_NONE)
+			continue;
+		if (apple5k_target_is_native_half(&target)) {
+			if (!apple5k_native_half_is_clean(candidate, &target))
+				return DC_ERROR_UNEXPECTED;
+			if (state->apple5k_transition_reason ==
+					APPLE5K_TRANSITION_RESTART_HANDOFF) {
+				if (target.class != APPLE5K_TARGET_ROOT_ONLY)
+					return DC_ERROR_UNEXPECTED;
+				dc->hwss.unblank_stream(target.root_pipe,
+					&target.root_pipe->stream->link->cur_link_settings);
+				if (apple5k_pipe_is_blanked(target.root_pipe))
+					return DC_ERROR_UNEXPECTED;
+				if (link_apple5k_log_enabled(dc,
+							APPLE5K_LOG_SUMMARY)) {
+					DC_LOGGER_INIT(candidate->ctx->logger);
+					DC_LOG_INFO("APPLE5K-RESTART root handoff live root_link[%u] timing=%ux%u latch=base\n",
+						    candidate->link_index,
+						    target.root_pipe->stream->timing.h_addressable,
+						    target.root_pipe->stream->timing.v_addressable);
+				}
+			}
+			continue;
+		}
+		if (target.class == APPLE5K_TARGET_ROOT_ONLY)
 			continue;
 		if (target.class != APPLE5K_TARGET_PAIR)
 			return DC_ERROR_UNEXPECTED;

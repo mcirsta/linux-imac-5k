@@ -227,6 +227,7 @@ int amdgpu_apple5k_pair_mode = 1;
 int amdgpu_apple5k_wake_mode;
 int amdgpu_apple5k_boot_mode;
 int amdgpu_apple5k_shutdown_mode;
+int amdgpu_apple5k_restart_handoff_ms = 100;
 int amdgpu_apple5k_pair_order;
 int amdgpu_apple5k_discovery_mode = 1;
 int amdgpu_apple5k_transition_hpd_guard = 1;
@@ -917,7 +918,7 @@ MODULE_PARM_DESC(apple5k_enable,
 module_param_named(apple5k_enable, amdgpu_apple5k_enable, int, 0444);
 
 MODULE_PARM_DESC(apple5k_profile,
-		 "Apple 5K experiment profile (0 = custom/default, 1 = observe, 2 = coherent, 3 = Pro cold, 4 = coherent+cold, 5 = coherent+shutdown observe, 6 = pair-quiesce shutdown, 8 = neutralize shutdown, 9 = coherent+MSA-ignore, 10 = legacy, 11 = no Apple writes)");
+		 "Apple 5K experiment profile (0 = custom/default, 1 = observe, 2 = coherent+root-handoff restart, 3 = Pro cold, 4 = coherent+cold+root-handoff restart, 5 = coherent+shutdown observe, 6 = pair-quiesce shutdown, 8 = neutralize shutdown, 9 = coherent+MSA-ignore, 10 = legacy, 11 = no Apple writes)");
 module_param_named(apple5k_profile, amdgpu_apple5k_profile, int, 0444);
 
 MODULE_PARM_DESC(apple5k_pair_mode,
@@ -933,8 +934,13 @@ MODULE_PARM_DESC(apple5k_boot_mode,
 module_param_named(apple5k_boot_mode, amdgpu_apple5k_boot_mode, int, 0444);
 
 MODULE_PARM_DESC(apple5k_shutdown_mode,
-		 "Apple 5K restart policy for profile 0 (0 = stock (default), 1 = observe, 2 = pair quiesce, 4 = neutralize)");
+		 "Apple 5K restart policy for profile 0 (0 = stock (default), 1 = observe, 2 = pair quiesce, 3 = live root handoff, 4 = neutralize)");
 module_param_named(apple5k_shutdown_mode, amdgpu_apple5k_shutdown_mode, int, 0444);
+
+MODULE_PARM_DESC(apple5k_restart_handoff_ms,
+		 "Apple 5K live root restart-handoff settle time in ms (0..2000, default 100)");
+module_param_named(apple5k_restart_handoff_ms,
+		   amdgpu_apple5k_restart_handoff_ms, int, 0444);
 
 MODULE_PARM_DESC(apple5k_pair_order,
 		 "Apple 5K transactional pair order (0 = root first (default), 1 = slave first, 2 = existing pipe order)");

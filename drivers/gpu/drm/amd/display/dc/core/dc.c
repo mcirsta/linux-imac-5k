@@ -2495,6 +2495,8 @@ enum dc_status dc_commit_streams(struct dc *dc, struct dc_commit_streams_params 
 		goto context_alloc_fail;
 
 	context->power_source = params->power_source;
+	context->apple5k_transition_reason =
+		params->apple5k_transition_reason;
 
 	res = dc_validate_with_context(dc, set, params->stream_count, context, DC_VALIDATE_MODE_AND_PROGRAMMING);
 

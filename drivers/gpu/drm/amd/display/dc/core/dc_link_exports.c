@@ -95,6 +95,11 @@ bool dc_link_consume_apple5k_transition_hpd(struct dc_link *link)
 	return link_apple_5k_consume_transition_hpd(link);
 }
 
+enum dc_status dc_prepare_apple5k_restart_handoff(struct dc *dc)
+{
+	return link_apple_5k_prepare_restart_handoff(dc);
+}
+
 bool dc_link_detect_connection_type(struct dc_link *link,
 		enum dc_connection_type *type)
 {
