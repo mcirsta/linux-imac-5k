@@ -96,6 +96,7 @@ void link_apple_5k_prepare_shutdown(struct dc *dc,
 				    struct dc_state *new_state);
 void link_apple_5k_finish_detection(struct dc_link *link,
 				    enum dc_detect_reason reason);
+bool link_apple_5k_consume_transition_hpd(struct dc_link *link);
 
 /*
  * APPLE5K eDP power-off exclusion (defined in link/protocols/link_dpcd.c).

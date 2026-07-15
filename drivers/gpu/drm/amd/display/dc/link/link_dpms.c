@@ -61,6 +61,7 @@
 #include "vpg.h"
 #include "grph_object_id.h"
 #include <linux/dmi.h>
+#include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/reboot.h>
 
@@ -236,6 +237,7 @@ static enum dc_status apple5k_write_root_latch(struct dc_link *root,
  */
 #define APPLE5K_READY_GATE_ROOT_HPD	0x100	/* DC_GPIO_HPD2_Y */
 #define APPLE5K_READY_GATE_SIBLING_HPD	0x001	/* DC_GPIO_HPD1_Y */
+#define APPLE5K_TRANSITION_HPD_TIMEOUT_MS 2000
 
 static bool apple5k_pipe_is_blanked(struct pipe_ctx *pipe_ctx);
 
@@ -280,6 +282,169 @@ static void apple5k_log_ready_gate(struct dc_link *root, const char *stage)
 		    stage ? stage : "?", address, value,
 		    (value & APPLE5K_READY_GATE_ROOT_HPD) ? 1 : 0,
 		    (value & APPLE5K_READY_GATE_SIBLING_HPD) ? 1 : 0);
+}
+
+static void apple5k_clear_transition_hpd_locked(struct dc_link *root)
+{
+	lockdep_assert_held(&root->apple5k.lock);
+
+	root->apple5k.transition_hpd_pending = false;
+	root->apple5k.transition_hpd_generation = 0;
+	root->apple5k.transition_hpd_armed_at = 0;
+	root->apple5k.transition_hpd_deadline = 0;
+}
+
+static void apple5k_cancel_transition_hpd(
+		struct dc_link *root, const char *stage)
+{
+	enum apple5k_tx_state state;
+	uint32_t generation;
+	bool pending;
+
+	if (!root)
+		return;
+
+	mutex_lock(&root->apple5k.lock);
+	pending = root->apple5k.transition_hpd_pending;
+	generation = root->apple5k.transition_hpd_generation;
+	state = root->apple5k.state;
+	if (pending)
+		apple5k_clear_transition_hpd_locked(root);
+	mutex_unlock(&root->apple5k.lock);
+
+	if (pending && link_apple5k_log_enabled(root->dc, APPLE5K_LOG_LINK)) {
+		DC_LOGGER_INIT(root->ctx->logger);
+
+		DC_LOG_INFO("APPLE5K-HPD cancel stage=%s root_link[%u] gen=%u state=%s\n",
+			    stage ? stage : "?", root->link_index, generation,
+			    link_apple5k_state_name(state));
+	}
+}
+
+/*
+ * The slave HPD pad is low in compat mode and rises when the native pair is
+ * brought online.  Arm only across that observed low state: if the pad was
+ * already high there is no transaction-owned edge to consume.
+ */
+static void apple5k_arm_transition_hpd(
+		struct dc_link *root, struct dc_link *slave)
+{
+	enum apple5k_tx_state state;
+	unsigned long now = jiffies;
+	uint32_t gate = 0;
+	uint32_t generation;
+	uint32_t arm_count;
+	bool armed = false;
+	bool gate_read = false;
+
+	if (!root || !slave || !root->dc->apple5k_policy.enabled ||
+	    !root->dc->apple5k_policy.transition_hpd_guard ||
+	    root->dc->apple5k_policy.pair_mode != APPLE5K_PAIR_TRANSACTIONAL ||
+	    root->tiled_peer != slave || slave->tiled_peer != root ||
+	    !dc_link_has_tiled_root_panel_patch(root) ||
+	    !dc_link_has_tiled_slave_panel_patch(slave))
+		return;
+
+	mutex_lock(&root->apple5k.lock);
+	state = root->apple5k.state;
+	generation = root->apple5k.generation;
+	gate_read = apple5k_read_ready_gate(root, NULL, &gate);
+	if (state == APPLE5K_TX_ENABLING &&
+	    root->apple5k.latch_owner == APPLE5K_LATCH_ENABLE &&
+	    !root->apple5k.block_rearm && gate_read &&
+	    (gate & APPLE5K_READY_GATE_ROOT_HPD) &&
+	    !(gate & APPLE5K_READY_GATE_SIBLING_HPD)) {
+		root->apple5k.transition_hpd_pending = true;
+		root->apple5k.transition_hpd_generation = generation;
+		root->apple5k.transition_hpd_armed_at = now;
+		root->apple5k.transition_hpd_deadline = now +
+			msecs_to_jiffies(APPLE5K_TRANSITION_HPD_TIMEOUT_MS);
+		root->apple5k.transition_hpd_arm_count++;
+		armed = true;
+	}
+	arm_count = root->apple5k.transition_hpd_arm_count;
+	mutex_unlock(&root->apple5k.lock);
+
+	if (link_apple5k_log_enabled(root->dc, APPLE5K_LOG_LINK)) {
+		DC_LOGGER_INIT(root->ctx->logger);
+
+		DC_LOG_INFO("APPLE5K-HPD arm root_link[%u] slave_link[%u] "
+			    "gen=%u state=%s gate_s=%d gate=0x%08x armed=%d "
+			    "arms=%u timeout_ms=%u\n",
+			    root->link_index, slave->link_index, generation,
+			    link_apple5k_state_name(state), gate_read, gate, armed,
+			    arm_count, APPLE5K_TRANSITION_HPD_TIMEOUT_MS);
+	}
+}
+
+bool link_apple_5k_consume_transition_hpd(struct dc_link *link)
+{
+	struct dc_link *root;
+	enum apple5k_tx_state state = APPLE5K_TX_IDLE;
+	unsigned long now = jiffies;
+	unsigned long age_ms = 0;
+	uint32_t gate = 0;
+	uint32_t generation = 0;
+	uint32_t consume_count = 0;
+	uint32_t expire_count = 0;
+	bool consumed = false;
+	bool expired = false;
+	bool stale = false;
+
+	if (!dc_link_has_tiled_slave_panel_patch(link))
+		return false;
+	root = apple5k_root_for_link(link);
+	if (!root || !root->dc->apple5k_policy.enabled ||
+	    !root->dc->apple5k_policy.transition_hpd_guard ||
+	    root->dc->apple5k_policy.pair_mode != APPLE5K_PAIR_TRANSACTIONAL ||
+	    root->tiled_peer != link || link->tiled_peer != root ||
+	    !root->local_sink || !link->local_sink)
+		return false;
+
+	mutex_lock(&root->apple5k.lock);
+	if (!root->apple5k.transition_hpd_pending)
+		goto unlock;
+
+	state = root->apple5k.state;
+	generation = root->apple5k.transition_hpd_generation;
+	age_ms = jiffies_to_msecs(now -
+					 root->apple5k.transition_hpd_armed_at);
+	if (generation != root->apple5k.generation ||
+	    (state != APPLE5K_TX_ENABLING && state != APPLE5K_TX_NATIVE)) {
+		stale = true;
+		apple5k_clear_transition_hpd_locked(root);
+	} else if (time_after(now, root->apple5k.transition_hpd_deadline)) {
+		expired = true;
+		root->apple5k.transition_hpd_expire_count++;
+		apple5k_clear_transition_hpd_locked(root);
+	} else if (apple5k_read_ready_gate(root, NULL, &gate) &&
+		   (gate & (APPLE5K_READY_GATE_ROOT_HPD |
+			    APPLE5K_READY_GATE_SIBLING_HPD)) ==
+			   (APPLE5K_READY_GATE_ROOT_HPD |
+			    APPLE5K_READY_GATE_SIBLING_HPD)) {
+		consumed = true;
+		root->apple5k.transition_hpd_consume_count++;
+		apple5k_clear_transition_hpd_locked(root);
+	}
+	consume_count = root->apple5k.transition_hpd_consume_count;
+	expire_count = root->apple5k.transition_hpd_expire_count;
+unlock:
+	mutex_unlock(&root->apple5k.lock);
+
+	if ((consumed || expired || stale) &&
+	    link_apple5k_log_enabled(root->dc, APPLE5K_LOG_LINK)) {
+		DC_LOGGER_INIT(root->ctx->logger);
+
+		DC_LOG_INFO("APPLE5K-HPD event root_link[%u] slave_link[%u] "
+			    "gen=%u state=%s gate=0x%08x age_ms=%lu action=%s "
+			    "consumed=%u expired=%u\n",
+			    root->link_index, link->link_index, generation,
+			    link_apple5k_state_name(state), gate, age_ms,
+			    consumed ? "consume" : expired ? "expire" : "stale",
+			    consume_count, expire_count);
+	}
+
+	return consumed;
 }
 
 /*
@@ -341,6 +506,7 @@ void link_apple_5k_boot_cold_down(struct dc *dc)
 	if (!root)
 		return;
 	slave = root->tiled_peer;
+	apple5k_cancel_transition_hpd(root, "cold-boot");
 
 	DC_LOGGER_INIT(root->ctx->logger);
 	DC_LOG_INFO("APPLE5K-COLD boot cold-down root_link[%u] slave_link[%d]\n",
@@ -433,6 +599,7 @@ static enum dc_status apple5k_neutralize_pair(struct dc_link *root,
 	    !dc_link_has_tiled_slave_panel_patch(slave))
 		return DC_ERROR_UNEXPECTED;
 
+	apple5k_cancel_transition_hpd(root, stage);
 	DC_LOGGER_INIT(root->ctx->logger);
 	mutex_lock(&root->apple5k.lock);
 	root->apple5k.state = APPLE5K_TX_ABORTING;
@@ -612,6 +779,7 @@ static bool apple5k_begin_native_enable(struct dc_link *root,
 	 */
 	prior.state = root->apple5k.state;
 	prior.owner = root->apple5k.latch_owner;
+	apple5k_clear_transition_hpd_locked(root);
 	root->apple5k.generation++;
 	prior.generation = root->apple5k.generation;
 	root->apple5k.state = APPLE5K_TX_ENABLING;
@@ -686,6 +854,7 @@ static bool apple5k_begin_native_enable(struct dc_link *root,
 		return false;
 	}
 
+	apple5k_arm_transition_hpd(root, slave);
 	status = apple5k_write_root_latch(root, 1, "native-txn:arm");
 	if (status != DC_OK) {
 		DC_LOG_INFO("APPLE5K-TXN arm failed root_link[%u] slave_link[%u] status=%d\n",
@@ -1632,6 +1801,7 @@ void link_apple_5k_prepare_shutdown(struct dc *dc,
 	if (!root || !root_pipe || !slave_pipe)
 		return;
 
+	apple5k_cancel_transition_hpd(root, "restart");
 	mode = dc->apple5k_policy.shutdown_mode;
 	mutex_lock(&root->apple5k.lock);
 	root->apple5k.block_rearm = true;

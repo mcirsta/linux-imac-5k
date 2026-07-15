@@ -229,6 +229,7 @@ int amdgpu_apple5k_boot_mode;
 int amdgpu_apple5k_shutdown_mode;
 int amdgpu_apple5k_pair_order;
 int amdgpu_apple5k_discovery_mode = 1;
+int amdgpu_apple5k_transition_hpd_guard = 1;
 int amdgpu_apple5k_dce12_force_msa_ignore;
 uint amdgpu_apple5k_log_mask = 1;
 int amdgpu_async_gfx_ring = 1;
@@ -943,6 +944,11 @@ MODULE_PARM_DESC(apple5k_discovery_mode,
 		 "Apple 5K discovery (0 = read-only bypass, 1 = full bounded discovery (default), 2 = one-shot arm/clear pulse without slave discovery)");
 module_param_named(apple5k_discovery_mode,
 		   amdgpu_apple5k_discovery_mode, int, 0444);
+
+MODULE_PARM_DESC(apple5k_transition_hpd_guard,
+		 "Apple 5K consume the transaction-generated slave HPD rise (0 = off, 1 = on (default))");
+module_param_named(apple5k_transition_hpd_guard,
+		   amdgpu_apple5k_transition_hpd_guard, int, 0444);
 
 MODULE_PARM_DESC(apple5k_dce12_force_msa_ignore,
 		 "Apple 5K DCE12 tiled panel force DPCD 0x107 bit 7 (0 = off (default), 1 = on)");

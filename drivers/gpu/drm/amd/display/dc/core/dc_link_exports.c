@@ -90,6 +90,11 @@ bool dc_link_detect(struct dc_link *link, enum dc_detect_reason reason)
 	return detected;
 }
 
+bool dc_link_consume_apple5k_transition_hpd(struct dc_link *link)
+{
+	return link_apple_5k_consume_transition_hpd(link);
+}
+
 bool dc_link_detect_connection_type(struct dc_link *link,
 		enum dc_connection_type *type)
 {

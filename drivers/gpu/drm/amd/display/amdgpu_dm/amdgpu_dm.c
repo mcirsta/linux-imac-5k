@@ -4101,6 +4101,14 @@ static void handle_hpd_irq_helper(struct amdgpu_dm_connector *aconnector)
 	 */
 	guard(mutex)(&aconnector->hpd_lock);
 
+	/* Native Apple tiled enable raises the internal slave HPD pad.  That
+	 * generation-owned edge is part of the in-flight modeset, not a sink
+	 * topology change; consuming it here prevents redetection from replacing
+	 * the sink underneath the atomic commit which generated the edge.
+	 */
+	if (dc_link_consume_apple5k_transition_hpd(aconnector->dc_link))
+		return;
+
 	if (adev->dm.hdcp_workqueue) {
 		hdcp_reset_display(adev->dm.hdcp_workqueue, aconnector->dc_link->link_index);
 		dm_con_state->update_hdcp = true;
