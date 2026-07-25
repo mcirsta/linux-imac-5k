@@ -147,9 +147,13 @@ static void apply_edid_quirks(struct drm_device *dev,
 	 * Both endpoints can present either identity:
 	 *   - AE25 = 4K-compat identity (primary, pre-wake);
 	 *   - AE26 = tile identity (secondary always, primary after root-wake re-read).
+	 * iMac17,1 (Pitcairn/SI/DCE6) presents APP/AE05 on the eDP root and the
+	 *   paired APP/AE06 on the DP slave (verified on this unit).
 	 * Role discrimination is by connector_signal (eDP=root, DP=slave) — not by
 	 * panel-id alone, since the primary flips AE25->AE26 after the wake.
 	 */
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE05):
+	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE06):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE25):
 	case drm_edid_encode_panel_id('A', 'P', 'P', 0xAE26):
 		drm_dbg_driver(dev, "Apple 5K tiled panel match: panel_id=0x%X signal=%d\n",
