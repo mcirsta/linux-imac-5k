@@ -1633,7 +1633,8 @@ static void enable_timing_multisync(
 static bool imac5k_dmi_match(void)
 {
 	return dmi_match(DMI_SYS_VENDOR, "Apple Inc.") &&
-	       dmi_match(DMI_PRODUCT_NAME, "iMac19,1");
+	       (dmi_match(DMI_PRODUCT_NAME, "iMac19,1") ||
+		dmi_match(DMI_PRODUCT_NAME, "iMac18,3"));
 }
 
 static unsigned int imac5k_stream_object_id(
@@ -7798,4 +7799,3 @@ bool dc_update_planes_and_stream_cleanup(
 			? update_planes_and_stream_cleanup_v3(scratch)
 			: update_planes_and_stream_cleanup_v2(scratch);
 }
-
