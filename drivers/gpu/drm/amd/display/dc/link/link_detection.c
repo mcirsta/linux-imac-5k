@@ -116,7 +116,8 @@ static enum ddc_transaction_type get_ddc_transaction_type(enum signal_type sink_
 static bool link_is_imac5k_machine(void)
 {
 	return dmi_match(DMI_SYS_VENDOR, "Apple Inc.") &&
-	       dmi_match(DMI_PRODUCT_NAME, "iMac19,1");
+	       (dmi_match(DMI_PRODUCT_NAME, "iMac19,1") ||
+		dmi_match(DMI_PRODUCT_NAME, "iMac18,3"));
 }
 
 static bool link_is_imac5k_primary_route(const struct dc_link *link)

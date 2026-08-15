@@ -1093,7 +1093,7 @@ enum dc_status dpcd_set_training_pattern(
 }
 
 /*
- * IMAC5K: the iMac19,1 5K secondary tile (object 0x3113 / DDC3 / UNIPHY_D)
+ * IMAC5K: the supported iMac 5K secondary tile (object 0x3113 / DDC3 / UNIPHY_D)
  * has a write-marginal AUX. Reads (EDID, DPCD rev) succeed, but the
  * link-configuration writes below (DP_DOWNSPREAD_CTRL / DP_LANE_COUNT_SET /
  * DP_LINK_BW_SET) fail with -EIO ("aux hw bus 1: Too many retries") because
@@ -1117,7 +1117,8 @@ enum dc_status dpcd_set_training_pattern(
 static bool imac5k_lt_is_secondary_route(const struct dc_link *link)
 {
 	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
-	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1"))
+	    (!dmi_match(DMI_PRODUCT_NAME, "iMac19,1") &&
+	     !dmi_match(DMI_PRODUCT_NAME, "iMac18,3")))
 		return false;
 	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)
 		return false;
@@ -1940,4 +1941,3 @@ bool perform_link_training_with_retries(
 
 	return false;
 }
-

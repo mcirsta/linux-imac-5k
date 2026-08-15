@@ -77,7 +77,8 @@ static bool link_is_imac5k_secondary_source_dpcd_route(
 	const struct dc_link *link)
 {
 	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
-	    !dmi_match(DMI_PRODUCT_NAME, "iMac19,1"))
+	    (!dmi_match(DMI_PRODUCT_NAME, "iMac19,1") &&
+	     !dmi_match(DMI_PRODUCT_NAME, "iMac18,3")))
 		return false;
 
 	if (!link || link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT)

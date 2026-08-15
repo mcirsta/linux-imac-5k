@@ -5698,7 +5698,7 @@ static int amdgpu_dm_initialize_drm_device(struct amdgpu_device *adev)
 	 * mode), force the primary 0x3114 to re-read its EDID. This is the
 	 * RE-recommended empirical probe for whether the primary flips from the
 	 * 4K-compat identity (0xAE25, no tile) to the full tile identity
-	 * (0xAE26, DisplayID tile block). No-op on all non-iMac19,1 hardware.
+	 * (0xAE26, DisplayID tile block). No-op on non-supported iMac hardware.
 	 */
 	amdgpu_dm_imac5k_reprobe_primary_after_secondary(adev);
 
@@ -8126,7 +8126,8 @@ cleanup:
 static bool amdgpu_dm_imac5k_dmi_match(void)
 {
 	return dmi_match(DMI_SYS_VENDOR, "Apple Inc.") &&
-	       dmi_match(DMI_PRODUCT_NAME, "iMac19,1");
+	       (dmi_match(DMI_PRODUCT_NAME, "iMac19,1") ||
+		dmi_match(DMI_PRODUCT_NAME, "iMac18,3"));
 }
 
 static bool
@@ -8368,7 +8369,7 @@ amdgpu_dm_imac5k_log_edid_raw(struct drm_device *dev, const char *label,
  * identity. The next dmesg then shows conclusively whether the primary flips
  * 0xAE25 -> 0xAE26 and gains the tile block.
  *
- * Tightly gated: DMI iMac19,1 + exact primary/secondary routes; only runs once
+ * Tightly gated: DMI iMac 5K models + exact primary/secondary routes; only runs once
  * the secondary actually carries the tile (panel proven latched); idempotent
  * (skips the re-read when the primary already carries the tile identity).
  * No-op on all other hardware.
@@ -8634,7 +8635,7 @@ enum drm_mode_status amdgpu_dm_connector_mode_valid(struct drm_connector *connec
 		return result;
 
 	/*
-	 * The iMac19,1 5K panel exposes the secondary half as a tiled
+	 * The supported iMac 5K panel exposes the secondary half as a tiled
 	 * 2560x2880 DisplayPort sink on object 0x3113. A plain-boot bring-up
 	 * can otherwise lose that real mode to single-stream DP bandwidth
 	 * validation, after which DRM adds and selects a synthetic 640x480
