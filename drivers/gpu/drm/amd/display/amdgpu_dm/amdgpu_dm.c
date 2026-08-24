@@ -8469,6 +8469,48 @@ amdgpu_dm_stream_has_apple5k_patch(const struct dc_stream_state *stream)
 		dc_link_has_tiled_slave_panel_patch(link));
 }
 
+static void
+amdgpu_dm_enable_apple5k_timing_sync(struct dc_state *context)
+{
+	struct dc_stream_state *root = NULL;
+	struct dc_stream_state *slave = NULL;
+	int i;
+
+	if (!context)
+		return;
+
+	for (i = 0; i < context->stream_count; i++) {
+		struct dc_stream_state *stream = context->streams[i];
+		struct dc_link *link = stream ? stream->link : NULL;
+
+		if (!link)
+			continue;
+
+		if (dc_link_has_tiled_root_panel_patch(link)) {
+			if (root)
+				return;
+			root = stream;
+		} else if (dc_link_has_tiled_slave_panel_patch(link)) {
+			if (slave)
+				return;
+			slave = stream;
+		}
+	}
+
+	if (!root || !slave ||
+	    root->link->tiled_peer != slave->link ||
+	    slave->link->tiled_peer != root->link)
+		return;
+
+	if (root->timing.pix_clk_100hz != slave->timing.pix_clk_100hz ||
+	    root->timing.h_total != slave->timing.h_total ||
+	    root->timing.v_total != slave->timing.v_total)
+		return;
+
+	root->triggered_crtc_reset.enabled = true;
+	slave->triggered_crtc_reset.enabled = true;
+}
+
 static const char *amdgpu_dm_apple5k_plane_type_name(enum drm_plane_type type)
 {
 	switch (type) {
@@ -11307,6 +11349,7 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_state *state,
 		amdgpu_dm_psr_disable_all(dm);
 	}
 
+	amdgpu_dm_enable_apple5k_timing_sync(dc_state);
 	dm_enable_per_frame_crtc_master_sync(dc_state);
 	amdgpu_dm_log_apple5k_dc_streams(dev, dc_state, "commit-after-sync");
 	mutex_lock(&dm->dc_lock);
@@ -14310,6 +14353,7 @@ void amdgpu_dm_trigger_timing_sync(struct drm_device *dev)
 				->triggered_crtc_reset.enabled =
 				adev->dm.force_timing_sync;
 
+		amdgpu_dm_enable_apple5k_timing_sync(dc->current_state);
 		dm_enable_per_frame_crtc_master_sync(dc->current_state);
 		amdgpu_dm_log_apple5k_dc_streams(dev, dc->current_state,
 						  "manual-trigger-sync");
